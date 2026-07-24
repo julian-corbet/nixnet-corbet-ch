@@ -14,12 +14,25 @@
 # merging. Core has no provider registry and no provider-specific code;
 # see docs/providers.md.
 
-{ lib, config, pkgs, ... }:
+{ lib, config, pkgs, options, ... }:
 
 with lib;
 
 let
   cfg = config.services.nixnet;
+
+  # ---------------------------------------------------------------------
+  # system-manager backend detection (design.md §9). system-manager exposes
+  # no `networking.hosts` at all and only a fixed `system.activationScripts.
+  # users` stub (not an extensible attrsOf), so both the /etc/hosts merge
+  # below and the activation-script seeding mechanism need a system-manager
+  # code path. Detected via system-manager's OWN `system-manager.*` option
+  # namespace (e.g. `system-manager.allowAnyDistro`), which exists only
+  # under system-manager and never under real NixOS -- cheaper and more
+  # robust than trying to introspect whether `system.activationScripts` is
+  # of an extensible type.
+  # ---------------------------------------------------------------------
+  isSystemManager = options ? system-manager;
 
   # ---------------------------------------------------------------------
   # Shared transport submodule (design.md §3.1) — reused verbatim by both
@@ -288,11 +301,13 @@ let
   # ---------------------------------------------------------------------
   # Boot-time hosts seeding (design.md §5.1): synchronous, so
   # /run/nixnet/hosts is NEVER dangling even before nixnetd's first tick.
-  # Runs as an activation script, not inside the daemon.
+  # Runs as an activation script on NixOS; system-manager has no
+  # `networking.hosts` to merge in at all, so this is simply empty there
+  # (see the systemd-oneshot seeding path below for that backend instead).
   # ---------------------------------------------------------------------
   extraHostsLines = concatStringsSep "\n" (
     mapAttrsToList (address: names: "${address}\t${concatStringsSep " " (if isList names then names else [ names ])}")
-      config.networking.hosts
+      (if isSystemManager then { } else config.networking.hosts)
   );
 
   seedHostsScript = pkgs.writeShellScript "nixnet-seed-hosts" ''
@@ -370,7 +385,7 @@ in
     };
   };
 
-  config = mkIf cfg.enable {
+  config = mkIf cfg.enable ({
     assertions = [
       {
         assertion =
@@ -427,20 +442,35 @@ in
     # instead. Loudly documented here, not a silent takeover.
     environment.etc.hosts = mkForce { source = cfg.daemon.hostsFile; };
 
-    system.activationScripts.nixnetSeedHosts = {
-      text = "${seedHostsScript}";
-      deps = [ ];
+    # system-manager: no `system.activationScripts.<name>` at all (only a
+    # fixed, non-extensible `.users` stub -- see options.services.nixnet's
+    # `isSystemManager` note above), so the same seeding logic runs as an
+    # ordinary oneshot unit instead, ordered before nixnetd via the
+    # `before`/`wants` wiring nixnetd itself carries below (added
+    # unconditionally -- a harmless dangling unit reference on NixOS, where
+    # this service doesn't exist and the activation script above already
+    # covers it).
+    systemd.services.nixnet-seed-hosts = mkIf isSystemManager {
+      description = "Seed /run/nixnet/hosts before nixnetd's first tick (system-manager backend)";
+      before = [ "nixnetd.service" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${seedHostsScript}";
+      };
     };
 
     systemd.services.nixnetd = {
       description = "nixnet transport failover daemon";
-      # No explicit ordering against the hosts-seeding activation script:
-      # system.activationScripts already runs synchronously, to
-      # completion, before systemd starts any unit on a fresh boot; on a
-      # `nixos-rebuild switch` (not a fresh boot) activation runs
-      # synchronously too, ahead of restarting changed units -- there is
-      # no systemd unit to order against, activation isn't one.
-      after = [ "network.target" ];
+      # On NixOS, no explicit ordering against the hosts-seeding activation
+      # script is needed (see the comment on system.activationScripts
+      # above -- activation isn't a systemd unit, it already completes
+      # first). On system-manager, nixnet-seed-hosts.service above needs
+      # explicit ordering, which these two lines provide; referencing a
+      # unit that doesn't exist (the NixOS case) is a harmless no-op.
+      after = [ "network.target" "nixnet-seed-hosts.service" ];
+      wants = [ "nixnet-seed-hosts.service" ];
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
@@ -461,5 +491,28 @@ in
         Type = "notify";
       };
     };
-  };
+  }
+  # NixOS only: an activation script (design.md §5.1) -- runs synchronously,
+  # to completion, before systemd starts any unit on a fresh boot; on a
+  # `nixos-rebuild switch` (not a fresh boot) activation runs synchronously
+  # too, ahead of restarting changed units. Merged in via `//` (a plain Nix
+  # conditional on the ATTRSET ITSELF), not `mkIf` wrapping the value --
+  # system-manager's `system.activationScripts` is a fixed-field submodule
+  # (only `.users`/`.setupSecrets`/`.generate-age-key` are declared there,
+  # not an extensible `attrsOf`), so an `mkIf false { nixnetSeedHosts = ...;
+  # }` assigned to it STILL throws "option does not exist" -- the module
+  # system's submodule merge walks a definition's structural KEYS to check
+  # them against declared options independent of the mkIf condition's truth
+  # value. `optionalAttrs` avoids this because when its condition is false
+  # the `system` key is simply ABSENT from this module's contributed
+  # attrset entirely, so there is no definition to check in the first
+  # place. (Verified empirically against a real system-manager consumer
+  # target -- an `mkIf isSystemManager`-wrapped version of this same block
+  # still failed eval with exactly that error.)
+  // (optionalAttrs (!isSystemManager) {
+    system.activationScripts.nixnetSeedHosts = {
+      text = "${seedHostsScript}";
+      deps = [ ];
+    };
+  }));
 }
