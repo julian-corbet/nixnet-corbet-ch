@@ -300,10 +300,11 @@ let
 
   # ---------------------------------------------------------------------
   # Boot-time hosts seeding (design.md §5.1): synchronous, so
-  # /run/nixnet/hosts is NEVER dangling even before nixnetd's first tick.
-  # Runs as an activation script on NixOS; system-manager has no
+  # cfg.daemon.hostsFile is NEVER dangling even before nixnetd's first
+  # tick. Runs as an activation script on NixOS; system-manager has no
   # `networking.hosts` to merge in at all, so this is simply empty there
-  # (see the systemd-oneshot seeding path below for that backend instead).
+  # (see the systemd-oneshot seeding path AND the preActivationAssertions
+  # hook below for that backend instead).
   # ---------------------------------------------------------------------
   extraHostsLines = concatStringsSep "\n" (
     mapAttrsToList (address: names: "${address}\t${concatStringsSep " " (if isList names then names else [ names ])}")
@@ -362,7 +363,26 @@ in
     daemon = {
       stateDir = mkOption { type = types.path; default = "/var/lib/nixnet"; };
       runtimeDir = mkOption { type = types.str; default = "nixnet"; description = "Under /run."; };
-      hostsFile = mkOption { type = types.path; default = "/run/nixnet/hosts"; };
+      hostsFile = mkOption {
+        type = types.path;
+        default = "${cfg.daemon.stateDir}/hosts";
+        description = ''
+          Where nixnetd actually keeps /etc/hosts's live content --
+          environment.etc.hosts.source points here (see the comment on
+          that option below). Deliberately under stateDir (/var/lib), NOT
+          runtimeDir (/run): /run is a fresh, empty tmpfs on every single
+          boot, so a symlink chain ending there can never resolve until
+          something has run *this specific boot* to (re)create it -- and
+          on the system-manager backend specifically, nothing has, at the
+          point system-manager-engine resolves this symlink (see
+          design.md §9 / §5.1). Living under /var/lib instead means that
+          once this file exists for the first time ever on a given host,
+          it never goes missing again across any future boot or
+          redeploy, which is what actually makes the system-manager
+          `preActivationAssertions` guarantee below sufficient in
+          practice, not just on paper.
+        '';
+      };
 
       defaultProbe = {
         intervalMs = mkOption { type = types.ints.positive; default = 3000; };
@@ -440,7 +460,27 @@ in
     # /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf: point a
     # normally store-symlinked /etc file at a runtime-writable path
     # instead. Loudly documented here, not a silent takeover.
-    environment.etc.hosts = mkForce { source = cfg.daemon.hostsFile; };
+    #
+    # mkForce replaces the WHOLE attrset (not just `source`), so any
+    # option this feature needs MUST be set HERE, in this same literal --
+    # a sibling module contributing e.g. `environment.etc.hosts.
+    # replaceExisting = true` separately gets silently discarded back to
+    # its default by this mkForce, not merged (verified via
+    # lib.evalModules: a consumer override there evaluates to the
+    # default regardless). `replaceExisting` only exists as an option on
+    # the system-manager backend (real NixOS's environment.etc has no
+    # such field -- it always reconciles /etc from scratch on activation
+    # instead, so there's nothing to set there); system-manager needs it
+    # unconditionally true for this entry specifically, because /etc/hosts
+    # already exists, unmanaged, on essentially every real distro
+    # system-manager bolts onto -- without it, system-manager just warns
+    # and leaves the pre-existing file alone, silently no-op'ing this
+    # entire feature.
+    environment.etc.hosts = mkForce ({
+      source = cfg.daemon.hostsFile;
+    } // optionalAttrs isSystemManager {
+      replaceExisting = true;
+    });
 
     # system-manager: no `system.activationScripts.<name>` at all (only a
     # fixed, non-extensible `.users` stub -- see options.services.nixnet's
@@ -451,7 +491,7 @@ in
     # this service doesn't exist and the activation script above already
     # covers it).
     systemd.services.nixnet-seed-hosts = mkIf isSystemManager {
-      description = "Seed /run/nixnet/hosts before nixnetd's first tick (system-manager backend)";
+      description = "Seed cfg.daemon.hostsFile before nixnetd's first tick (system-manager backend)";
       before = [ "nixnetd.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
@@ -513,6 +553,47 @@ in
     system.activationScripts.nixnetSeedHosts = {
       text = "${seedHostsScript}";
       deps = [ ];
+    };
+  })
+  # system-manager only: the actual fix for the etc-activation ordering bug
+  # (design.md §9). system-manager-engine's activate() runs, in order: (1)
+  # preActivationAssertions, (2) etc-file activation, (3) systemd-tmpfiles
+  # --create (i.e. systemd.tmpfiles.rules), (4) systemd services -- so both
+  # nixnet-seed-hosts.service (a systemd service, step 4) AND a
+  # systemd.tmpfiles.rules entry (step 3) run strictly AFTER step 2, too
+  # late to help environment.etc.hosts's own resolution at step 2 (verified
+  # by reading system-manager-engine's own source, crates/system-manager-
+  # engine/src/activate.rs and .../activate/etc_files.rs: it resolves every
+  # symlink-mode /etc entry via `fs::canonicalize`, which errors on a
+  # dangling target, and -- critically -- ONE such error there aborts
+  # collection of the ENTIRE etc file list, so nothing under /etc gets
+  # activated at all that run, not just this one entry).
+  #
+  # `system-manager.preActivationAssertions.<name>.script` is the one hook
+  # that genuinely runs BEFORE step 2 (it's step 0, gating whether
+  # activation proceeds past its own success/failure at all) -- despite the
+  # "assertions" name, its `script` is just an arbitrary shell string run
+  # for effect, so it's used here to guarantee cfg.daemon.hostsFile exists
+  # as a real file (reusing seedHostsScript itself, so it's the SAME
+  # real/best-effort-last-known-good content nixnet-seed-hosts.service
+  # produces, not a bare placeholder) before system-manager-engine ever
+  # tries to canonicalize environment.etc.hosts's symlink chain. Combined
+  # with hostsFile now living under stateDir (/var/lib, survives reboots --
+  # see the option's own doc comment) rather than runtimeDir (/run, wiped
+  # every boot), this only needs to actually fire on the very first
+  # activation ever performed for a given host; every activation after
+  # that, the file this script would create already exists from either a
+  # previous run of this same script or from nixnetd's own last session.
+  #
+  # Uses the SAME `optionalAttrs isSystemManager` (not `mkIf`) pattern as
+  # the NixOS-only activationScripts block above, for the identical reason:
+  # `system-manager.preActivationAssertions` is an option namespace that
+  # simply doesn't exist under real NixOS at all, and assigning into an
+  # undeclared option path throws regardless of any mkIf wrapping.
+  // (optionalAttrs isSystemManager {
+    system-manager.preActivationAssertions.nixnetSeedHosts = {
+      enable = true;
+      script = "${seedHostsScript}";
     };
   }));
 }

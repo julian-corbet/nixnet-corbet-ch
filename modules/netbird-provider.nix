@@ -375,6 +375,27 @@ in
     # install/config management (docs/providers.md §6.1.3).
     services.netbird.enable = true;
 
+    # nixnetd's unit hard-requires SupplementaryGroups = [ "netbird" ]
+    # (see the systemd.services.nixnetd extension further down) so the
+    # exec-probe script above -- run as a child of nixnetd's own
+    # unprivileged process -- can reach NetBird's control socket. That
+    # group is NOT guaranteed to exist just because services.netbird.
+    # enable = true: upstream's netbird.nix only provisions a matching
+    # users.groups.<name> for a `hardened = true` client (AmbientCapabilities
+    # + DynamicUser-alike sandboxing), and `services.netbird.enable = true`
+    # here only sets up its backward-compat "default" client with
+    # `hardened = mkDefault false` -- i.e. a root-run daemon, no group at
+    # all, by default. Relying on that group having been provisioned as a
+    # side effect elsewhere is exactly the kind of assumption that leaves
+    # nixnetd crash-looping (systemd exit 216/GROUP, "Failed to determine
+    # supplementary groups") on any host where netbird just runs as root.
+    # Declare it ourselves instead, so the dependency is guaranteed rather
+    # than accidentally-sometimes-true. Safe even when services.netbird
+    # DOES also provision it (e.g. a consumer sets `hardened = true`):
+    # both contribute the same all-defaults `{ }` definition, and NixOS
+    # merges two such definitions for the same group with no conflict.
+    users.groups.netbird = { };
+
     # Contribute one exec-probe transport per configured peer, via
     # ordinary list-option merging into the SAME
     # services.nixnet.peers.<name>.transports list the consumer's own
