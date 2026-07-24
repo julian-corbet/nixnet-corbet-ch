@@ -1,0 +1,12 @@
+result
+result-*
+
+# Go build artifacts. vendor/ is intentionally NOT ignored -- it's
+# committed so `nix build` (vendorHash = null) works fully offline.
+/nixnetd
+/nixnetctl
+/cmd/nixnetd/nixnetd
+/cmd/nixnetctl/nixnetctl
+
+# Cloudflare wrangler local cache (holds account id + name — never commit)
+.wrangler/
