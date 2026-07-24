@@ -595,5 +595,47 @@ in
       enable = true;
       script = "${seedHostsScript}";
     };
+
+    # /etc/hosts management is silently useless if the host's own NSS
+    # config never actually reaches "files" for hostname lookups. Modern
+    # systemd-resolved defaults ship `hosts: resolve [!UNAVAIL=return]
+    # files ... dns` -- the [!UNAVAIL=return] means ANY answer from
+    # resolve (a successful DNS hit, NOT just success-or-fail) short-
+    # circuits NSS before "files" is ever consulted. On a split-horizon
+    # setup where DNS already answers a peer's hostname (e.g. via a VPN
+    # mesh's own DNS), nixnetd's carefully-computed winner in /etc/hosts
+    # is written correctly and then never read -- discovered exactly this
+    # way against a real deploy (DNS returned a mesh peer's overlay
+    # address for a hostname nixnetd had already resolved to the healthy
+    # LAN address). Rather than rewrite a file nixnet doesn't own, fail
+    # loudly at activation time with the fix, instead of a confusing
+    # mount/connect timeout discovered later -- same "enforce at
+    # declaration, not detection after the fact" principle as nixnas's
+    # persist-enforce.
+    system-manager.preActivationAssertions.nixnetNsswitchOrder = {
+      enable = true;
+      script = pkgs.writeShellScript "nixnet-nsswitch-check" ''
+        set -euo pipefail
+        line="$(grep '^hosts:' /etc/nsswitch.conf || true)"
+        if [ -z "$line" ]; then
+          exit 0   # no hosts: line at all -- not nixnet's problem to diagnose
+        fi
+        files_pos=$(echo "$line" | grep -bo '\bfiles\b' | head -1 | cut -d: -f1 || echo "")
+        resolve_pos=$(echo "$line" | grep -bo '\bresolve\b' | head -1 | cut -d: -f1 || echo "")
+        dns_pos=$(echo "$line" | grep -bo '\bdns\b' | head -1 | cut -d: -f1 || echo "")
+        shortcircuit_pos="$resolve_pos"
+        if [ -z "$shortcircuit_pos" ]; then shortcircuit_pos="$dns_pos"; fi
+        if [ -n "$files_pos" ] && [ -n "$shortcircuit_pos" ] && [ "$files_pos" -lt "$shortcircuit_pos" ]; then
+          exit 0   # files comes first -- nixnet's /etc/hosts entries are reachable
+        fi
+        echo "nixnet: /etc/nsswitch.conf's 'hosts:' line does not reach 'files' before" >&2
+        echo "  'resolve'/'dns' (found: $line)." >&2
+        echo "  nixnetd writes /etc/hosts correctly, but nothing will ever read it --" >&2
+        echo "  DNS answers first and NSS short-circuits on [!UNAVAIL=return]." >&2
+        echo "  Fix: put 'files' before 'resolve'/'dns' in that line, e.g.:" >&2
+        echo "    hosts: files mymachines resolve [!UNAVAIL=return] dns" >&2
+        exit 1
+      '';
+    };
   }));
 }
