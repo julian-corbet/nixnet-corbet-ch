@@ -294,7 +294,7 @@ let
   # ---------------------------------------------------------------------
   # nixnet package: nixnetd + nixnetctl. Defined once in ../package.nix,
   # shared with flake.nix's own `packages` output, so there's exactly one
-  # buildGoModule call in the whole repo.
+  # rustPlatform.buildRustPackage call in the whole repo.
   # ---------------------------------------------------------------------
   nixnetPackage = pkgs.callPackage ../package.nix { };
 

@@ -136,7 +136,7 @@ every ordinary NSS files-then-dns lookup
 
 `nixnetd` is entirely Nix-unaware — it only ever reads
 `/etc/nixnet/config.json` and writes JSON/text elsewhere
-(`/run/nixnet/hosts`, `/run/nixnet/status.json`,
+(`/var/lib/nixnet/hosts`, `/run/nixnet/status.json`,
 `/var/lib/nixnet/state.json`). The same binary works unmodified from a
 Nix-rendered config, a hand-written one, or a `system-manager` render.
 
@@ -148,7 +148,11 @@ Nix-rendered config, a hand-written one, or a `system-manager` render.
 - `package` — the `nixnetd`/`nixnetctl` build; override only to pin/patch.
 - `daemon.stateDir` (default `/var/lib/nixnet`), `daemon.runtimeDir`
   (default `nixnet`, under `/run`), `daemon.hostsFile` (default
-  `/run/nixnet/hosts`).
+  `${daemon.stateDir}/hosts`, i.e. `/var/lib/nixnet/hosts` — deliberately
+  under `stateDir`, not `runtimeDir`: `/run` is a fresh, empty tmpfs on
+  every boot, so a symlink chain ending there can never resolve before
+  something has (re)created it *this specific boot* — see the
+  `system-manager` note below).
 - `daemon.defaultProbe.{intervalMs,timeoutMs,upThreshold,downThreshold}` —
   the single source of truth every transport's own `probe.*` field falls
   back to when not set explicitly (defaults `3000`/`800`/`2`/`3` — ◐
@@ -236,11 +240,12 @@ services.nixnet.enable = true;
 nixnet only ever touches `environment.etc`, `systemd.services`/`timers`/
 `path` units, and a rendered JSON config — none of the primitives
 `system-manager` categorically can't reach (no `boot.kernel.sysctl`, no
-kernel command-line parameters). The one adoption trap worth knowing (not
-novel to nixnet): if a target's `/etc/hosts` already exists as a real file
-rather than a fresh path, `environment.etc.hosts.replaceExisting = true`
-must be set explicitly — omitting it is a silent no-op on `system-manager`,
-not an error.
+kernel command-line parameters). `modules/core.nix` sets
+`environment.etc.hosts.replaceExisting = true` itself on the
+`system-manager` backend (real NixOS has no such option — it always
+reconciles `/etc` from scratch on activation instead), so a target whose
+`/etc/hosts` already exists as a real, hand-edited file is adopted
+correctly with no action needed from a consumer.
 
 ## Security
 
@@ -259,20 +264,22 @@ privileged process.
 
 ## Building from source
 
-The daemon (`cmd/nixnetd`, `cmd/nixnetctl`) is a real, working Go
-implementation — the winner-selection/hysteresis engine
-(`internal/engine`), all four probe methods
-(`internal/probe`), both publish backends
-(`internal/publish`), and the `sd_notify` watchdog integration
-(`internal/sdnotify`) are complete, not stubs.
+The daemon (`nixnetd`, `nixnetctl`) is a real, working Rust
+implementation — a single crate with two `[[bin]]` targets over a shared
+library (`src/lib.rs`): the winner-selection/hysteresis engine
+(`src/engine`), all four probe methods (`src/probe`), both publish
+backends (`src/publish`), and the `sd_notify` watchdog integration
+(`src/sdnotify`) are complete, not stubs.
 
 ```
-go build ./...      # or: nix build .#nixnet
+cargo build --release   # or: nix build .#nixnet
+cargo test               # or: nix build .#nixnet (runs the same suite in-derivation)
 ```
 
-`vendor/` is committed (see `go.mod`/`go.sum`), so both build paths work
-fully offline — `nix build` uses `vendorHash = null` against the
-committed vendor directory rather than a network-fetch FOD hash.
+`Cargo.lock` is committed, so both build paths work fully offline — `nix
+build` uses `rustPlatform.buildRustPackage`'s `cargoLock.lockFile`
+against the committed lockfile rather than a separate vendor hash to keep
+in sync.
 
 ## Status
 

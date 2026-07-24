@@ -1,0 +1,55 @@
+[package]
+name = "nixnet"
+version = "0.1.0"
+edition = "2021"
+description = "Provider-agnostic transport failover daemon: peer address publish + uplink route-metric publish, health-checked, hysteresis-damped"
+homepage = "https://github.com/julian-corbet/nixnet-corbet-ch"
+license = "MIT"
+publish = false
+
+# nixnetd (resident daemon) and nixnetctl (status CLI) share all their
+# behavior through the library crate below -- mirrors the Go layout's
+# cmd/nixnetd + cmd/nixnetctl thin mains over internal/* packages.
+[[bin]]
+name = "nixnetd"
+path = "src/bin/nixnetd.rs"
+
+[[bin]]
+name = "nixnetctl"
+path = "src/bin/nixnetctl.rs"
+
+[lib]
+name = "nixnet"
+path = "src/lib.rs"
+
+[dependencies]
+# JSON config/state/status shapes (internal/config, internal/engine/state.go,
+# internal/status) -- the standard, de facto serde stack.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# RFC3339 timestamp formatting/parsing for status.json's generatedAt/since
+# and state.json's winnerSince. Chosen over chrono for a smaller dependency
+# footprint (no chrono, no icu data tables) -- relevant on an e2-micro,
+# 1GB-RAM target.
+time = { version = "0.3", default-features = false, features = ["formatting", "parsing", "std"] }
+
+# SO_BINDTODEVICE (bind_linux.go's exact technique) and raw-socket
+# construction for the ICMP prober. socket2 is the standard, well-maintained
+# crate for this -- a thin, safe wrapper over the same setsockopt(2) Go's
+# syscall.SetsockoptString call makes.
+socket2 = { version = "0.5", features = ["all"] }
+
+# Raw errno / sockaddr plumbing socket2 doesn't cover on its own (ICMP
+# recvfrom's peer-address comparison).
+libc = "0.2"
+
+# SIGINT/SIGTERM handling for the daemon's shutdown context, replacing Go's
+# signal.NotifyContext. Standard, widely-used, small.
+signal-hook = "0.3"
+
+# Atomic "write .tmp, fsync, [chmod,] rename()" publishing (hosts.go,
+# state.go, status.go all hand-roll the identical os.CreateTemp/Sync/
+# Close/Rename dance in Go; consolidated onto this one well-maintained
+# crate instead of three copies of the same unsafe-if-wrong logic).
+tempfile = "3"

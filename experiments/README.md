@@ -58,14 +58,14 @@ count over a fixed test window.
 
 ## 003 — privileged raw ICMP vs unprivileged `ping_group_range` SOCK_DGRAM
 
-**Question:** `internal/probe/probe.go`'s ICMP prober uses privileged raw
-sockets (`net.ListenPacket("ip4:icmp", ...)`, needs `CAP_NET_RAW`) per
-design.md §1's "capability-gated, only when needed" story. Linux also
-supports unprivileged `SOCK_DGRAM` ICMP (via
-`net.ipv4.ping_group_range`), which `golang.org/x/net/icmp` also supports
-(`"udp4"` network string). Would defaulting to that — where the sysctl
-happens to already permit it — let more peers-plus-ICMP installs stay in
-the zero-capability common case design.md §8 wants?
+**Question:** `src/probe/icmp.rs`'s ICMP prober uses privileged raw
+sockets (`Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))`,
+needs `CAP_NET_RAW`) per design.md §1's "capability-gated, only when
+needed" story. Linux also supports unprivileged `SOCK_DGRAM` ICMP (via
+`net.ipv4.ping_group_range`), which a plain `Type::DGRAM` +
+`Protocol::ICMPV4` socket also supports. Would defaulting to that — where
+the sysctl happens to already permit it — let more peers-plus-ICMP
+installs stay in the zero-capability common case design.md §8 wants?
 
 **Hypothesis:** unlikely to be a clean win — `ping_group_range` is a
 host-wide sysctl nixnet doesn't control and can't assume is set, and
@@ -87,15 +87,15 @@ knowing about before this ships anywhere real.
 
 **Status:** open.
 
-## 005 — one coarse `sync.Mutex` vs per-transport locks, at scale
+## 005 — one coarse `Mutex` vs per-transport locks, at scale
 
-**Question:** `internal/engine/engine.go` uses a single `Engine.mu`
-guarding all group/transport state (see the package doc comment's
+**Question:** `src/engine/mod.rs` uses a single `Engine.state: Mutex<..>`
+guarding all group/transport state (see the module doc comment's
 reasoning: this workload ticks in seconds, a handful of transports, one
 lock is simpler and costs nothing observable). At what transport count
 does that stop being true — does a large fleet (dozens of peers, each
 with several transports) start to see probe-tick jitter from lock
-contention against `publishPeersLocked`'s file I/O?
+contention against `publish_peers_locked`'s file I/O?
 
 **Method sketch:** a synthetic config with O(100) transports, instrumented
 tick-to-tick jitter measurement, before deciding whether per-group (not

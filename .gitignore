@@ -1,12 +1,10 @@
 result
 result-*
 
-# Go build artifacts. vendor/ is intentionally NOT ignored -- it's
-# committed so `nix build` (vendorHash = null) works fully offline.
-/nixnetd
-/nixnetctl
-/cmd/nixnetd/nixnetd
-/cmd/nixnetctl/nixnetctl
+# Cargo build artifacts. Cargo.lock is intentionally NOT ignored -- it's
+# committed so `nix build` (rustPlatform.buildRustPackage's cargoLock)
+# works fully offline and reproducibly.
+/target
 
 # Cloudflare wrangler local cache (holds account id + name — never commit)
 .wrangler/

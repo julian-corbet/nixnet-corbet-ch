@@ -116,8 +116,8 @@ services.nixnet.peers = lib.mkMerge (lib.mapAttrsToList (peerName: peerCfg: {
 }) cfg.tailscale-provider.peers);
 ```
 
-No Go code, no core-repo changes — this is the complete shape a new
-provider PR needs to fill in. `modules/netbird-provider.nix` is the same
+No daemon code changes, no core-repo changes — this is the complete shape
+a new provider PR needs to fill in. `modules/netbird-provider.nix` is the same
 shape at full scale (real drift detection, real reprovisioning, real
 exec-probe scripts) if you want a worked example past "minimal."
 
@@ -139,7 +139,7 @@ assigns `probe.exec = "${nixnetNetbirdAddressProbe} ${name}";`, which is a
 not a bare path. `types.path` cannot represent that. `modules/core.nix`
 types `probe.exec` as `types.nullOr types.str` instead, documented
 throughout as "a full command line, argv[0] already an absolute Nix store
-path." `internal/probe/probe.go`'s `runExec` tokenizes that string with a
+path." `src/probe/exec.rs`'s `run` tokenizes that string with a
 small quote-aware word-splitter and execs `argv[0]` directly — **never**
 through `/bin/sh** — which is actually a *stricter* reading of the design's
 own "no PATH dependency, one narrow well-tested exec" goal (§1's rationale
@@ -161,7 +161,7 @@ never moved. That would silently defeat the entire "dynamic address
 source" mechanism §6.2 describes as the reason the exec-probe JSON
 envelope's `address` field exists at all.
 
-`internal/engine/engine.go`'s `reconcileLocked` additionally republishes
+`src/engine/mod.rs`'s `reconcile_locked` additionally republishes
 whenever the current winner's effective address differs from what was
 last actually published — winner-index unchanged or not. This is a
 narrow, additive extension: it changes *when* a publish happens, never
@@ -176,7 +176,7 @@ pseudocode log line format (`"transport=%s state=%s->Up after=%d" %
 (id, ...)`) and §5.3's `status.json` shape (a `transports` object keyed by
 some string) both assume transports have string identities somewhere.
 
-`internal/engine/engine.go` resolves this gap by using each transport's
+`src/engine/mod.rs` resolves this gap by using each transport's
 position in its `transports` list as its stable identity for
 `state.json` persistence, and derives a readable label
 (`peer/host-b#0(lan)`) from `providerId`/`interface`/`address` (whichever
@@ -213,8 +213,8 @@ actually wires the two together — read completely literally,
 `daemon.defaultProbe` would be a dead option nobody consults.
 `modules/core.nix`'s `probeType` submodule instead sets each field's
 default to `cfg.daemon.defaultProbe.<field>`, and
-`internal/config/config.go`'s hand-written-JSON fallback path mirrors the
-same chain (`Probe.applyDefaults` takes the resolved `daemon.defaultProbe`
+`src/config.rs`'s hand-written-JSON fallback path mirrors the
+same chain (`Probe::apply_defaults` takes the resolved `daemon.defaultProbe`
 as a parameter). This makes `daemon.defaultProbe` an actually-functional
 single point of control, matching what the option's existence otherwise
 implies it should do.
