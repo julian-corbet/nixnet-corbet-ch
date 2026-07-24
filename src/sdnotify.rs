@@ -14,8 +14,17 @@ use std::time::Duration;
 /// running under systemd -- e.g. local development), matching
 /// `sd_notify`'s own documented behavior.
 pub fn notify(state: &str) -> io::Result<()> {
-    let socket_path = match std::env::var("NOTIFY_SOCKET") {
-        Ok(v) if !v.is_empty() => v,
+    notify_to(std::env::var("NOTIFY_SOCKET").ok().as_deref(), state)
+}
+
+/// Pure core of [`notify`], taking the socket path explicitly instead of
+/// reading the environment -- lets tests exercise the logic without
+/// mutating process-global state (env vars are shared across the whole
+/// test-binary process, and the default test harness runs tests
+/// concurrently in threads, so env-var-mutating tests race each other).
+fn notify_to(socket_path: Option<&str>, state: &str) -> io::Result<()> {
+    let socket_path = match socket_path {
+        Some(v) if !v.is_empty() => v,
         _ => return Ok(()),
     };
 
@@ -28,7 +37,7 @@ pub fn notify(state: &str) -> io::Result<()> {
         let addr = SocketAddr::from_abstract_name(rest.as_bytes())?;
         sock.send_to_addr(state.as_bytes(), &addr)?;
     } else {
-        sock.send_to(state.as_bytes(), &socket_path)?;
+        sock.send_to(state.as_bytes(), socket_path)?;
     }
     Ok(())
 }
@@ -39,7 +48,14 @@ pub fn notify(state: &str) -> io::Result<()> {
 /// has no watchdog configured (`WATCHDOG_USEC` unset -- again, a plain
 /// no-op, not an error).
 pub fn watchdog_interval() -> Option<Duration> {
-    let usec_str = std::env::var("WATCHDOG_USEC").ok()?;
+    parse_watchdog_usec(std::env::var("WATCHDOG_USEC").ok().as_deref())
+}
+
+/// Pure core of [`watchdog_interval`] -- see [`notify_to`] for why this is
+/// split out (env-var-mutating tests race each other under the default
+/// concurrent test harness; a pure function sidesteps that entirely).
+fn parse_watchdog_usec(usec_str: Option<&str>) -> Option<Duration> {
+    let usec_str = usec_str?;
     if usec_str.is_empty() {
         return None;
     }
@@ -56,44 +72,26 @@ mod tests {
 
     #[test]
     fn notify_is_a_silent_noop_without_notify_socket() {
-        // SAFETY: test-only env var manipulation, single-threaded within
-        // this test's own process step (no other test in this module
-        // touches NOTIFY_SOCKET concurrently).
-        unsafe {
-            std::env::remove_var("NOTIFY_SOCKET");
-        }
-        assert!(notify("READY=1").is_ok());
+        assert!(notify_to(None, "READY=1").is_ok());
     }
 
     #[test]
     fn watchdog_interval_is_none_when_unset() {
-        unsafe {
-            std::env::remove_var("WATCHDOG_USEC");
-        }
-        assert_eq!(watchdog_interval(), None);
+        assert_eq!(parse_watchdog_usec(None), None);
     }
 
     #[test]
     fn watchdog_interval_is_half_of_watchdog_usec() {
-        unsafe {
-            std::env::set_var("WATCHDOG_USEC", "20000000");
-        }
-        assert_eq!(watchdog_interval(), Some(Duration::from_secs(10)));
-        unsafe {
-            std::env::remove_var("WATCHDOG_USEC");
-        }
+        assert_eq!(
+            parse_watchdog_usec(Some("20000000")),
+            Some(Duration::from_secs(10))
+        );
     }
 
     #[test]
     fn watchdog_interval_is_none_for_zero_or_negative_or_unparsable() {
         for v in ["0", "-5", "not-a-number", ""] {
-            unsafe {
-                std::env::set_var("WATCHDOG_USEC", v);
-            }
-            assert_eq!(watchdog_interval(), None, "value {:?}", v);
-        }
-        unsafe {
-            std::env::remove_var("WATCHDOG_USEC");
+            assert_eq!(parse_watchdog_usec(Some(v)), None, "value {:?}", v);
         }
     }
 
@@ -103,13 +101,7 @@ mod tests {
         let sock_path = dir.path().join("notify.sock");
         let listener = UnixDatagram::bind(&sock_path).unwrap();
 
-        unsafe {
-            std::env::set_var("NOTIFY_SOCKET", sock_path.to_str().unwrap());
-        }
-        notify("READY=1").unwrap();
-        unsafe {
-            std::env::remove_var("NOTIFY_SOCKET");
-        }
+        notify_to(Some(sock_path.to_str().unwrap()), "READY=1").unwrap();
 
         let mut buf = [0u8; 64];
         listener
