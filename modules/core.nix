@@ -317,6 +317,16 @@ let
     mkdir -p "$runtime_dir"
     hosts_dir=$(dirname "${cfg.daemon.hostsFile}")
     mkdir -p "$hosts_dir"
+    # hostsFile deliberately lives outside nixnetd's DynamicUser StateDirectory
+    # (see the option's own doc comment) specifically so it stays reachable by
+    # every other reader on the box. nixnetd itself writes here as an
+    # unprivileged, per-boot-random DynamicUser UID with no fixed group to
+    # grant ownership through, so the directory has to be sticky+world-
+    # writable (mode 1777, same model as /tmp) for nixnetd's own atomic
+    # write-tmp-then-rename to succeed -- there is exactly one writer
+    # (nixnetd) in practice, and the content itself (hostname -> address
+    # mappings) is no more sensitive than what's already public via DNS.
+    chmod 1777 "$hosts_dir"
 
     tmp=$(mktemp "${cfg.daemon.hostsFile}.seed.XXXXXX")
     trap 'rm -f "$tmp"' EXIT
@@ -365,12 +375,26 @@ in
       runtimeDir = mkOption { type = types.str; default = "nixnet"; description = "Under /run."; };
       hostsFile = mkOption {
         type = types.path;
-        default = "${cfg.daemon.stateDir}/hosts";
+        # NOT "${cfg.daemon.stateDir}/hosts" -- found 2026-07-25 in production:
+        # nixnetd runs with DynamicUser=true, so systemd relocates its
+        # StateDirectory to /var/lib/private/nixnet (a symlinked-from
+        # /var/lib/nixnet convenience path) and, crucially, makes the shared
+        # /var/lib/private/ PARENT directory 0700 root:root -- a hardcoded
+        # systemd isolation boundary with no per-service override. Any file
+        # nixnetd writes under stateDir inherits that same unreachability for
+        # every OTHER process on the box, including systemd-resolved and
+        # every plain NSS "files" lookup -- exactly the readers /etc/hosts
+        # exists to serve. A sibling directory outside stateDir (still under
+        # /var/lib, so the persistence argument below still holds) sidesteps
+        # the private-parent entirely.
+        default = "/var/lib/nixnet-hosts/hosts";
         description = ''
           Where nixnetd actually keeps /etc/hosts's live content --
           environment.etc.hosts.source points here (see the comment on
-          that option below). Deliberately under stateDir (/var/lib), NOT
-          runtimeDir (/run): /run is a fresh, empty tmpfs on every single
+          that option below). Deliberately under /var/lib (persists across
+          reboots), but deliberately NOT nested under stateDir -- see the
+          comment on the default above for why. /run is ruled out for the
+          same reason it always was: a fresh, empty tmpfs on every single
           boot, so a symlink chain ending there can never resolve until
           something has run *this specific boot* to (re)create it -- and
           on the system-manager backend specifically, nothing has, at the
@@ -427,6 +451,20 @@ in
           what gives the DynamicUser nixnetd runs as correct ownership of
           it. A path elsewhere would silently keep the *directory name*
           but not actually point at the location you configured.
+        '';
+      }
+      {
+        assertion = !(hasPrefix ("${toString cfg.daemon.stateDir}/") (toString cfg.daemon.hostsFile));
+        message = ''
+          services.nixnet.daemon.hostsFile (${toString cfg.daemon.hostsFile}) must NOT
+          live under services.nixnet.daemon.stateDir (${toString cfg.daemon.stateDir}).
+          Found in production 2026-07-25: nixnetd's StateDirectory= is silently
+          relocated by systemd (DynamicUser=true) to /var/lib/private/<name>,
+          and the shared /var/lib/private/ parent is 0700 root:root with no
+          per-service override -- anything nested under stateDir inherits that
+          same unreachability for every other reader on the box, including
+          /etc/hosts's whole reason to exist. hostsFile has its own sibling
+          directory (see its option default) precisely to avoid this.
         '';
       }
     ] ++ (flatten (mapAttrsToList
@@ -520,7 +558,7 @@ in
         StateDirectory = baseNameOf (toString cfg.daemon.stateDir);
         NoNewPrivileges = true;
         ProtectSystem = "strict";
-        ReadWritePaths = [ "/run/${cfg.daemon.runtimeDir}" cfg.daemon.stateDir ];
+        ReadWritePaths = [ "/run/${cfg.daemon.runtimeDir}" cfg.daemon.stateDir (dirOf cfg.daemon.hostsFile) ];
         AmbientCapabilities =
           (optional needsNetAdmin "CAP_NET_ADMIN")
           ++ (optional needsNetRaw "CAP_NET_RAW");

@@ -136,7 +136,7 @@ every ordinary NSS files-then-dns lookup
 
 `nixnetd` is entirely Nix-unaware — it only ever reads
 `/etc/nixnet/config.json` and writes JSON/text elsewhere
-(`/var/lib/nixnet/hosts`, `/run/nixnet/status.json`,
+(`/var/lib/nixnet-hosts/hosts`, `/run/nixnet/status.json`,
 `/var/lib/nixnet/state.json`). The same binary works unmodified from a
 Nix-rendered config, a hand-written one, or a `system-manager` render.
 
@@ -186,11 +186,15 @@ candidates show up.
 - `package` — the `nixnetd`/`nixnetctl` build; override only to pin/patch.
 - `daemon.stateDir` (default `/var/lib/nixnet`), `daemon.runtimeDir`
   (default `nixnet`, under `/run`), `daemon.hostsFile` (default
-  `${daemon.stateDir}/hosts`, i.e. `/var/lib/nixnet/hosts` — deliberately
-  under `stateDir`, not `runtimeDir`: `/run` is a fresh, empty tmpfs on
-  every boot, so a symlink chain ending there can never resolve before
-  something has (re)created it *this specific boot* — see the
-  `system-manager` note below).
+  `/var/lib/nixnet-hosts/hosts` — under `/var/lib`, not `runtimeDir`:
+  `/run` is a fresh, empty tmpfs on every boot, so a symlink chain ending
+  there can never resolve before something has (re)created it *this
+  specific boot* — see the `system-manager` note below. Deliberately a
+  sibling of `stateDir`, not nested under it: `nixnetd` runs with
+  `DynamicUser=true`, which relocates `stateDir` under the shared,
+  `0700 root:root` `/var/lib/private/` parent — anything nested there
+  becomes unreadable to every other process on the box, defeating the
+  whole point of `/etc/hosts`).
 - `daemon.defaultProbe.{intervalMs,timeoutMs,upThreshold,downThreshold}` —
   the single source of truth every transport's own `probe.*` field falls
   back to when not set explicitly (defaults `3000`/`800`/`2`/`3` — ◐
