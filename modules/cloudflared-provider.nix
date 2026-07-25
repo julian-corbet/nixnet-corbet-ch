@@ -32,7 +32,7 @@ let
 
   driftCheckScript = pkgs.writeShellApplication {
     name = "nixnet-cloudflared-drift-check";
-    runtimeInputs = [ pkgs.curl pkgs.jq pkgs.systemd pkgs.coreutils ];
+    runtimeInputs = [ pkgs.curl pkgs.jq pkgs.systemd pkgs.coreutils pkgs.gawk ];
     text = ''
       set -euo pipefail
 
@@ -58,6 +58,21 @@ let
       if [ "$drift" -eq 0 ]; then
         rm -f "$drift_count_file"
         echo "nixnet-cloudflared-drift-check: healthy"
+        exit 0
+      fi
+
+      # A freshly-(re)started cloudflared genuinely needs a few seconds to
+      # reach the edge -- on a slow boot (network-online.target delayed) or
+      # right after an unrelated switch-triggered restart, that legitimate
+      # startup window looks identical to real drift. Give it the same
+      # grace period the threshold itself represents (checkIntervalSec *
+      # driftFailureThreshold) before counting a failure at all, rather
+      # than risk restarting a daemon that was already about to succeed.
+      active_since_us=$(systemctl show ${lib.escapeShellArg cfg.tunnelUnit} -p ActiveEnterTimestampMonotonic --value 2>/dev/null || echo 0)
+      now_us=$(awk '{ printf "%d", $1 * 1000000 }' /proc/uptime)
+      age_sec=$(( (now_us - active_since_us) / 1000000 ))
+      if [ "$age_sec" -lt ${toString (cfg.checkIntervalSec * cfg.driftFailureThreshold)} ]; then
+        echo "nixnet-cloudflared-drift-check: drift-shaped reading but ${cfg.tunnelUnit} only active ''${age_sec}s -- within startup grace, not counting"
         exit 0
       fi
 
@@ -139,6 +154,27 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        # The exact regression this module already shipped once (caught in
+        # build-verification, not by this assertion): a pre-suffixed
+        # tunnelUnit silently creates a second, bogus
+        # "<name>.service.service" unit that gets TUNNEL_METRICS instead of
+        # the real one -- which then leaves the REAL tunnel's /ready
+        # endpoint permanently unreachable, so this watchdog would restart
+        # a healthy, public-serving tunnel every minRestartIntervalSec
+        # forever. Strictly worse than not running this module at all, so
+        # it's worth a hard eval-time guard, not just a doc comment.
+        assertion = !(lib.hasSuffix ".service" cfg.tunnelUnit) && !(lib.hasInfix "/" cfg.tunnelUnit);
+        message = ''
+          services.nixnet.cloudflared.tunnelUnit ("${cfg.tunnelUnit}") must
+          be the BARE systemd unit name, with no ".service" suffix and no
+          "/" -- see this option's own description for why a pre-suffixed
+          value is actively dangerous here, not just redundant.
+        '';
+      }
+    ];
+
     systemd.services.${cfg.tunnelUnit}.environment.TUNNEL_METRICS = cfg.metricsAddr;
 
     systemd.timers.nixnet-cloudflared-drift-check = {
