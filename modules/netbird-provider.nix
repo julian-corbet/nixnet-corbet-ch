@@ -61,7 +61,7 @@ let
   mkAddressProbe = peerName: peerCfg:
     pkgs.writeShellApplication {
       name = "nixnet-netbird-address-probe-${peerName}";
-      runtimeInputs = [ pkgs.netbird pkgs.jq ];
+      runtimeInputs = [ pkgs.netbird pkgs.jq pkgs.iproute2 ];
       text = ''
         set -euo pipefail
 
@@ -232,7 +232,7 @@ let
 
   reprovisionScript = pkgs.writeShellApplication {
     name = "nixnet-netbird-reprovision";
-    runtimeInputs = [ pkgs.netbird pkgs.jq pkgs.util-linux pkgs.coreutils ];
+    runtimeInputs = [ pkgs.netbird pkgs.jq pkgs.util-linux pkgs.coreutils pkgs.iproute2 ];
     text = ''
       set -euo pipefail
 
