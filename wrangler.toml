@@ -1,13 +1,13 @@
 name = "nixnet"
-compatibility_date = "2026-07-24"
+compatibility_date = "2026-07-25"
 
 # Static project page — Cloudflare Worker static assets (same shape as the
-# sibling project sites). Content lives in ./site.
-#
-# No [[routes]]/custom_domain block here (unlike sibling repos' wrangler.toml)
-# — this is a public repo and a custom-domain route would hardcode a private
-# domain into version control. Wire up the route out-of-band when this site
-# is actually deployed.
+# sibling project sites). Links the central foss/v1 design + local theme.css.
 [assets]
 directory = "./site"
+# Pinned rather than left to the platform default, matching the sibling sites.
 html_handling = "auto-trailing-slash"
+
+[[routes]]
+pattern = "nixnet.corbet.ch"
+custom_domain = true

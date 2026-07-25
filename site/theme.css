@@ -1,0 +1,55 @@
+/* =====================================================================
+   nixnet / site / theme.css
+   Project-specific theme override for the foss/v1 design system.
+   Only touches the tokens documented as "safe to override" in the
+   design-corbet-ch project-pages theming contract — retints the accent
+   hue to an indigo, distinct from every sibling (nixarch teal, nixvps
+   amber, nixram emerald, nixapps violet, nixgpu red, nixk3s blue,
+   nixremote lime, nixfish/nixllm pink, nixnas/nixvibe cyan, nixpush
+   fuchsia).
+
+   Load order:
+     <link rel="stylesheet" href="https://v1.foss.design.corbet.ch/assets/base.css">
+     <link rel="stylesheet" href="./theme.css">
+   ===================================================================== */
+
+:root {
+  /* Dark mode (and default) accent — indigo-400. #818cf8 on the dark
+     --bg (#0b1120) is 6.31:1, comfortably AA (computed via WCAG relative
+     luminance, not eyeballed). */
+  --accent: #818cf8;
+  --accent-hover: #a5b4fc;
+  --accent-dim: rgba(129, 140, 248, 0.12);
+  --accent-glow: rgba(129, 140, 248, 0.08);
+  --accent-text: #0b1120;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    /* Darker indigo for light mode — #4f46e5 on #ffffff is 6.29:1, and
+       white text on it is the same 6.29:1. Both AA. */
+    --accent: #4f46e5;
+    --accent-hover: #4338ca;
+    --accent-dim: rgba(79, 70, 229, 0.08);
+    --accent-glow: rgba(79, 70, 229, 0.06);
+    --accent-text: #ffffff;
+  }
+}
+
+/* Mirror both variants for the explicit data-theme toggle, so it wins
+   over the OS media query in both directions. */
+:root[data-theme="dark"] {
+  --accent: #818cf8;
+  --accent-hover: #a5b4fc;
+  --accent-dim: rgba(129, 140, 248, 0.12);
+  --accent-glow: rgba(129, 140, 248, 0.08);
+  --accent-text: #0b1120;
+}
+
+:root[data-theme="light"] {
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-dim: rgba(79, 70, 229, 0.08);
+  --accent-glow: rgba(79, 70, 229, 0.06);
+  --accent-text: #ffffff;
+}

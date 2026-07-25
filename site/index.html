@@ -3,83 +3,121 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>nixnet &mdash; declarative transport failover for NixOS</title>
-  <meta name="description" content="nixnet picks the best currently-healthy path to a host or a local uplink — LAN or VPN overlay, wired or cellular — and publishes the winner so ssh, mount, and curl need zero mesh-awareness.">
+
+  <title>nixnet &mdash; provider-agnostic transport failover for NixOS</title>
+  <meta name="description" content="nixnet picks the best currently-healthy path to a peer or a local uplink — LAN or VPN overlay, wired or cellular — and publishes the winner into /etc/hosts or a route metric, so ssh, mount and curl need zero mesh-awareness. Rust daemon plus NixOS and system-manager modules. v0.1, not yet run against a real fleet.">
+
   <meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+
   <meta property="og:title" content="nixnet">
-  <meta property="og:description" content="Declarative transport failover for NixOS. One engine, two tables: which address reaches a peer, which uplink carries egress — both health-checked, both hysteresis-damped, both published with zero app awareness.">
+  <meta property="og:description" content="Provider-agnostic transport failover. One engine, two shapes: which address reaches a peer, which uplink carries egress — both health-checked, both hysteresis-damped, both published with zero app awareness.">
   <meta property="og:type" content="website">
-  <!-- TODO(publish): replace with the real deployed URL once the Publish stage picks a hosting domain -->
-  <meta property="og:url" content="https://nixnet.example.com/">
-  <meta property="og:image" content="https://nixnet.example.com/og-image.png">
-  <meta property="og:image:width" content="1200">
-  <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="nixnet wordmark over a terminal showing a peer and an uplink mid-failover">
-  <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:image" content="https://nixnet.example.com/og-image.png">
+  <meta property="og:url" content="https://nixnet.corbet.ch">
+
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="./style.css">
+
+  <link rel="stylesheet" href="https://v1.foss.design.corbet.ch/assets/base.css">
+  <link rel="stylesheet" href="./theme.css">
 </head>
 <body>
 
 <header class="hero">
-  <nav class="container">
+  <nav>
     <a href="/" class="nav-brand">nixnet</a>
     <div class="nav-links">
       <a href="https://github.com/julian-corbet/nixnet-corbet-ch/blob/main/docs/providers.md">Docs</a>
       <a href="https://github.com/julian-corbet/nixnet-corbet-ch">GitHub</a>
       <a href="#install">Install</a>
+      <details class="nav-family">
+        <summary>nix* family</summary>
+        <nav class="nav-family-panel" aria-label="The nix* project family">
+          <a href="https://nixapps.corbet.ch">nixapps <span>cluster apps as typed Nix</span></a>
+          <a href="https://nixarch.corbet.ch">nixarch <span>Arch's AUR breadth, Nix's declarative config</span></a>
+          <a href="https://nixbackup.corbet.ch">nixbackup <span>verify the backup, not the exit code</span></a>
+          <a href="https://nixfish.corbet.ch">nixfish <span>your fish config as code</span></a>
+          <a href="https://nixgpu.corbet.ch">nixgpu <span>share one GPU by priority</span></a>
+          <a href="https://nixk3s.corbet.ch">nixk3s <span>the host is a flake, the cluster is git</span></a>
+          <a href="https://nixllm.corbet.ch">nixllm <span>the model store IS the registry</span></a>
+          <a href="https://nixnas.corbet.ch">nixnas <span>declarative NAS on a USB stick</span></a>
+          <a href="https://nixnet.corbet.ch" aria-current="page">nixnet <span>the best live path to a host</span></a>
+          <a href="https://nixpush.corbet.ch">nixpush <span>one send call, any notification backend</span></a>
+          <a href="https://nixram.corbet.ch">nixram <span>RAM tuning that fits your machine</span></a>
+          <a href="https://nixremote.corbet.ch">nixremote <span>remote apps as real windows</span></a>
+          <a href="https://nixvibe.corbet.ch">nixvibe <span>a coding agent in a browser terminal</span></a>
+          <a href="https://nixvps.corbet.ch">nixvps <span>NixOS on sub-1GB VPSes</span></a>
+        </nav>
+      </details>
     </div>
   </nav>
 
   <div class="hero-content">
     <h1>nixnet</h1>
     <p class="tagline">Still reachable when the mesh isn't.</p>
-    <p class="subtitle">nixnet is a small resident daemon and NixOS module that picks the best currently-healthy path to a host or a local uplink — LAN or VPN overlay, wired or cellular — and publishes the winner where <code>ssh</code>, <code>mount</code>, and everything else already look. It replaces the hand-rolled per-host failover script, and fills the one gap every mesh VPN daemon leaves open: what happens when the mesh itself is down.</p>
+    <p class="subtitle">
+      nixnet is a small resident daemon plus a NixOS (and
+      <code>system-manager</code>) module surface. It picks the best
+      currently-healthy path to a peer or a local uplink &mdash; LAN or VPN
+      overlay, wired or cellular &mdash; and publishes the winner where
+      <code>ssh</code>, <code>mount</code> and everything else already look.
+      It replaces the hand-rolled per-host failover script, and fills the gap
+      every mesh VPN daemon leaves open: what happens when the mesh itself is
+      down.
+    </p>
     <div class="cta">
       <a href="#install" class="btn btn-primary">Get started</a>
-      <a href="https://github.com/julian-corbet/nixnet-corbet-ch" class="btn btn-secondary">Read the source</a>
+      <a href="https://github.com/julian-corbet/nixnet-corbet-ch" class="btn btn-secondary">View on GitHub</a>
     </div>
   </div>
 
   <div class="hero-demo">
     <div class="terminal">
       <div class="terminal-header">
-        <div class="terminal-dots"><span></span><span></span><span></span></div>
-        <span class="terminal-title">nixnetctl — a peer and an uplink, mid-failover</span>
+        <div class="terminal-dots">
+          <span></span><span></span><span></span>
+        </div>
+        <span class="terminal-title">nixnetctl &mdash; a peer and an uplink, mid-failover</span>
       </div>
-      <pre class="terminal-body"><code><span class="prompt">$</span> nixnetctl status
-PEER      WINNER          TRANSPORTS
-host-b    lan (up 2h11m)  lan=up  overlay=up
+      <pre class="terminal-body"><code><span class="prompt">$</span> nixnetctl
+<span class="output">nixnet status as of 2026-07-25T12:04:11Z
 
-UPLINK    WINNER    TRANSPORTS
-internet  wired0    wired0=up  wireless0=up  cellular0=down
+peers:
+  host-b               winner=192.0.2.20       since=2026-07-25T09:53:02Z
+      peer/host-b#0(192.0.2.20)      up       tcp connect ok
+      peer/host-b#1(netbird)         up       tcp connect ok
 
-<span class="output">-- wired0 unplugged --</span>
-<span class="prompt">$</span> journalctl -u nixnetd -n2 --no-pager
-<span class="output">uplink=internet transport=wired0 state=Up-&gt;Down after=3</span>
-<span class="output">uplink=internet winner=wireless0 reason=failover</span>
+uplinks:
+  internet             winner=wired0           since=2026-07-25T09:53:02Z
+      uplink/internet#0(wired0)      up       tcp connect ok
+      uplink/internet#1(wireless0)   up       tcp connect ok
+      uplink/internet#2(cellular0)   down     Network is unreachable (os error 101)</span>
+
+<span class="output"># wired0 unplugged</span>
+<span class="prompt">$</span> journalctl -u nixnetd -o cat -n 2
+<span class="output">2026/07/25 12:07:31 transport=uplink/internet#0(wired0) state=up-&gt;down after=5 detail="Network is unreachable (os error 101)"
+2026/07/25 12:07:31 group=uplink=internet winner-change new=uplink/internet#1(wireless0)</span>
 
 <span class="prompt">$</span> ssh host-b
-<span class="output">Last login: Fri Jul 24 10:02:11 2026 from 198.51.100.4</span></code></pre>
+<span class="output">Last login: Sat Jul 25 12:07:44 2026</span></code></pre>
     </div>
   </div>
 </header>
 
-<section id="how-it-works">
+<main>
+
+<section id="how-it-works" class="how-it-works">
   <div class="container">
     <h2>How it works</h2>
     <div class="steps">
       <div class="step">
         <div class="step-num">1</div>
         <h3>Describe the transports</h3>
-        <p>List every way to reach a peer, or carry an uplink — LAN, overlay, wired, wireless — each with a priority and a health check, in one declarative schema.</p>
+        <p>List every way to reach a peer, or to carry an uplink &mdash; LAN, overlay, wired, wireless, cellular &mdash; each with a priority and a health check, in one declarative schema.</p>
       </div>
       <div class="step">
         <div class="step-num">2</div>
         <h3>nixnetd probes, continuously</h3>
-        <p>Every transport gets its own goroutine and its own ticker, so one slow or hung probe never delays another. A hysteresis state machine tells healthy apart from flapping.</p>
+        <p>Every transport gets its own thread and its own ticker, so one slow or hung probe never delays another. A hysteresis state machine tells healthy apart from flapping.</p>
       </div>
       <div class="step">
         <div class="step-num">3</div>
@@ -95,36 +133,40 @@ internet  wired0    wired0=up  wireless0=up  cellular0=down
     <h2>Features</h2>
     <div class="feature-grid">
       <div class="feature">
-        <h3>One schema, two tables</h3>
-        <p><code>peers.&lt;name&gt;</code> and <code>uplinks.&lt;name&gt;</code> share one transport type and one engine — not a bolt-on <code>kind</code> discriminator bolted onto a single pool.</p>
+        <h3>One schema, two shapes</h3>
+        <p><code>peers.&lt;name&gt;</code> and <code>uplinks.&lt;name&gt;</code> share one transport type and one engine. Only the publish backend differs &mdash; an <code>/etc/hosts</code> entry for peers, a kernel route metric for uplinks.</p>
       </div>
       <div class="feature">
         <h3>Provider-agnostic by contract</h3>
-        <p>A provider contributes ordinary list entries, optionally backed by an exec script — exit code plus one JSON line. No plugin loader, no core changes for a new mesh.</p>
+        <p>A provider contributes ordinary Nix list entries, optionally backed by an exec script &mdash; an exit code plus one JSON line on stdout. No plugin loader, and no core changes for a new mesh.</p>
       </div>
       <div class="feature">
         <h3>Hysteresis-damped</h3>
-        <p>A minimum hold time stops nixnet switching away from a healthy winner just because a lower-priority option also came up — but a dead winner is never held onto.</p>
+        <p>A minimum hold time stops nixnet switching away from a healthy winner just because a lower-priority option also came up &mdash; but a dead winner is never held onto.</p>
       </div>
       <div class="feature">
         <h3>No resolver, no listener</h3>
-        <p>Peers publish into <code>/etc/hosts</code>, read by NSS <code>files</code> ahead of <code>dns</code>. Zero query-time protocol, zero coupling to whichever mesh daemon's own resolver is currently unwell.</p>
+        <p>Peers publish into <code>/etc/hosts</code>, read by NSS <code>files</code> ahead of <code>dns</code>. Zero query-time protocol, and nixnet never listens on a network port for peer publishing.</p>
       </div>
       <div class="feature">
         <h3>Reprioritizes, never replaces</h3>
-        <p>Uplink failover flips a route's metric field only — the gateway and every other attribute DHCP or a static config assigned is left exactly as it was.</p>
+        <p>Uplink failover flips a route's metric field only &mdash; the gateway and every other attribute DHCP or a static config assigned is left exactly as it was.</p>
       </div>
       <div class="feature">
         <h3>Self-watchdogged</h3>
-        <p><code>nixnetd</code> calls <code>sd_notify(WATCHDOG=1)</code> on its own heartbeat; systemd force-restarts it if the event loop ever wedges — no bespoke supervision code.</p>
+        <p><code>nixnetd</code> calls <code>sd_notify(WATCHDOG=1)</code> on its own heartbeat, so systemd force-restarts it if the event loop ever wedges. No bespoke supervision code.</p>
       </div>
       <div class="feature">
         <h3>Unprivileged by default</h3>
-        <p>A peers-only install using TCP or HTTP probes gets zero elevated capabilities. <code>CAP_NET_RAW</code> is granted automatically, and only, when a transport actually needs it.</p>
+        <p>Runs as <code>DynamicUser</code> under <code>ProtectSystem=strict</code>. A peers-only install using TCP or HTTP probes gets no elevated capabilities at all; <code>CAP_NET_RAW</code> and <code>CAP_NET_ADMIN</code> are granted only when a transport actually needs them.</p>
       </div>
       <div class="feature">
-        <h3>Ships a NetBird provider</h3>
-        <p>Detects the local mesh identity going stale, or silently re-enrolling against the wrong endpoint, and re-provisions headlessly from a setup key — failing loudly, never silently, when it can't.</p>
+        <h3>Nix-unaware daemon</h3>
+        <p><code>nixnetd</code> only ever reads <code>/etc/nixnet/config.json</code>. The same binary works unmodified from a Nix-rendered config, a hand-written one, or a <code>system-manager</code> render.</p>
+      </div>
+      <div class="feature">
+        <h3>Ships real providers</h3>
+        <p><code>netbird-provider</code> contributes the overlay address <em>and</em> detects local identity going stale or enrolled against the wrong endpoint, re-enrolling headlessly from a setup key. <code>cloudflared-provider</code> restarts a tunnel whose edge connection has wedged without the process dying.</p>
       </div>
     </div>
   </div>
@@ -140,7 +182,7 @@ internet  wired0    wired0=up  wireless0=up  cellular0=down
             |
             v
       +------------+
-      |  nixnetd   |   one probe goroutine + ticker per transport
+      |  nixnetd   |   one probe thread + ticker per transport
       +-----+------+
             |
       winner changes?
@@ -162,13 +204,33 @@ every ordinary NSS files-then-dns lookup</code></pre>
       </div>
       <div class="arch-detail">
         <h3>One health contract</h3>
-        <p>Built-in TCP, ICMP, and HTTP probes cover the common case. A provider needing richer health, or a dynamically discovered address, drops in an exec script: exit code plus one optional JSON line.</p>
+        <p>Built-in TCP, ICMP and HTTP probes cover the common case. A provider needing richer health, or a dynamically discovered address, drops in an exec probe: an exit code plus one optional JSON line.</p>
       </div>
       <div class="arch-detail">
         <h3>Reconverges from disk</h3>
-        <p>Hysteresis counters and last-known winners persist to <code>/var/lib/nixnet/state.json</code>. A killed or restarted daemon rebuilds its picture correctly — no special recovery path.</p>
+        <p>Hysteresis counters and last-known winners persist to <code>/var/lib/nixnet/state.json</code>, written with the same atomic write-then-rename discipline as every other output. A restarted daemon rebuilds its picture correctly &mdash; no special recovery path.</p>
       </div>
     </div>
+  </div>
+</section>
+
+<section id="status">
+  <div class="container">
+    <h2>Status</h2>
+    <p>
+      <strong>v0.1 &mdash; fresh project.</strong> The winner-selection and
+      hysteresis engine, all four probe methods, both publish backends and the
+      <code>sd_notify</code> watchdog integration are implemented for real, not
+      stubbed, and the test suite runs in-derivation on every
+      <code>nix build</code>. What has <em>not</em> happened yet is a real
+      deployment: nothing here has run against a live fleet. Default probe
+      intervals and hold times are reasoned, not measured &mdash; the repo's
+      <code>experiments/</code> notes track exactly which values still need a
+      real deployment behind them, and
+      <a href="https://github.com/julian-corbet/nixnet-corbet-ch/blob/main/docs/providers.md#deviations-from-the-v1-design-document">docs/providers.md</a>
+      lists every place the code deviates from the v1 design document rather
+      than leaving it implicit. Treat it accordingly.
+    </p>
   </div>
 </section>
 
@@ -180,24 +242,28 @@ every ordinary NSS files-then-dns lookup</code></pre>
         <h3>NixOS (flake)</h3>
         <p>Import the core module and turn it on. Providers are opt-in additional imports.</p>
         <pre><code>{
-  inputs.nixnet.url = "github:julian-corbet/nixnet-corbet-ch";
+  inputs.nixnet.url =
+    "github:julian-corbet/nixnet-corbet-ch";
+}
 
-  # host configuration.nix
-  imports = [ inputs.nixnet.nixosModules.default ];
-  services.nixnet.enable = true;
-}</code></pre>
+# host configuration.nix
+imports = [ inputs.nixnet.nixosModules.default ];
+services.nixnet.enable = true;</code></pre>
       </div>
       <div class="install-method">
         <h3>Non-NixOS (system-manager)</h3>
-        <p>Same module file, same schema — nixnet touches only <code>environment.etc</code> and systemd units, nothing <code>system-manager</code> can't reach.</p>
-        <pre><code>systemManagerModules.core = inputs.nixnet.systemManagerModules.core;</code></pre>
+        <p>Same module file, same schema. nixnet only ever touches <code>environment.etc</code>, systemd units and a rendered JSON config &mdash; none of the primitives <code>system-manager</code> categorically can't reach.</p>
+        <pre><code>imports = [
+  inputs.nixnet.systemManagerModules.core
+];
+services.nixnet.enable = true;</code></pre>
       </div>
       <div class="install-method">
         <h3>From source</h3>
-        <p>The daemon is a small Rust binary; the module is plain Nix.</p>
+        <p>The daemon is a single Rust crate with two binaries; the modules are plain Nix. <code>Cargo.lock</code> is committed, so both build paths work fully offline.</p>
         <pre><code>git clone https://github.com/julian-corbet/nixnet-corbet-ch
 cd nixnet-corbet-ch
-nix build .#nixnet</code></pre>
+nix build .#nixnet   # or: cargo build --release</code></pre>
       </div>
     </div>
   </div>
@@ -207,27 +273,27 @@ nix build .#nixnet</code></pre>
   <div class="container">
     <h2>Commands</h2>
     <div class="table-scroll">
-      <table style="min-width: 460px">
+      <table>
         <tbody>
           <tr>
-            <th scope="row"><code>nixnetctl status</code></th>
+            <td><code>nixnetctl</code></td>
             <td>Every peer and uplink group: current winner, per-transport health, and how long the winner has held.</td>
           </tr>
           <tr>
-            <th scope="row"><code>systemctl status nixnetd</code></th>
+            <td><code>nixnetctl -json</code></td>
+            <td>The same snapshot as raw JSON, for a script or a status page.</td>
+          </tr>
+          <tr>
+            <td><code>systemctl status nixnetd</code></td>
             <td>Whether the daemon itself is up, and since when.</td>
           </tr>
           <tr>
-            <th scope="row"><code>journalctl -u nixnetd -f</code></th>
-            <td>Follow failover events live — one structured line per state transition.</td>
+            <td><code>journalctl -u nixnetd -f</code></td>
+            <td>Follow failover events live &mdash; one structured line per state transition.</td>
           </tr>
           <tr>
-            <th scope="row"><code>cat /run/nixnet/status.json</code></th>
-            <td>The same data <code>nixnetctl</code> formats, as raw JSON — for a script or a status page.</td>
-          </tr>
-          <tr>
-            <th scope="row"><code>systemctl restart nixnetd</code></th>
-            <td>Safe any time — every publish is a full atomic recompute, so a restart reconverges cleanly from disk.</td>
+            <td><code>systemctl restart nixnetd</code></td>
+            <td>Safe at any time: state persists to disk and every publish is a full atomic recompute, so a restart reconverges cleanly.</td>
           </tr>
         </tbody>
       </table>
@@ -235,15 +301,20 @@ nix build .#nixnet</code></pre>
   </div>
 </section>
 
+</main>
+
 <footer>
   <div class="container">
     <div class="footer-links">
       <a href="https://github.com/julian-corbet/nixnet-corbet-ch/blob/main/docs/providers.md">Docs</a>
-      <a href="https://github.com/julian-corbet/nixnet-corbet-ch">GitHub</a>
+      <a href="https://github.com/julian-corbet/nixnet-corbet-ch">Source</a>
       <a href="https://github.com/julian-corbet/nixnet-corbet-ch/issues">Issues</a>
       <a href="https://github.com/julian-corbet/nixnet-corbet-ch/blob/main/LICENSE">License</a>
     </div>
-    <p>MIT licensed &middot; source and issues on <a href="https://github.com/julian-corbet/nixnet-corbet-ch">GitHub</a></p>
+    <p>
+      <a href="https://github.com/julian-corbet/nixnet-corbet-ch/blob/main/LICENSE">MIT licensed</a> &middot;
+      <a href="https://github.com/julian-corbet">julian-corbet</a>
+    </p>
   </div>
 </footer>
 
