@@ -27,9 +27,8 @@
 # peer server-side and orphans the original one, along with whatever
 # routes it was advertising. That exact failure happened in production the
 # first time this module's setup-key secret went from a placeholder to a
-# real value: corbet-server's peer forked from `server`/100.64.42.6 to a
-# freshly-minted `server-42-226`/100.64.42.226, silently orphaning the
-# `192.168.42.0/24` LAN route the original peer advertised.
+# real value: a peer forked from its stable identity to a freshly-minted
+# duplicate, silently orphaning the LAN route the original peer advertised.
 #
 # Like modules/core.nix, this file is shared verbatim between
 # nixosModules.netbird-provider and systemManagerModules.netbird-provider.
