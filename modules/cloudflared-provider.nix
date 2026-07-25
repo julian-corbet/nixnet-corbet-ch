@@ -93,12 +93,17 @@ in
 
     tunnelUnit = lib.mkOption {
       type = lib.types.str;
-      example = "cloudflared-tunnel-00000000-0000-0000-0000-000000000000.service";
+      example = "cloudflared-tunnel-00000000-0000-0000-0000-000000000000";
       description = ''
         The `services.cloudflared`-managed systemd unit this watchdog
-        probes and, on persistent drift, restarts. Wraps upstream --
-        never reimplements cloudflared's own tunnel/config management,
-        same boundary netbird-provider draws around `services.netbird`.
+        probes and, on persistent drift, restarts -- the BARE unit name,
+        with no trailing `.service` (this module uses it as a
+        `systemd.services.<name>` attribute key, which NixOS itself
+        appends `.service` to; passing it pre-suffixed here would
+        silently produce a second, bogus `<name>.service.service` unit
+        instead of extending the real one). Wraps upstream -- never
+        reimplements cloudflared's own tunnel/config management, same
+        boundary netbird-provider draws around `services.netbird`.
       '';
     };
 

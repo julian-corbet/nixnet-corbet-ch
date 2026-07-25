@@ -169,7 +169,7 @@ imports = [ inputs.nixnet.nixosModules.cloudflared-provider ]; # core.nix NOT re
 
 services.nixnet.cloudflared = {
   enable = true;
-  tunnelUnit = "cloudflared-tunnel-00000000-0000-0000-0000-000000000000.service";
+  tunnelUnit = "cloudflared-tunnel-00000000-0000-0000-0000-000000000000"; # bare unit name, no ".service"
 };
 ```
 
