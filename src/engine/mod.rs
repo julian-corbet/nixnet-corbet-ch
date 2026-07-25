@@ -730,6 +730,44 @@ mod tests {
         g.transports.len() - 1
     }
 
+    /// Regression test for the 2026-07-25 production incident: a host
+    /// with zero peer groups and zero uplink groups configured (nixnet
+    /// enabled ahead of any real config being pushed -- a legitimate,
+    /// expected state) has no transports to spawn, so `run()`'s terminal
+    /// `for h in handles { h.join(); }` loop was a silent no-op and the
+    /// resident daemon exited cleanly in well under a second instead of
+    /// staying up. Under the unit's `Restart=always` that produced an
+    /// instant crash-loop into `start-limit-hit`. `run()` must now block
+    /// on `shutdown` in the zero-transport case exactly like the N>0
+    /// case does, and return only once `trigger()` is called.
+    #[test]
+    fn run_blocks_on_shutdown_with_zero_transports() {
+        let (eng, _dir) = new_test_engine();
+        let eng = Arc::new(eng);
+        let shutdown = Shutdown::new();
+
+        let eng2 = Arc::clone(&eng);
+        let sd2 = shutdown.clone();
+        let handle = std::thread::spawn(move || eng2.run(sd2));
+
+        // Give run() a moment to reach the (now-blocking) zero-transports
+        // guard. If the bug regresses, run() returns almost instantly and
+        // this assertion is what actually catches it -- without it, the
+        // later join() below would "pass" even on the old, broken
+        // behavior, since triggering shutdown on an already-exited thread
+        // is harmless.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !handle.is_finished(),
+            "run() returned before shutdown was triggered -- the \
+             zero-transport case is falling through instead of blocking \
+             (regression of the 2026-07-25 fix)"
+        );
+
+        shutdown.trigger();
+        handle.join().expect("run() thread panicked");
+    }
+
     /// Exercises the core winner-selection rule: among currently-healthy
     /// candidates, lowest priority number wins.
     #[test]
