@@ -140,6 +140,44 @@ every ordinary NSS files-then-dns lookup
 `/var/lib/nixnet/state.json`). The same binary works unmodified from a
 Nix-rendered config, a hand-written one, or a `system-manager` render.
 
+## Beyond peer/uplink: resident-daemon watchdogs
+
+nixnet's charter is broader than "peer address failover" + "uplink
+egress selection" — those are the two shapes that fit `nixnetd`'s own
+probe-and-publish engine, but the underlying idea is simpler and wider:
+**any declaratively-managed network connection that can fail and needs
+non-interactive recovery belongs in nixnet's namespace.** `netbird-provider`
+already does two things: it contributes NetBird's overlay address as a
+peer transport (the engine-shaped half), *and* it runs an independent
+drift-check/reprovision loop that catches "looks connected, isn't
+actually" and non-interactively re-enrolls (a daemon-health-watchdog
+half that has nothing to do with the engine at all).
+
+`cloudflared-provider` is the second half on its own, applied to a daemon
+that structurally can't be a peer transport: a Cloudflare Tunnel client
+is inbound-only (it *receives* public traffic; it never helps this host
+*reach* a peer), so it has no address to contribute. What it shares with
+NetBird is the failure mode — a wedged QUIC/HTTP2 edge connection that
+`Restart=on-failure` never sees, because the process never actually
+dies. `cloudflared-provider` probes cloudflared's own `/ready` health
+endpoint on a timer and restarts the tunnel service non-interactively
+past a drift threshold, same hysteresis-then-act shape as
+`netbird-provider`'s reprovisioning, no peer/uplink engine involved.
+
+```nix
+imports = [ inputs.nixnet.nixosModules.cloudflared-provider ]; # core.nix NOT required
+
+services.nixnet.cloudflared = {
+  enable = true;
+  tunnelUnit = "cloudflared-tunnel-00000000-0000-0000-0000-000000000000.service";
+};
+```
+
+See `modules/cloudflared-provider.nix`'s own header comment for the full
+design note, and expect more providers in this second, non-transport
+shape over time as more "this can fail and should heal itself"
+candidates show up.
+
 ## Options reference
 
 `services.nixnet.*` (`modules/core.nix`):
