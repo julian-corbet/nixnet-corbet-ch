@@ -101,17 +101,12 @@ let
 
         status_json=$(netbird status --json 2>/dev/null || echo '{}')
 
-        mgmt_url=$(echo "$status_json" | ${pkgs.jq}/bin/jq -r '.managementState.url // .management.url // empty' 2>/dev/null || true)
-        if [ -n "$mgmt_url" ] && [ "$mgmt_url" != "${cfg.managementUrl}" ]; then
-          # Management-URL mismatch: the single check that catches a
-          # daemon that silently re-enrolled against the wrong (e.g. a
-          # tool's public default) endpoint after local state was wiped --
-          # every OTHER signal on such a daemon looks healthy.
-          fail_drift_shaped
-        fi
-
-        needs_login=$(echo "$status_json" | ${pkgs.jq}/bin/jq -r 'if (.managementState.connected == false) or (.needsLogin == true) then "yes" else "no" end' 2>/dev/null || echo "yes")
-        if [ "$needs_login" = "yes" ]; then
+        ${identityHealthCheckBash "${pkgs.jq}/bin/jq" cfg.managementUrl}
+        if [ "$mgmt_healthy" = "no" ]; then
+          # Identity/management-channel problem: enrolled against the wrong
+          # endpoint, or the management connection is down. Every OTHER
+          # signal on such a daemon can still look healthy -- this is
+          # exactly what drift detection exists to catch.
           fail_drift_shaped
         fi
 
@@ -126,7 +121,7 @@ let
         ok_reachable
 
         peer_entry=$(echo "$status_json" | ${pkgs.jq}/bin/jq -c --arg name "${peerName}" \
-          '(.peers // [])[] | select(.fqdn == $name or .hostName == $name or (.fqdn | tostring | startswith($name)))' 2>/dev/null | head -n1 || true)
+          '(.peers.details // [])[] | select(.fqdn == $name or .hostName == $name or (.fqdn | tostring | startswith($name)))' 2>/dev/null | head -n1 || true)
 
         connected="false"
         discovered_addr=""
@@ -149,6 +144,34 @@ let
       '';
     };
 
+  # Shared identity/management-health check, used identically by the
+  # exec-probe, drift-check, and reprovision scripts below -- factored out
+  # 2026-07-25 after the same check was found duplicated AND independently
+  # buggy in three separate places. Sets $mgmt_url/$mgmt_connected/
+  # $mgmt_healthy ("yes"/"no") in the caller's shell; the caller decides
+  # what "not healthy" means in its own context (probe failure vs
+  # drift-check log line vs reprovision precondition).
+  #
+  # netbird v0.74.3's `status --json` has NO `.managementState` object and
+  # NO `.needsLogin` field at all -- confirmed directly against a live
+  # daemon. The real fields are `.management.url` (which ALWAYS carries an
+  # explicit port, e.g. "https://host:443", even when the configured
+  # managementUrl has none -- the naive exact-string comparison this
+  # replaced produced a false "drift-shaped failure" on a genuinely healthy,
+  # correctly-enrolled connection) and `.management.connected` (boolean).
+  identityHealthCheckBash = jqBin: expectedUrl: ''
+    mgmt_url=$(echo "$status_json" | ${jqBin} -r '.management.url // empty' 2>/dev/null || true)
+    mgmt_url_no_port="''${mgmt_url%:*}"
+    mgmt_connected=$(echo "$status_json" | ${jqBin} -r '.management.connected // false' 2>/dev/null || echo false)
+    mgmt_healthy=yes
+    if [ -n "$mgmt_url" ] && [ "$mgmt_url_no_port" != "${expectedUrl}" ]; then
+      mgmt_healthy=no
+    fi
+    if [ "$mgmt_connected" != "true" ]; then
+      mgmt_healthy=no
+    fi
+  '';
+
   driftCheckScript = pkgs.writeShellApplication {
     name = "nixnet-netbird-drift-check";
     runtimeInputs = [ pkgs.netbird pkgs.jq pkgs.iproute2 ];
@@ -169,14 +192,9 @@ let
 
       if [ "$drift" -eq 0 ]; then
         status_json=$(netbird status --json 2>/dev/null || echo '{}')
-        mgmt_url=$(echo "$status_json" | jq -r '.managementState.url // .management.url // empty' 2>/dev/null || true)
-        if [ -n "$mgmt_url" ] && [ "$mgmt_url" != "${cfg.managementUrl}" ]; then
-          echo "nixnet-netbird-drift-check: management URL mismatch (enrolled against $mgmt_url, expected ${cfg.managementUrl})"
-          drift=1
-        fi
-        needs_login=$(echo "$status_json" | jq -r 'if (.managementState.connected == false) or (.needsLogin == true) then "yes" else "no" end' 2>/dev/null || echo "yes")
-        if [ "$needs_login" = "yes" ]; then
-          echo "nixnet-netbird-drift-check: NeedsLogin or management channel disconnected"
+        ${identityHealthCheckBash "jq" cfg.managementUrl}
+        if [ "$mgmt_healthy" = "no" ]; then
+          echo "nixnet-netbird-drift-check: management URL mismatch or management channel disconnected (url=$mgmt_url, expected ${cfg.managementUrl})"
           drift=1
         fi
         if ! ip link show netbird0 >/dev/null 2>&1 && ! ip link show wt0 >/dev/null 2>&1; then
@@ -236,9 +254,8 @@ let
         drift_still_present=1
       else
         status_json=$(netbird status --json 2>/dev/null || echo '{}')
-        mgmt_url=$(echo "$status_json" | jq -r '.managementState.url // .management.url // empty' 2>/dev/null || true)
-        needs_login=$(echo "$status_json" | jq -r 'if (.managementState.connected == false) or (.needsLogin == true) then "yes" else "no" end' 2>/dev/null || echo "yes")
-        if { [ -n "$mgmt_url" ] && [ "$mgmt_url" != "${cfg.managementUrl}" ]; } || [ "$needs_login" = "yes" ]; then
+        ${identityHealthCheckBash "jq" cfg.managementUrl}
+        if [ "$mgmt_healthy" = "no" ]; then
           drift_still_present=1
         fi
       fi
@@ -271,7 +288,7 @@ let
       connected="false"
       while [ "$(date +%s)" -lt "$deadline" ]; do
         st=$(netbird status --json 2>/dev/null || echo '{}')
-        mgmt_connected=$(echo "$st" | jq -r '.managementState.connected // false')
+        mgmt_connected=$(echo "$st" | jq -r '.management.connected // false')
         if [ "$mgmt_connected" = "true" ] && { ip link show netbird0 >/dev/null 2>&1 || ip link show wt0 >/dev/null 2>&1; }; then
           connected="true"
           break
