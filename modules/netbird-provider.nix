@@ -5,12 +5,31 @@
 # management — and adds exactly three things on top: a dynamic
 # address+health source per configured peer (via the exec-probe contract,
 # docs/providers.md §6.2), a precise drift detector, and non-interactive
-# headless reprovisioning from a setup-key secret.
+# headless reprovisioning, ESCALATING through two distinct repair actions
+# rather than jumping straight to the most destructive one.
 #
 # This is the concrete fix for the incident that motivated nixnet: local
 # NetBird identity state going empty/stale and the daemon silently falling
 # back to a default management endpoint. See §7.4 "the concrete incident
 # fix" for the exact drift definition this module checks.
+#
+# REPROVISION ESCALATION ORDER (root-caused 2026-07-25, production peer
+# fork): reprovisionScript below tries a PLAIN `netbird up
+# --management-url ...` (no setup key) FIRST. An already-enrolled peer
+# whose local identity (config.json/state.json) is intact but merely
+# drifted to the wrong management URL or lost its connection reattaches to
+# its SAME already-registered peer object this way -- no new identity, no
+# server-side side effects. Only if that fails does the script fall back
+# to `--setup-key` re-enrollment, which is what the incident this module
+# was built for actually needs (local state genuinely absent/corrupt).
+# Getting this order backwards -- unconditionally re-keying on ANY drift,
+# including a merely-disconnected-but-intact daemon -- mints a brand-new
+# peer server-side and orphans the original one, along with whatever
+# routes it was advertising. That exact failure happened in production the
+# first time this module's setup-key secret went from a placeholder to a
+# real value: corbet-server's peer forked from `server`/100.64.42.6 to a
+# freshly-minted `server-42-226`/100.64.42.226, silently orphaning the
+# `192.168.42.0/24` LAN route the original peer advertised.
 #
 # Like modules/core.nix, this file is shared verbatim between
 # nixosModules.netbird-provider and systemManagerModules.netbird-provider.
@@ -279,6 +298,62 @@ let
 
       echo "$now" > "$last_attempt_file"
 
+      # Polls `netbird status --json` until management reports connected +
+      # the mesh interface exists, or the given deadline (an epoch second,
+      # ALWAYS computed fresh right before the call -- reusing a deadline
+      # left over from an earlier step in this same run would silently
+      # starve whichever step runs second) passes. Prints "true"/"false".
+      connect_wait() {
+        local deadline_epoch="$1" connected="false"
+        while [ "$(date +%s)" -lt "$deadline_epoch" ]; do
+          st=$(netbird status --json 2>/dev/null || echo '{}')
+          mgmt_connected=$(echo "$st" | jq -r '.management.connected // false')
+          if [ "$mgmt_connected" = "true" ] && { ip link show netbird0 >/dev/null 2>&1 || ip link show wt0 >/dev/null 2>&1; }; then
+            connected="true"
+            break
+          fi
+          sleep 1
+        done
+        echo "$connected"
+      }
+
+      netbird down || true
+
+      # Try a PLAIN reconnect first -- no setup key. If this daemon already
+      # has a valid local peer identity (config.json/state.json intact) but
+      # merely drifted to the wrong management URL or lost its connection,
+      # this alone reattaches it to the SAME already-registered peer object
+      # -- no new identity, no new peer minted server-side. Only fall back
+      # to --setup-key re-enrollment (below) if this genuinely fails: that
+      # is the real signal that local state is absent/corrupt, the actual
+      # incident this module was built to recover from (see the file
+      # header). Getting this order backwards is exactly what forked a live
+      # peer's identity in production: an already-enrolled daemon that was
+      # merely management-disconnected got unconditionally re-keyed,
+      # minting a brand-new peer server-side and orphaning the original one
+      # -- along with whatever routes it advertised.
+      #
+      # `timeout` wraps BOTH `netbird up` invocations below (not just the
+      # connect-wait polling after them): a peer with genuinely no local
+      # identity may fall through to an interactive/SSO device-auth flow
+      # instead of failing fast, which would otherwise hang this headless,
+      # lock-held script indefinitely.
+      plain_reconnect_ok="false"
+      if timeout ${toString cfg.reprovision.connectTimeoutSec} \
+           netbird up --management-url "${cfg.managementUrl}" 2>&1; then
+        plain_deadline=$(( $(date +%s) + ${toString cfg.reprovision.connectTimeoutSec} ))
+        plain_reconnect_ok=$(connect_wait "$plain_deadline")
+      fi
+
+      if [ "$plain_reconnect_ok" = "true" ]; then
+        rm -f /run/nixnet/reprovision/netbird
+        echo "NIXNET_NETBIRD_REPROVISION_SUCCEEDED method=plain-reconnect"
+        printf '{"result":"succeeded","method":"plain-reconnect","at":"%s"}\n' "$(date -Iseconds)" > "$status_file"
+        exit 0
+      fi
+
+      echo "NIXNET_NETBIRD_REPROVISION_PLAIN_RECONNECT_FAILED falling back to setup-key re-enrollment"
+
       if [ ! -r "${cfg.setupKeyFile}" ]; then
         echo "NIXNET_NETBIRD_REPROVISION_FAILED reason=no-setup-key path=${cfg.setupKeyFile}" >&2
         echo '{"result":"failed","reason":"no-setup-key"}' > "$status_file"
@@ -288,31 +363,23 @@ let
 
       netbird down || true
 
-      if ! netbird up --management-url "${cfg.managementUrl}" \
-                       --setup-key "$setup_key" \
-                       --hostname "${hostname}"; then
+      if ! timeout ${toString cfg.reprovision.connectTimeoutSec} \
+             netbird up --management-url "${cfg.managementUrl}" \
+                         --setup-key "$setup_key" \
+                         --hostname "${hostname}"; then
         echo "NIXNET_NETBIRD_REPROVISION_FAILED reason=netbird-up-failed" >&2
         echo '{"result":"failed","reason":"netbird-up-failed"}' > "$status_file"
         exit 1
       fi
 
-      deadline=$((now + ${toString cfg.reprovision.connectTimeoutSec}))
-      connected="false"
-      while [ "$(date +%s)" -lt "$deadline" ]; do
-        st=$(netbird status --json 2>/dev/null || echo '{}')
-        mgmt_connected=$(echo "$st" | jq -r '.management.connected // false')
-        if [ "$mgmt_connected" = "true" ] && { ip link show netbird0 >/dev/null 2>&1 || ip link show wt0 >/dev/null 2>&1; }; then
-          connected="true"
-          break
-        fi
-        sleep 1
-      done
+      setup_deadline=$(( $(date +%s) + ${toString cfg.reprovision.connectTimeoutSec} ))
+      connected=$(connect_wait "$setup_deadline")
 
       rm -f /run/nixnet/reprovision/netbird
 
       if [ "$connected" = "true" ]; then
-        echo "NIXNET_NETBIRD_REPROVISION_SUCCEEDED"
-        printf '{"result":"succeeded","at":"%s"}\n' "$(date -Iseconds)" > "$status_file"
+        echo "NIXNET_NETBIRD_REPROVISION_SUCCEEDED method=setup-key"
+        printf '{"result":"succeeded","method":"setup-key","at":"%s"}\n' "$(date -Iseconds)" > "$status_file"
         exit 0
       else
         echo "NIXNET_NETBIRD_REPROVISION_FAILED reason=timeout-waiting-for-connected" >&2

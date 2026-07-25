@@ -255,6 +255,24 @@ impl Engine {
         // completes.
         self.write_status();
 
+        // A host with zero peer groups and zero uplink groups configured
+        // (nixnet enabled ahead of any real config -- a legitimate,
+        // expected state per this daemon's own "resident, ready for
+        // whatever this host resolves outbound in the future" design) has
+        // no transports to spawn, so `handles` is empty here. Without this
+        // guard the join loop below is a no-op and `run` (and therefore
+        // `main`) returns immediately -- a resident daemon silently
+        // exiting 0 in under a second. Under the unit's Restart=always
+        // policy that means an instant crash-loop into start-limit-hit.
+        // Block on the same shutdown signal every transport ticker already
+        // uses, so the daemon behaves identically to the N>0 case: it
+        // stays up, and a future config push (through a config reload,
+        // once that lands) or SIGTERM/SIGINT ends it the normal way.
+        if handles.is_empty() {
+            while !shutdown.wait(Duration::from_secs(3600)) {}
+            return;
+        }
+
         for h in handles {
             let _ = h.join();
         }
