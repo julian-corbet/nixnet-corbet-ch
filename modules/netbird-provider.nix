@@ -92,14 +92,23 @@ let
           rm -f "$drift_count_file"
         }
 
-        if [ ! -s /var/lib/netbird/config.json ]; then
-          fail_drift_shaped
-        fi
-        if ! ${pkgs.jq}/bin/jq -e . /var/lib/netbird/config.json >/dev/null 2>&1; then
-          fail_drift_shaped
-        fi
-
+        # Query the daemon over its control socket rather than reading
+        # /var/lib/netbird/config.json directly -- that file (and its
+        # parent dir) is root-only (0600/0700, real private-key material,
+        # and deliberately NOT group-readable even by the "netbird" group
+        # nixnetd's DynamicUser joins), so a direct read here would always
+        # fail-closed for this unprivileged process regardless of whether
+        # netbird itself is actually healthy. The control socket is
+        # world-accessible (srw-rw-rw-) by netbird's own design specifically
+        # so unprivileged clients like this one can query status -- and it's
+        # a strictly more accurate signal anyway (an empty/unparseable
+        # response means the daemon itself isn't answering, which is the
+        # same "no usable state" case the old file check was trying to
+        # detect).
         status_json=$(netbird status --json 2>/dev/null || echo '{}')
+        if [ "$status_json" = "{}" ] || ! echo "$status_json" | ${pkgs.jq}/bin/jq -e . >/dev/null 2>&1; then
+          fail_drift_shaped
+        fi
 
         ${identityHealthCheckBash "${pkgs.jq}/bin/jq" cfg.managementUrl}
         if [ "$mgmt_healthy" = "no" ]; then
@@ -182,16 +191,20 @@ let
 
       drift=0
 
-      if [ ! -s /var/lib/netbird/config.json ]; then
-        echo "nixnet-netbird-drift-check: config.json missing or empty"
-        drift=1
-      elif ! jq -e . /var/lib/netbird/config.json >/dev/null 2>&1; then
-        echo "nixnet-netbird-drift-check: config.json is not valid JSON"
+      # Query over the control socket (world-accessible by netbird's own
+      # design), not by reading /var/lib/netbird/config.json directly --
+      # that file and its parent dir are root-only, deliberately not
+      # group-readable even by the "netbird" group this feature's other
+      # units join. See identityHealthCheckBash's comment for the full
+      # reasoning; same fix applied here for consistency and because this
+      # unit's own privilege level shouldn't matter to correctness.
+      status_json=$(netbird status --json 2>/dev/null || echo '{}')
+      if [ "$status_json" = "{}" ] || ! echo "$status_json" | jq -e . >/dev/null 2>&1; then
+        echo "nixnet-netbird-drift-check: daemon not responding on its control socket"
         drift=1
       fi
 
       if [ "$drift" -eq 0 ]; then
-        status_json=$(netbird status --json 2>/dev/null || echo '{}')
         ${identityHealthCheckBash "jq" cfg.managementUrl}
         if [ "$mgmt_healthy" = "no" ]; then
           echo "nixnet-netbird-drift-check: management URL mismatch or management channel disconnected (url=$mgmt_url, expected ${cfg.managementUrl})"
@@ -246,14 +259,13 @@ let
       fi
 
       # Re-confirm drift is still present before acting on what may be a
-      # stale trigger.
+      # stale trigger. Socket-based, not a direct config.json read -- see
+      # identityHealthCheckBash's comment for why.
       drift_still_present=0
-      if [ ! -s /var/lib/netbird/config.json ]; then
-        drift_still_present=1
-      elif ! jq -e . /var/lib/netbird/config.json >/dev/null 2>&1; then
+      status_json=$(netbird status --json 2>/dev/null || echo '{}')
+      if [ "$status_json" = "{}" ] || ! echo "$status_json" | jq -e . >/dev/null 2>&1; then
         drift_still_present=1
       else
-        status_json=$(netbird status --json 2>/dev/null || echo '{}')
         ${identityHealthCheckBash "jq" cfg.managementUrl}
         if [ "$mgmt_healthy" = "no" ]; then
           drift_still_present=1
