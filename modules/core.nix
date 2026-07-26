@@ -652,7 +652,7 @@ in
     # persist-enforce.
     system-manager.preActivationAssertions.nixnetNsswitchOrder = {
       enable = true;
-      script = pkgs.writeShellScript "nixnet-nsswitch-check" ''
+      script = "${pkgs.writeShellScript "nixnet-nsswitch-check" ''
         set -euo pipefail
         line="$(grep '^hosts:' /etc/nsswitch.conf || true)"
         if [ -z "$line" ]; then
@@ -673,7 +673,7 @@ in
         echo "  Fix: put 'files' before 'resolve'/'dns' in that line, e.g.:" >&2
         echo "    hosts: files mymachines resolve [!UNAVAIL=return] dns" >&2
         exit 1
-      '';
+      ''}";
     };
   }));
 }
