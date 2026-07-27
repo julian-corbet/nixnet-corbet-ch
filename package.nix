@@ -1,5 +1,5 @@
 # The nixnetd + nixnetctl build, shared by flake.nix's `packages` output and
-# modules/core.nix's `services.nixnet.package` default so there is exactly
+# modules/core.nix's `nixnet.package` default so there is exactly
 # one place this derivation is defined.
 { lib, rustPlatform }:
 

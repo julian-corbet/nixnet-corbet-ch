@@ -16,7 +16,7 @@ this code).
 
 ## 001 — is 3000ms the right default probe interval?
 
-**Question:** `services.nixnet.daemon.defaultProbe.intervalMs` defaults to
+**Question:** `nixnet.daemon.defaultProbe.intervalMs` defaults to
 3000. Is that actually a good default for the two motivating scenarios —
 a laptop roaming between WiFi networks (uplinks) and a server occasionally
 losing its overlay VPN (peers) — or too slow/too chatty for either?

@@ -4,8 +4,8 @@ A **provider** is an ordinary NixOS (or system-manager) module that makes a
 new transport source available to nixnet. Core has no registry, no
 plugin-loading mechanism, and no provider-specific code — a provider
 "registers" purely by contributing standard Nix option values into
-`services.nixnet.peers.<name>.transports` and/or
-`services.nixnet.uplinks.<name>.transports`.
+`nixnet.peers.<name>.transports` and/or
+`nixnet.uplinks.<name>.transports`.
 
 `netbird-provider` (shipped in this same repo, `modules/netbird-provider.nix`)
 is the reference implementation. If you're writing a new provider — a
@@ -15,18 +15,18 @@ code, not a stub.
 
 ## 1. What a provider MUST do
 
-1. **Namespace its own options** under `services.nixnet.<providerName>.*`
+1. **Namespace its own options** under `nixnet.<providerName>.*`
    (mirroring the `services.prometheus.exporters.<name>` convention — one
    dedicated options namespace per provider, one segment under
-   `services.nixnet`, not a nested `providers.` level).
-2. **Contribute only into `services.nixnet.peers.<name>.transports`
-   and/or `services.nixnet.uplinks.<name>.transports`**, via ordinary
-   list concatenation (`services.nixnet.peers = lib.mkMerge [ ... ]`, or
+   `nixnet`, not a nested `providers.` level).
+2. **Contribute only into `nixnet.peers.<name>.transports`
+   and/or `nixnet.uplinks.<name>.transports`**, via ordinary
+   list concatenation (`nixnet.peers = lib.mkMerge [ ... ]`, or
    building the transport list programmatically from the provider's own
    smaller option table and merging it in — see
-   `modules/netbird-provider.nix`'s `services.nixnet.peers = mkMerge
+   `modules/netbird-provider.nix`'s `nixnet.peers = mkMerge
    (mapAttrsToList ...)`). A provider module must never touch
-   `services.nixnet.daemon.*`, never write to `/run/nixnet/*` directly, and
+   `nixnet.daemon.*`, never write to `/run/nixnet/*` directly, and
    never assume anything about how core probes or publishes — it only ever
    contributes *candidates*. (See §4 below for the one narrow, documented
    exception this repo's own reference provider needed.)
@@ -90,16 +90,16 @@ code, not a stub.
 ## 4. Minimal example (for a hypothetical `tailscale-provider`)
 
 ```nix
-services.nixnet.tailscale-provider.enable = mkEnableOption "...";
-services.nixnet.tailscale-provider.authKeyFile = mkOption { type = types.path; };
-services.nixnet.tailscale-provider.peers.<name> = mkOption {
+nixnet.tailscale-provider.enable = mkEnableOption "...";
+nixnet.tailscale-provider.authKeyFile = mkOption { type = types.path; };
+nixnet.tailscale-provider.peers.<name> = mkOption {
   type = types.submodule { options = {
     priority = mkOption { type = types.int; };
   };};
 };
 
 # internally:
-services.nixnet.peers = lib.mkMerge (lib.mapAttrsToList (peerName: peerCfg: {
+nixnet.peers = lib.mkMerge (lib.mapAttrsToList (peerName: peerCfg: {
   ${peerName}.transports = [{
     priority = peerCfg.priority;
     providerId = "tailscale";
@@ -189,9 +189,9 @@ discovered the hard way.
 ### Deviation: `nixnetd`'s `SupplementaryGroups` set by netbird-provider
 
 `docs/providers.md` §3 says a provider must never touch
-`services.nixnet.daemon.*`. `modules/netbird-provider.nix` sets
+`nixnet.daemon.*`. `modules/netbird-provider.nix` sets
 `systemd.services.nixnetd.serviceConfig.SupplementaryGroups = [ "netbird" ];`
-when enabled — which is **not** the same boundary: `services.nixnet.daemon.*`
+when enabled — which is **not** the same boundary: `nixnet.daemon.*`
 is nixnet's own Nix *option surface* (cadence, paths, thresholds — the
 things §6.1.2 actually says a provider must leave alone); `systemd.services.nixnetd`
 is the raw NixOS systemd-unit option any two unrelated modules can
@@ -208,7 +208,7 @@ documented at the point it's set, in `modules/netbird-provider.nix`.
 
 Design document §3.1's `probe` submodule hardcodes its own field defaults
 (3000/800/2/3) directly; §3.2 separately declares
-`services.nixnet.daemon.defaultProbe` with the *same* numbers, but never
+`nixnet.daemon.defaultProbe` with the *same* numbers, but never
 actually wires the two together — read completely literally,
 `daemon.defaultProbe` would be a dead option nobody consults.
 `modules/core.nix`'s `probeType` submodule instead sets each field's

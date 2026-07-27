@@ -1,7 +1,7 @@
 # modules/core.nix
 #
-# nixnet's whole generic engine: services.nixnet.peers.<name> and
-# services.nixnet.uplinks.<name>, sharing one transport submodule type and
+# nixnet's whole generic engine: nixnet.peers.<name> and
+# nixnet.uplinks.<name>, sharing one transport submodule type and
 # rendered into one config.json for nixnetd (design.md §3). This file is
 # shared verbatim between nixosModules.core and systemManagerModules.core
 # (flake.nix) — see §9 for why that's safe: nixnet only ever touches
@@ -9,7 +9,7 @@
 # none of which system-manager categorically can't reach.
 #
 # Providers (netbird-provider.nix and friends) never import this file
-# directly — they contribute into services.nixnet.peers/uplinks the same
+# directly — they contribute into nixnet.peers/uplinks the same
 # way a consumer's own machine config does, via ordinary Nix option
 # merging. Core has no provider registry and no provider-specific code;
 # see docs/providers.md.
@@ -19,7 +19,7 @@
 with lib;
 
 let
-  cfg = config.services.nixnet;
+  cfg = config.nixnet;
 
   # ---------------------------------------------------------------------
   # system-manager backend detection (design.md §9). system-manager exposes
@@ -361,7 +361,7 @@ let
 
 in
 {
-  options.services.nixnet = {
+  options.nixnet = {
     enable = mkEnableOption "nixnet transport failover (peer + uplink health-checked publish)";
 
     package = mkOption {
@@ -436,7 +436,7 @@ in
           let allNames = concatMap (p: p.hostnames) (attrValues cfg.peers);
           in length allNames == length (unique allNames);
         message = ''
-          services.nixnet.peers.*.hostnames has a duplicate entry across
+          nixnet.peers.*.hostnames has a duplicate entry across
           two different peers. Silently colliding entries in a shared
           namespace like /etc/hosts is exactly the kind of failure nixnet
           exists to prevent, not reproduce -- rename one of them.
@@ -445,7 +445,7 @@ in
       {
         assertion = hasPrefix "/var/lib/" (toString cfg.daemon.stateDir);
         message = ''
-          services.nixnet.daemon.stateDir (${toString cfg.daemon.stateDir}) must
+          nixnet.daemon.stateDir (${toString cfg.daemon.stateDir}) must
           live under /var/lib/ -- the systemd unit uses StateDirectory=,
           which systemd only ever creates under /var/lib/ and which is
           what gives the DynamicUser nixnetd runs as correct ownership of
@@ -456,8 +456,8 @@ in
       {
         assertion = !(hasPrefix ("${toString cfg.daemon.stateDir}/") (toString cfg.daemon.hostsFile));
         message = ''
-          services.nixnet.daemon.hostsFile (${toString cfg.daemon.hostsFile}) must NOT
-          live under services.nixnet.daemon.stateDir (${toString cfg.daemon.stateDir}).
+          nixnet.daemon.hostsFile (${toString cfg.daemon.hostsFile}) must NOT
+          live under nixnet.daemon.stateDir (${toString cfg.daemon.stateDir}).
           Found in production 2026-07-25: nixnetd's StateDirectory= is silently
           relocated by systemd (DynamicUser=true) to /var/lib/private/<name>,
           and the shared /var/lib/private/ parent is 0700 root:root with no
@@ -471,7 +471,7 @@ in
       (name: u: imap0
         (i: t: {
           assertion = t.interface != null;
-          message = "services.nixnet.uplinks.${name}.transports[${toString i}]: interface is required for uplink transports.";
+          message = "nixnet.uplinks.${name}.transports[${toString i}]: interface is required for uplink transports.";
         })
         u.transports)
       cfg.uplinks))
@@ -479,7 +479,7 @@ in
       (name: u: imap0
         (i: t: {
           assertion = t.probe.method == "exec" || t.probe.target != null;
-          message = "services.nixnet.uplinks.${name}.transports[${toString i}]: probe.target (or probe.method = \"exec\") is required -- address has no default for uplinks.";
+          message = "nixnet.uplinks.${name}.transports[${toString i}]: probe.target (or probe.method = \"exec\") is required -- address has no default for uplinks.";
         })
         u.transports)
       cfg.uplinks))
@@ -521,7 +521,7 @@ in
     });
 
     # system-manager: no `system.activationScripts.<name>` at all (only a
-    # fixed, non-extensible `.users` stub -- see options.services.nixnet's
+    # fixed, non-extensible `.users` stub -- see options.nixnet's
     # `isSystemManager` note above), so the same seeding logic runs as an
     # ordinary oneshot unit instead, ordered before nixnetd via the
     # `before`/`wants` wiring nixnetd itself carries below (added

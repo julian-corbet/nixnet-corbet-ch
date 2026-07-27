@@ -7,7 +7,7 @@
 # nixnet's namespace. cloudflared (a Cloudflare Tunnel client) is the
 # first example that doesn't fit the peer/transport shape at all -- it's
 # inbound-only (it RECEIVES public traffic; it never helps THIS host
-# reach a peer), so it can't contribute a `services.nixnet.peers.<name>`
+# reach a peer), so it can't contribute a `nixnet.peers.<name>`
 # transport the way netbird-provider does. What it shares with
 # netbird-provider is the OTHER half of that module: a resident daemon
 # whose failure mode is "looks alive, isn't actually working" (a wedged
@@ -28,7 +28,7 @@
 # random default port off the network at runtime.
 { config, lib, pkgs, ... }:
 let
-  cfg = config.services.nixnet.cloudflared;
+  cfg = config.nixnet.cloudflared;
 
   driftCheckScript = pkgs.writeShellApplication {
     name = "nixnet-cloudflared-drift-check";
@@ -103,7 +103,7 @@ let
   };
 in
 {
-  options.services.nixnet.cloudflared = {
+  options.nixnet.cloudflared = {
     enable = lib.mkEnableOption "cloudflared tunnel health watchdog (nixnet's drift-check/reprovision pattern, applied to a resident daemon instead of a peer transport)";
 
     tunnelUnit = lib.mkOption {
@@ -167,7 +167,7 @@ in
         # it's worth a hard eval-time guard, not just a doc comment.
         assertion = !(lib.hasSuffix ".service" cfg.tunnelUnit) && !(lib.hasInfix "/" cfg.tunnelUnit);
         message = ''
-          services.nixnet.cloudflared.tunnelUnit ("${cfg.tunnelUnit}") must
+          nixnet.cloudflared.tunnelUnit ("${cfg.tunnelUnit}") must
           be the BARE systemd unit name, with no ".service" suffix and no
           "/" -- see this option's own description for why a pre-suffixed
           value is actively dangerous here, not just redundant.
@@ -202,7 +202,7 @@ in
       # Same path netbird-provider's own tmpfiles rule declares -- a plain
       # duplicate list entry across modules is harmless (systemd-tmpfiles
       # is idempotent), and cloudflared-provider must not assume
-      # netbird-provider (or even services.nixnet.core) is enabled on the
+      # netbird-provider (or even nixnet.core) is enabled on the
       # same host, so it declares this independently rather than relying
       # on another module having already done so.
       "d /run/nixnet/reprovision 0750 root root -"

@@ -176,7 +176,7 @@ uplinks:
 <section id="architecture" class="architecture">
   <div class="container">
     <h2>Architecture</h2>
-    <pre class="arch-diagram"><code>services.nixnet.peers / uplinks
+    <pre class="arch-diagram"><code>nixnet.peers / uplinks
             |
             v
  /etc/nixnet/config.json          (rendered once, at build time)
@@ -201,7 +201,7 @@ every ordinary NSS files-then-dns lookup</code></pre>
     <div class="arch-details">
       <div class="arch-detail">
         <h3>Providers, not plugins</h3>
-        <p>A provider registers by contributing ordinary Nix list entries into <code>services.nixnet.peers.&lt;name&gt;.transports</code>. Core has no registry and no provider-specific code to fork.</p>
+        <p>A provider registers by contributing ordinary Nix list entries into <code>nixnet.peers.&lt;name&gt;.transports</code>. Core has no registry and no provider-specific code to fork.</p>
       </div>
       <div class="arch-detail">
         <h3>One health contract</h3>
@@ -249,7 +249,7 @@ every ordinary NSS files-then-dns lookup</code></pre>
 
 # host configuration.nix
 imports = [ inputs.nixnet.nixosModules.default ];
-services.nixnet.enable = true;</code></pre>
+nixnet.enable = true;</code></pre>
       </div>
       <div class="install-method">
         <h3>Non-NixOS (system-manager)</h3>
@@ -257,7 +257,7 @@ services.nixnet.enable = true;</code></pre>
         <pre><code>imports = [
   inputs.nixnet.systemManagerModules.core
 ];
-services.nixnet.enable = true;</code></pre>
+nixnet.enable = true;</code></pre>
       </div>
       <div class="install-method">
         <h3>From source</h3>

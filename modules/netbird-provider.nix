@@ -38,7 +38,7 @@
 with lib;
 
 let
-  cfg = config.services.nixnet.netbird;
+  cfg = config.nixnet.netbird;
 
   peerType = types.submodule {
     options = {
@@ -390,7 +390,7 @@ let
 
 in
 {
-  options.services.nixnet.netbird = {
+  options.nixnet.netbird = {
     enable = mkEnableOption "NetBird transport provider for nixnet";
 
     managementUrl = mkOption {
@@ -419,9 +419,9 @@ in
       type = types.attrsOf peerType;
       default = { };
       description = ''
-        Which services.nixnet.peers.<name> entries netbird-provider
+        Which nixnet.peers.<name> entries netbird-provider
         should contribute an overlay transport into. The name here MUST
-        match an existing services.nixnet.peers.<name> (declared by you,
+        match an existing nixnet.peers.<name> (declared by you,
         with its own `hostnames` and any other transports) -- this
         provider only ever ADDS one more transport to that peer's list,
         via ordinary Nix list-option merging (docs/providers.md §6.1.2).
@@ -456,10 +456,10 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = all (name: hasAttr name config.services.nixnet.peers) (attrNames cfg.peers);
+        assertion = all (name: hasAttr name config.nixnet.peers) (attrNames cfg.peers);
         message = ''
-          services.nixnet.netbird.peers has an entry whose name doesn't
-          match any services.nixnet.peers.<name> -- declare the peer
+          nixnet.netbird.peers has an entry whose name doesn't
+          match any nixnet.peers.<name> -- declare the peer
           itself first (hostnames, any other transports), then let
           netbird-provider contribute its overlay transport into it.
         '';
@@ -493,11 +493,11 @@ in
 
     # Contribute one exec-probe transport per configured peer, via
     # ordinary list-option merging into the SAME
-    # services.nixnet.peers.<name>.transports list the consumer's own
+    # nixnet.peers.<name>.transports list the consumer's own
     # machine config (and any other provider) also contributes into.
-    # netbird-provider never touches services.nixnet.daemon.* and never
+    # netbird-provider never touches nixnet.daemon.* and never
     # writes to /run/nixnet/* directly (docs/providers.md §6.1.2).
-    services.nixnet.peers = mkMerge (mapAttrsToList
+    nixnet.peers = mkMerge (mapAttrsToList
       (peerName: peerCfg: {
         ${peerName}.transports = [{
           priority = peerCfg.priority;
@@ -513,7 +513,7 @@ in
 
     # This unit is owned by core (systemd.services.nixnetd, defined in
     # core.nix) -- adding a SupplementaryGroups entry to it here is NOT
-    # netbird-provider reaching into services.nixnet.daemon.* (the
+    # netbird-provider reaching into nixnet.daemon.* (the
     # contract's actual boundary, docs/providers.md §6.1.2); it's an
     # ordinary cross-module systemd.services.* extension, the same
     # mechanism any two unrelated NixOS modules can use to jointly shape a
@@ -522,7 +522,7 @@ in
     # `netbird status` needs group-level access to NetBird's control
     # socket. See docs/providers.md's "Deviation: nixnetd
     # SupplementaryGroups" note.
-    systemd.services.nixnetd.serviceConfig.SupplementaryGroups = mkIf config.services.nixnet.enable [ "netbird" ];
+    systemd.services.nixnetd.serviceConfig.SupplementaryGroups = mkIf config.nixnet.enable [ "netbird" ];
 
     systemd.timers.nixnet-netbird-drift-check = mkIf cfg.reprovision.enable {
       description = "Periodic safety-net for nixnet's netbird drift detector";

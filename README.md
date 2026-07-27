@@ -48,10 +48,10 @@ it can't.
 # host configuration.nix:
 imports = [ inputs.nixnet.nixosModules.default ];
 
-services.nixnet.enable = true;
+nixnet.enable = true;
 
 # ── Remote peer: LAN-preferred, overlay-fallback ──
-services.nixnet.peers."host-b" = {
+nixnet.peers."host-b" = {
   hostnames = [ "host-b" ];
   transports = [
     {
@@ -68,7 +68,7 @@ services.nixnet.peers."host-b" = {
 };
 
 # ── Local dual-uplink: wired-preferred, wireless/cellular fallback ──
-services.nixnet.uplinks."internet" = {
+nixnet.uplinks."internet" = {
   transports = [
     { interface = "wired0";    priority = 10;
       probe = { method = "tcp"; target = "192.0.2.53"; port = 443;
@@ -85,7 +85,7 @@ services.nixnet.uplinks."internet" = {
 };
 
 # ── netbird-provider: contributes host-b's overlay transport automatically ──
-services.nixnet.netbird = {
+nixnet.netbird = {
   enable        = true;
   managementUrl = "https://mesh.example.com";
   setupKeyFile  = config.sops.secrets."nixnet-netbird-setup-key".path;
@@ -110,7 +110,7 @@ services.nixnet.netbird = {
 ## How it fits together
 
 ```
-services.nixnet.peers / uplinks
+nixnet.peers / uplinks
             |
             v
  /etc/nixnet/config.json          (rendered once, at build time)
@@ -167,7 +167,7 @@ past a drift threshold, same hysteresis-then-act shape as
 ```nix
 imports = [ inputs.nixnet.nixosModules.cloudflared-provider ]; # core.nix NOT required
 
-services.nixnet.cloudflared = {
+nixnet.cloudflared = {
   enable = true;
   tunnelUnit = "cloudflared-tunnel-00000000-0000-0000-0000-000000000000"; # bare unit name, no ".service"
 };
@@ -180,7 +180,7 @@ candidates show up.
 
 ## Options reference
 
-`services.nixnet.*` (`modules/core.nix`):
+`nixnet.*` (`modules/core.nix`):
 
 - `enable` — turn the engine on.
 - `package` — the `nixnetd`/`nixnetctl` build; override only to pin/patch.
@@ -240,7 +240,7 @@ The shared **transport** type (`peers.<name>.transports[]` and
   already an absolute Nix store path. Run with no shell involved, every
   tick, per the [provider contract](docs/providers.md).
 
-`services.nixnet.netbird.*` (`modules/netbird-provider.nix`) — see
+`nixnet.netbird.*` (`modules/netbird-provider.nix`) — see
 [Quickstart](#quickstart) for a worked example and
 [`docs/providers.md`](docs/providers.md) §7 for the full drift-detection
 and reprovisioning design:
@@ -257,8 +257,8 @@ and reprovisioning design:
   consecutive drift-shaped exec-probe failures before the reactive
   trigger fires), `.connectTimeoutSec` (default `30`).
 
-Every `peers.<name>` referenced under `services.nixnet.netbird.peers`
-must already exist under `services.nixnet.peers.<name>` (with its own
+Every `peers.<name>` referenced under `nixnet.netbird.peers`
+must already exist under `nixnet.peers.<name>` (with its own
 `hostnames`) — the provider only ever *adds* one more transport to that
 peer's list.
 
@@ -275,7 +275,7 @@ same file, same schema:
   inputs.nixnet.url = "github:julian-corbet/nixnet-corbet-ch";
 }
 imports = [ inputs.nixnet.systemManagerModules.core ];
-services.nixnet.enable = true;
+nixnet.enable = true;
 # ... same options as above
 ```
 
