@@ -358,8 +358,8 @@ Arch/CachyOS), [nixvps](https://github.com/julian-corbet/nixvps-corbet-ch)
 (tiny sub-1GB NixOS VPS profiles),
 [nixremote](https://github.com/julian-corbet/nixremote-corbet-ch)
 (cross-machine native Wayland app forwarding), and
-[nixfish](https://github.com/julian-corbet/nixfish-corbet-ch) (the
-safe-adoption pattern for declarative fish shell config). nixnet's own
+[nixsh](https://github.com/julian-corbet/nixsh-corbet-ch) (the
+safe-adoption pattern for declarative shell config, across fish, bash and zsh). nixnet's own
 niche is purely transport failover — usable alongside any of them, or
 standalone.
 
