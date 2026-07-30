@@ -65,9 +65,10 @@ let
           What this group MEANS -- a trust boundary or category, not
           just a label -- documented so a future rename doesn't lose the
           reasoning (see the doc precedent this closes: a bare group
-          name with no recorded intent is how "fleet" drifted into
-          reading as "our machines" instead of its real meaning, "every
-          one of our peers").
+          name with no recorded intent lets its meaning drift silently
+          -- a name coined to mean "every peer this policy trusts" can
+          end up read, a year later, as "just our own machines", with
+          nothing on record to correct the misreading).
         '';
         example = "Every one of our own peers -- the trust boundary the mesh-wide policy is anchored on.";
       };
@@ -75,7 +76,7 @@ let
       renamedFrom = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        example = "fleet";
+        example = "workers";
         description = ''
           The group's previous live name, set temporarily while a rename
           is in flight. Purely informational to the audit (below): it
@@ -132,7 +133,7 @@ let
       renamedFrom = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        example = "fleet-internal";
+        example = "workers-mesh";
         description = "Same rename-in-flight tracking as `groups.<name>.renamedFrom`, for policies.";
       };
 

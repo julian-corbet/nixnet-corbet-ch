@@ -251,16 +251,17 @@ module's own header). Renaming a group or policy that real policies
 already reference is safe, but only IN PLACE (same object `id`, new
 `name` field) — never "create a new one and delete the old one" (a new
 object gets a new `id`, orphaning every policy/route still pointing at
-the old one). Ordered steps, using the `fleet → internal` /
-`fleet-internal → internal-mesh` / `fleet-to-external →
-internal-to-external` renames as the worked example:
+the old one). Ordered steps, using a `workers → internal` /
+`workers-mesh → internal-mesh` / `workers-to-external →
+internal-to-external` rename as a worked, illustrative example (substitute your own real
+group/policy names):
 
 1. **Account-side, first:** `PUT` each object's existing `id` with only
    its `name` field changed — the group, then each policy. This is
    non-disruptive at every step: every rule/route still resolves the
    same `id`, so mid-rename traffic behavior does not change at all.
 2. **Then** flip the Nix declaration — `groups.internal` (was
-   `groups.fleet`), `policies.internal-mesh.{from,to}` /
+   `groups.workers`), `policies.internal-mesh.{from,to}` /
    `policies.internal-to-external.{from,to}` referencing `"internal"`,
    and `nixnet.netbirdAccessModel.internalGroup = "internal"` — to match.
    Set `renamedFrom` on the renamed group/policy entries to their old
