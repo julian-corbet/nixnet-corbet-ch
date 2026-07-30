@@ -136,3 +136,23 @@ documented companion recommendation (not a nixnet feature — just
 guidance) wherever nixnet manages uplink metrics?
 
 **Status:** open.
+
+## 008 — NetBird REST API `/policies` and `/routes` field paths are unverified against a real account
+
+**Question:** `modules/netbird-access-model.nix`'s audit script parses
+`GET /policies` (`.rules[0].sources`/`.destinations`/`.bidirectional`)
+and `GET /routes` (`.network`/`.groups`) with `jq` expressions written
+from NetBird's documented REST API shape — same caveat as #006, but for
+the HTTP API instead of the CLI's `--json` output, since no host in this
+project's development environment holds a real NetBird account either.
+
+**Hypothesis:** the one-rule-per-policy assumption matches this
+project's own usage pattern (a named policy = one directional edge —
+`internal-mesh`, `internal-to-external`, one `grant-<device>-<nibble>`
+per grant) and the field names are the documented ones, but neither has
+been checked against a captured real payload.
+
+**Status:** open — flagged explicitly (see the module's own header)
+rather than silently assumed correct. A field-path miss degrades to
+"can't confirm this one, logged and skipped," never a false
+DIVERGENCE report, so the failure mode is annoying, not misleading.

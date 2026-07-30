@@ -210,6 +210,17 @@ of these contribute a peer/uplink transport and none require
   peer that enrolls later. Membership-only: never creates/deletes groups
   or policies. `bands`/`catchAllGroup` are **live NetBird object names** —
   see the module's own header warning before wiring this in.
+- **`nixnet.netbirdAccessModel`** (`modules/netbird-access-model.nix`) —
+  declares the SHAPE of a NetBird account's access control (which groups
+  exist, which directional policies connect them, which groups receive
+  which routes) as an option surface with assertions, plus a read-only
+  timer that audits the live account against it. Never creates, renames,
+  or deletes anything account-side — same boundary as
+  `netbirdGroupReconcile` above, which it wires into (one host's
+  `internalGroup` feeds `netbirdGroupReconcile.catchAllGroup` as a
+  default, so a group is named exactly once when both are enabled). See
+  the module's own header for the rename-in-place warning and the
+  operator runbook below for the exact ordered steps of a live rename.
 - **`nixnet.ingress`** (`modules/ingress.nix`) — provisions a Cloudflare
   Tunnel (public hostname → local service ingress) plus an optional
   host-side DNS reconciler. Companion to `nixnet.cloudflared` (the
@@ -223,10 +234,66 @@ of these contribute a peer/uplink transport and none require
   Called from a consumer's own flake `outputs` or host config, same as
   `nixpkgs.lib` itself.
 
-These four modules are NixOS-only for now — each uses at least one
+These five modules are NixOS-only for now — each uses at least one
 primitive (`boot.kernel.sysctl`, `networking.firewall.extraCommands`, or
 upstream `services.cloudflared`) outside `system-manager`'s smaller option
 surface (see the `system-manager` section below for that boundary).
+`netbirdAccessModel` itself only touches `systemd.services`/`.timers`
+(so it *could* run on `system-manager`), but it's listed here because it
+has no purpose without the overlay/reconcile mechanism the rest of this
+section brings up.
+
+### Renaming a live group or policy — the operator runbook
+
+`nixnet.netbirdAccessModel` and `nixnet.netbirdGroupReconcile` both
+declare **names**; neither ever calls a rename endpoint (see each
+module's own header). Renaming a group or policy that real policies
+already reference is safe, but only IN PLACE (same object `id`, new
+`name` field) — never "create a new one and delete the old one" (a new
+object gets a new `id`, orphaning every policy/route still pointing at
+the old one). Ordered steps, using the `fleet → internal` /
+`fleet-internal → internal-mesh` / `fleet-to-external →
+internal-to-external` renames as the worked example:
+
+1. **Account-side, first:** `PUT` each object's existing `id` with only
+   its `name` field changed — the group, then each policy. This is
+   non-disruptive at every step: every rule/route still resolves the
+   same `id`, so mid-rename traffic behavior does not change at all.
+2. **Then** flip the Nix declaration — `groups.internal` (was
+   `groups.fleet`), `policies.internal-mesh.{from,to}` /
+   `policies.internal-to-external.{from,to}` referencing `"internal"`,
+   and `nixnet.netbirdAccessModel.internalGroup = "internal"` — to match.
+   Set `renamedFrom` on the renamed group/policy entries to their old
+   name for one deploy cycle, so the audit (if `audit.enable`) can
+   confirm the old name is actually gone live, then remove `renamedFrom`.
+3. **If `nixnet.netbirdGroupReconcile` is also enabled**, its `bands`/
+   `catchAllGroup` must reference the SAME new names — flipping step 2
+   already does this for `catchAllGroup` if it was relying on
+   `netbirdAccessModel`'s default; a `bands` entry naming the group
+   explicitly needs its own edit.
+
+**What breaks if this runs out of order:**
+
+- **Flipping the Nix declaration BEFORE the account-side rename (step 2
+  before step 1)** is *safe*, just inert: `netbirdGroupReconcile` looks
+  up a group's `id` by matching its CURRENT live `name` — if nothing
+  live is yet named `"internal"`, it logs `WARN: managed group
+  'internal' absent` every tick and changes nothing (by design — it
+  never creates a group). `netbirdAccessModel`'s own assertions still
+  pass (they only check the declaration is internally consistent, never
+  reach the account), and its audit (if enabled) reports every renamed
+  group/policy as "declared, not found live by name" until step 1 lands.
+  Nothing is torn down; the mesh keeps working on the OLD names the
+  whole time.
+- **Doing the account-side rename as "create new + delete old" instead
+  of a `name`-only `PUT`** is the genuinely dangerous order this whole
+  model exists to catch: the new group gets a new `id`, so every
+  existing policy/route rule still lists the OLD (now-deleted) group's
+  `id` — NetBird drops those rule entries to a dangling reference, and
+  the flow that policy was supposed to allow silently stops being
+  allowed (or, for a route, stops being distributed) with no error
+  raised anywhere. This is exactly "a policy referencing a group that
+  does not exist" — always rename in place.
 
 ## Options reference
 
@@ -359,6 +426,32 @@ peer's list.
   `excludeFromCatchAll.forBand` (default `null` — every band's members
   also join the catch-all).
 - `onBootSec` (default `5min`), `interval` (default `10min`).
+
+`nixnet.netbirdAccessModel.*` (`modules/netbird-access-model.nix`):
+
+- `enable`, `internalGroup` (required — must be a key of `groups`; the
+  group meaning "every one of our own peers").
+- `groups.<name>.description` (required), `.renamedFrom` (default
+  `null` — set for one deploy cycle while a rename is in flight; see the
+  runbook above).
+- `policies.<name>.from`/`.to` (both must be keys of `groups`),
+  `.bidirectional` (default `false`), `.enabled` (default `true` —
+  audited but a mismatch is informational-only, see the option's own
+  description), `.renamedFrom` (default `null`), `.description` (default
+  `""`).
+- `routes.<name>.network` (the CIDR the audit matches a live route by —
+  two declared routes must not share one), `.distributeTo` (group names,
+  each must be a key of `groups`), `.description` (default `""`).
+- `audit.enable`, `.apiUrl` (no default), `.tokenFile` (defaults to
+  `nixnet.meshGateway.apiTokenRuntimeFile`'s own default — shared token
+  with the sibling modules), `.onBootSec` (default `5min`), `.interval`
+  (default `15min`).
+- Assertions: `internalGroup` must be a declared group; every
+  policy/route group reference must be declared; no two routes may share
+  a `network`; when `nixnet.netbirdGroupReconcile` is also enabled, every
+  one of its `bands[].name` must be a declared group. Wiring:
+  `nixnet.netbirdGroupReconcile.catchAllGroup` defaults to
+  `internalGroup` whenever both modules are enabled.
 
 `nixnet.ingress.*` (`modules/ingress.nix`):
 

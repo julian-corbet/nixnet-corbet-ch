@@ -1,5 +1,5 @@
 {
-  description = "Provider-agnostic transport failover: a health-checked, hysteresis-damped best-path publisher for both remote peers (LAN/overlay-VPN/...) and local uplinks (wired/wireless/cellular/...), plus resident-daemon health watchdogs (NetBird, Cloudflare Tunnel) for any declaratively-managed network connection that can fail and needs non-interactive recovery -- plus the networking mechanism itself: a NetBird overlay client/routing-peer, an embed multi-peer mesh gateway, NetBird ACL group reconciliation, Cloudflare Tunnel ingress provisioning, and a split-horizon in-cluster proxy/DNS config generator.";
+  description = "Provider-agnostic transport failover: a health-checked, hysteresis-damped best-path publisher for both remote peers (LAN/overlay-VPN/...) and local uplinks (wired/wireless/cellular/...), plus resident-daemon health watchdogs (NetBird, Cloudflare Tunnel) for any declaratively-managed network connection that can fail and needs non-interactive recovery -- plus the networking mechanism itself: a NetBird overlay client/routing-peer, an embed multi-peer mesh gateway, NetBird ACL group reconciliation, a declared NetBird access-model (groups/directional policies/route distribution) audited against the live account, Cloudflare Tunnel ingress provisioning, and a split-horizon in-cluster proxy/DNS config generator.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -43,6 +43,7 @@
       nixosModules.overlay = ./modules/overlay.nix;
       nixosModules.mesh-gateway = ./modules/mesh-gateway.nix;
       nixosModules.netbird-group-reconcile = ./modules/netbird-group-reconcile.nix;
+      nixosModules.netbird-access-model = ./modules/netbird-access-model.nix;
       nixosModules.ingress = ./modules/ingress.nix;
 
       # ---------------------------------------------------------------
