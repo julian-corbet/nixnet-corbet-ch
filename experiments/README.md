@@ -11,7 +11,7 @@ every entry below corresponds to a default or design choice that's
 reasoned, not measured. Results feed back into `modules/core.nix`'s
 defaults or `docs/providers.md`'s deviation notes as they close.
 
-All open; nothing has been run yet (fresh scaffold, no real fleet has run
+All open; nothing has been run yet (fresh scaffold, no real hosts has run
 this code).
 
 ## 001 — is 3000ms the right default probe interval?
@@ -31,7 +31,7 @@ something on the table in one direction or the other.
 **Method sketch:** instrument `nixnetd` to log probe-to-detection latency
 against a real WiFi-roam event (e.g. `NetworkManager` reassociating) and
 compare against the same instrumentation on an overlay-VPN kill/restore
-cycle. No fleet host runs nixnet yet, so this can't be done for real until
+cycle. No host runs nixnet yet, so this can't be done for real until
 one does.
 
 **Status:** open.
@@ -93,7 +93,7 @@ knowing about before this ships anywhere real.
 guarding all group/transport state (see the module doc comment's
 reasoning: this workload ticks in seconds, a handful of transports, one
 lock is simpler and costs nothing observable). At what transport count
-does that stop being true — does a large fleet (dozens of peers, each
+does that stop being true — does many hosts (dozens of peers, each
 with several transports) start to see probe-tick jitter from lock
 contention against `publish_peers_locked`'s file I/O?
 
@@ -110,7 +110,7 @@ and reprovision scripts all parse `netbird status --json` with `jq`
 expressions like `.managementState.url // .management.url` and
 `.peers[].fqdn // .peers[].hostName` — written defensively (trying a
 couple of plausible field-name variants) from the CLI's documented
-behavior, not from a captured real payload, since no fleet host in this
+behavior, not from a captured real payload, since no host in this
 project's development environment runs NetBird.
 
 **Hypothesis:** the overall drift-detection *logic* (config.json

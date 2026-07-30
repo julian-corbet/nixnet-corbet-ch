@@ -396,7 +396,7 @@ in
     managementUrl = mkOption {
       type = types.str;
       example = "https://mesh.example.com";
-      description = "The NetBird management server URL this fleet enrolls against.";
+      description = "The NetBird management server URL these hosts enroll against.";
     };
 
     setupKeyFile = mkOption {

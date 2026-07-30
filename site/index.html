@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
 
   <title>nixnet &mdash; provider-agnostic transport failover for NixOS</title>
-  <meta name="description" content="nixnet picks the best currently-healthy path to a peer or a local uplink — LAN or VPN overlay, wired or cellular — and publishes the winner into /etc/hosts or a route metric, so ssh, mount and curl need zero mesh-awareness. Rust daemon plus NixOS and system-manager modules. v0.1, not yet run against a real fleet.">
+  <meta name="description" content="nixnet picks the best currently-healthy path to a peer or a local uplink — LAN or VPN overlay, wired or cellular — and publishes the winner into /etc/hosts or a route metric, so ssh, mount and curl need zero mesh-awareness. Rust daemon plus NixOS and system-manager modules. v0.1, not yet run against real hosts.">
 
   <meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
@@ -224,7 +224,7 @@ every ordinary NSS files-then-dns lookup</code></pre>
       <code>sd_notify</code> watchdog integration are implemented for real, not
       stubbed, and the test suite runs in-derivation on every
       <code>nix build</code>. What has <em>not</em> happened yet is a real
-      deployment: nothing here has run against a live fleet. Default probe
+      deployment: nothing here has run against live hosts. Default probe
       intervals and hold times are reasoned, not measured &mdash; the repo's
       <code>experiments/</code> notes track exactly which values still need a
       real deployment behind them, and

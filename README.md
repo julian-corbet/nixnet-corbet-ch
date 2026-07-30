@@ -198,7 +198,7 @@ candidates show up.
 - `daemon.defaultProbe.{intervalMs,timeoutMs,upThreshold,downThreshold}` —
   the single source of truth every transport's own `probe.*` field falls
   back to when not set explicitly (defaults `3000`/`800`/`2`/`3` — ◐
-  reasoned, not measured against a real fleet yet; see
+  reasoned, not measured across real hosts yet; see
   `experiments/README.md` #001).
 - `peers.<name>.hostnames` — names to publish (e.g. `[ "host-b" ]`).
 - `peers.<name>.transports` — list of the shared transport type (below).
@@ -327,7 +327,7 @@ in sync.
 
 Fresh project: the engine, both publish backends, and the netbird
 reference provider are implemented for real per the v1 design document,
-but nothing here has run against a real fleet yet. A handful of places
+but nothing here has run across real hosts yet. A handful of places
 where the code necessarily fills a gap or extends the letter of the
 design document are documented explicitly in
 [`docs/providers.md`](docs/providers.md#deviations-from-the-v1-design-document)
