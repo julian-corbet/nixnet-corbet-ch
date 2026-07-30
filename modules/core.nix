@@ -227,6 +227,149 @@ let
     };
   };
 
+  # ---------------------------------------------------------------------
+  # nixnet.interfaces.<name>: the interface FACT table. Added so a host's
+  # NICs are declared in exactly one place -- see this option's own
+  # description (below, in options.nixnet) for the fact/policy line this
+  # draws, and why it sits beside peers/uplinks despite sharing no engine
+  # code with either. `interfaceType` intentionally has the SAME shape
+  # (`mac`, `addresses` keyed by role) as nixhost's own hand-declared
+  # `netInterfaceSubmodule` -- that shape is simply what an interface fact
+  # table needs regardless of which repo states it, not a contortion of
+  # nixnet's namespace to please a particular consumer. The namespace
+  # PATH stays nixnet's own choice (`nixnet.interfaces`, not e.g.
+  # `nixnet.resources.net` mirroring nixhost's tree shape) -- nixhost
+  # adapts to the owner via its own defensive-read idiom
+  # (`config.nixnet.interfaces or { }`), the owner never contorts itself
+  # to shorten the consumer's path.
+  # ---------------------------------------------------------------------
+  interfaceType = types.submodule {
+    options = {
+      mac = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "aa:bb:cc:dd:ee:ff";
+        description = ''
+          This interface's hardware MAC, or `null` (the default) for an
+          interface with no stable one worth recording -- an
+          overlay-network (NetBird/WireGuard) interface's identity is its
+          tunnel key, not a MAC, and forcing a value here would mean
+          inventing one just to satisfy the type. Checked below
+          (`assertions`) against a six-octet colon-separated hex shape
+          whenever set, non-null: a malformed MAC is cheap to catch here
+          and expensive to debug at whatever udev rule or device-plugin
+          match eventually fails on it downstream.
+        '';
+      };
+
+      addresses = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        example = { lan = "192.0.2.10"; overlay = "198.51.100.10"; };
+        description = ''
+          Every address this interface is DECLARED to answer to, keyed by
+          role rather than a fixed column set -- one host's interface has
+          one LAN address, another has a LAN address AND an overlay one
+          simultaneously, a third has only a dynamic public address
+          nothing here needs to name. Add a role by using it.
+
+          This is inventory, not the failover engine's own runtime state,
+          and that line is deliberate: an address belongs here only if
+          it's known at Nix-eval time as part of this host's declared
+          configuration (a static LAN IP, a DHCP reservation, a NetBird
+          peer's overlay address pinned via `staticOverlayAddress` on
+          THIS host's own enrollment) -- never a value nixnetd discovers
+          or arbitrates between at runtime. The two nearest existing
+          "address" concepts in this file are NOT the same axis and are
+          deliberately left alone rather than folded in here:
+            - `transportType.address` / `netbird-provider`'s
+              `staticOverlayAddress` describe a REMOTE PEER's reachable
+              address, used to pick a winner among competing transports.
+              This table describes THIS HOST's own interfaces -- a peer's
+              address is that peer's inventory, declared on that peer's
+              own host, not a second copy of it here.
+            - `uplinks.<name>.transports[].interface` is a bare string
+              naming a local egress interface for routing purposes; it
+              deliberately carries no attached MAC/address inventory, and
+              this table doesn't force one on it either (no assertion
+              requires an uplink's `interface` to have a matching entry
+              here) -- coupling the two would make declaring an uplink
+              transport silently REQUIRE also fully inventorying that
+              NIC's addresses, which breaks the "each option group is
+              independently usable" property every other part of this
+              file preserves (a peers-only install needs no uplinks;
+              an uplinks-only install shouldn't need to start
+              inventorying interfaces it already names by string).
+          Duplicate address values across two different interfaces on
+          THIS table are asserted below as a hard error, the same
+          "colliding entries in a shared namespace" reasoning
+          `peers.*.hostnames`'s own assertion already applies -- a single
+          host declaring the identical address on two different NICs is
+          overwhelmingly a copy-paste mistake, not a real configuration
+          (unlike a genuinely-shared VIP/anycast address, which spans
+          *hosts*, not two NICs on the same one, and so never collides
+          with this per-host check).
+        '';
+      };
+    };
+  };
+
+  looksLikeMac = s: builtins.match "([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}" s != null;
+
+  malformedMacs = flatten (mapAttrsToList
+    (name: i:
+      optional (i.mac != null && !(looksLikeMac i.mac))
+        "nixnet.interfaces.${name}.mac = \"${i.mac}\" is not six colon-separated hex octets (e.g. \"aa:bb:cc:dd:ee:ff\").")
+    cfg.interfaces);
+
+  # Every (interface, role, address) triple flattened into one list, so
+  # duplicate detection below is a single group-by rather than an O(n^2)
+  # pairwise comparison across interfaces.
+  allInterfaceAddresses = flatten (mapAttrsToList
+    (name: i: mapAttrsToList (role: addr: { inherit name role addr; }) i.addresses)
+    cfg.interfaces);
+
+  addressOccurrences = foldl'
+    (acc: a: acc // { ${a.addr} = (acc.${a.addr} or [ ]) ++ [ "${a.name}.${a.role}" ]; })
+    { }
+    allInterfaceAddresses;
+
+  duplicateInterfaceAddresses = filterAttrs (_: locs: length locs > 1) addressOccurrences;
+
+  # Validation for `nixnet.interfaces` -- deliberately NOT nested inside
+  # `mkIf cfg.enable` below (see where this list is spliced into `config`):
+  # a host may declare its own interface inventory purely for a consumer
+  # like nixhost to read, with `nixnet.enable = false` and no daemon
+  # running at all. Gating these checks behind the daemon's own on/off
+  # switch would mean a malformed MAC or a duplicated address on such a
+  # host silently evaluates clean, only to surface however the consumer
+  # downstream chokes on it instead.
+  interfaceAssertions = [
+    {
+      assertion = malformedMacs == [ ];
+      message = ''
+        nixnet.interfaces has a malformed mac:
+          ${concatStringsSep "\n          " malformedMacs}
+        A MAC that doesn't type-check as six colon-separated hex octets
+        is worth catching HERE, at eval time -- the alternative is
+        whatever downstream consumer (a udev rule, a device-plugin match)
+        discovers it first, with a much less specific error.
+      '';
+    }
+    {
+      assertion = duplicateInterfaceAddresses == { };
+      message = ''
+        nixnet.interfaces has the same address declared on more than one
+        interface: ${concatStringsSep "; " (mapAttrsToList (addr: locs: "${addr} on ${concatStringsSep ", " locs}") duplicateInterfaceAddresses)}.
+        Two different NICs on the SAME host answering to the identical
+        address is overwhelmingly a copy-paste mistake, not a real
+        configuration (a genuinely-shared address spans hosts, not two
+        interfaces on one of them, and so never trips this check) --
+        rename or remove one of the entries above.
+      '';
+    }
+  ];
+
   uplinkType = types.submodule {
     options = {
       transports = mkOption {
@@ -427,9 +570,45 @@ in
       default = { };
       description = "Local egress choices (wired/wireless/cellular/...), published as route metrics.";
     };
+
+    interfaces = mkOption {
+      type = types.attrsOf interfaceType;
+      default = { };
+      example = literalExpression ''
+        { lan0 = { mac = "aa:bb:cc:dd:ee:ff"; addresses.lan = "192.0.2.10"; }; }
+      '';
+      description = ''
+        The network interfaces this host actually has, keyed by a short
+        stable name -- a FACT table (this host's own MAC/address
+        inventory), independent of `peers`/`uplinks` above (the engine
+        that picks a winner AMONG candidate transports at runtime) and of
+        any provider. Empty (the default) for a host where no interface
+        is worth recording at this path. See `interfaceType`'s own
+        comment (above, in this file's `let`) for the fact-vs-policy line
+        drawn here and how this reconciles with `transportType.address`
+        and `netbird-provider`'s `staticOverlayAddress` rather than
+        duplicating either.
+
+        This is the read a domain like nixhost mirrors defensively
+        (`config.nixnet.interfaces or { }`) to make a host's NICs
+        addressable at its own namespace path without a second,
+        independently-maintained copy of this table existing there --
+        the same one-way idiom nixhost's own `storage.disks` already
+        applies to nixstorage.
+      '';
+    };
   };
 
-  config = mkIf cfg.enable ({
+  # `mkMerge` here, rather than folding `interfaceAssertions` into the
+  # `mkIf cfg.enable` block below: those checks must fire whenever
+  # `nixnet.interfaces` is populated, independent of whether the
+  # peer/uplink daemon itself is enabled on this host (see
+  # `interfaceAssertions`'s own comment, above in this file's `let`, for
+  # why gating them on `cfg.enable` would leave a fact-table-only host
+  # unchecked).
+  config = mkMerge [
+    { assertions = interfaceAssertions; }
+    (mkIf cfg.enable ({
     assertions = [
       {
         assertion =
@@ -675,5 +854,6 @@ in
         exit 1
       ''}";
     };
-  }));
+  })))
+  ];
 }

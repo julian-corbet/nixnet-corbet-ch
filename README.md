@@ -213,6 +213,16 @@ candidates show up.
   question as peers').
 - `uplinks.<name>.publish.routeMetric` (default `true`),
   `.metricBase` (default `100`), `.metricStep` (default `10`).
+- `interfaces.<name>.mac` (default `null`), `.addresses` (an attrset keyed
+  by role, e.g. `{ lan = "192.0.2.10"; }`, default `{ }`) — a FACT table
+  of this host's own NICs, independent of `peers`/`uplinks` (which pick a
+  winner among candidate transports at runtime) and of `enable` (these
+  entries, and their own `assertions`, apply even with the daemon off).
+  This is the table a domain like `nixhost` mirrors defensively
+  (`config.nixnet.interfaces or { }`) rather than hand-declaring its own
+  copy — see `interfaceType`'s comment in `modules/core.nix` for the
+  fact/policy line drawn against `transportType.address` and
+  `netbird-provider`'s `staticOverlayAddress`.
 
 The shared **transport** type (`peers.<name>.transports[]` and
 `uplinks.<name>.transports[]` both use this):
