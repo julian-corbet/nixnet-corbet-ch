@@ -178,6 +178,56 @@ design note, and expect more providers in this second, non-transport
 shape over time as more "this can fail and should heal itself"
 candidates show up.
 
+## Owning the networking mechanism itself
+
+Everything above *observes* or *fails over between* connections someone
+else brought up. This repo also ships the modules that bring the
+connections up in the first place — the overlay network, the group
+membership that governs it, the multi-peer gateway that gives services
+their own identities on it, and the public ingress in front of them. None
+of these contribute a peer/uplink transport and none require
+`nixosModules.core`.
+
+- **`nixnet.overlay`** (`modules/overlay.nix`) — turn this host into a
+  NetBird overlay client, optionally the account's routing peer
+  (`advertiseRoutes`), with an external-device confinement rule
+  (`confineExternalRange`/`confineExternalAllow`) closing the blanket
+  forward-accept hole a routing peer otherwise leaves open. Distinct from
+  `nixnet.netbird` (above): that module is about REACHING a specific peer
+  through the failover engine; this one is about THIS host's own overlay
+  membership. A host commonly runs both.
+- **`nixnet.meshGateway`** (`modules/mesh-gateway.nix`) — one process
+  holding N self-hosted-NetBird identities (an embed client per configured
+  peer), L4-forwarding each to a real backend. Gives a service (or a
+  client-less machine) its own overlay address without running its own
+  NetBird client. Owns the systemd/config-rendering mechanism only —
+  `package` is a required option: bring your own build of a program that
+  reads the rendered JSON and speaks NetBird's embed-client library (see
+  the module's own header for why the binary itself is out of scope here).
+- **`nixnet.netbirdGroupReconcile`** (`modules/netbird-group-reconcile.nix`)
+  — keeps NetBird peer→group membership in sync with a declared IP-octet
+  addressing scheme, on a timer, so a group→group ACL grant picks up a
+  peer that enrolls later. Membership-only: never creates/deletes groups
+  or policies. `bands`/`catchAllGroup` are **live NetBird object names** —
+  see the module's own header warning before wiring this in.
+- **`nixnet.ingress`** (`modules/ingress.nix`) — provisions a Cloudflare
+  Tunnel (public hostname → local service ingress) plus an optional
+  host-side DNS reconciler. Companion to `nixnet.cloudflared` (the
+  watchdog, above), not a replacement — point the watchdog's `tunnelUnit`
+  at `"cloudflared-tunnel-${config.nixnet.ingress.tunnelId}"` to watch the
+  tunnel this module provisions.
+- **`lib.svcProxyConfig`** (`lib/svc-proxy-config.nix`) — not a module, a
+  pure function: turns a service registry into a split-horizon in-cluster
+  nginx config + CoreDNS zone, so an in-cluster caller of `<svc>.<zone>`
+  gets the same HTTPS experience as an overlay or public-tunnel caller.
+  Called from a consumer's own flake `outputs` or host config, same as
+  `nixpkgs.lib` itself.
+
+These four modules are NixOS-only for now — each uses at least one
+primitive (`boot.kernel.sysctl`, `networking.firewall.extraCommands`, or
+upstream `services.cloudflared`) outside `system-manager`'s smaller option
+surface (see the `system-manager` section below for that boundary).
+
 ## Options reference
 
 `nixnet.*` (`modules/core.nix`):
@@ -271,6 +321,63 @@ Every `peers.<name>` referenced under `nixnet.netbird.peers`
 must already exist under `nixnet.peers.<name>` (with its own
 `hostnames`) — the provider only ever *adds* one more transport to that
 peer's list.
+
+`nixnet.overlay.*` (`modules/overlay.nix`):
+
+- `enable`, `managementUrl`, `hostname`, `setupKeyFile` — same shape as
+  `nixnet.netbird`'s equivalents, no defaults (environment-specific).
+- `advertiseRoutes` (default `[ ]`) — LAN CIDRs this peer routes into the
+  overlay; non-empty turns on kernel forwarding + source-NAT for the
+  reverse direction.
+- `confineExternalRange`/`confineExternalAllow` (default `null`/`[ ]`) —
+  restrict an untrusted overlay band to only the LAN hosts it's allowed to
+  reach, everything else dropped.
+- `overlayInterface` (default `"wt0"`, upstream's default tunnel
+  interface name).
+
+`nixnet.meshGateway.*` (`modules/mesh-gateway.nix`):
+
+- `enable`, `package` (required — see the module's own header),
+  `managementUrl`, `apiUrl`, `ageKeyFile`, `setupKeySecret`,
+  `apiTokenSecret` — all environment-specific, no defaults.
+- `setupKeyRuntimeFile`/`apiTokenRuntimeFile` (defaults under
+  `/run/secrets/nixnet-mesh-gateway-*`) — where the unsealed secrets land.
+- `stateDir` (default `/var/lib/nixnet-mesh-gateway`).
+- `peers.<name>.ip`, `.forwards[].{proto,listenPort,dial}` — one entry per
+  overlay identity this gateway holds; `privateKeyFile` is computed
+  internally (`<stateDir>/<name>/private.key`), never set by hand.
+
+`nixnet.netbirdGroupReconcile.*` (`modules/netbird-group-reconcile.nix`):
+
+- `enable`, `apiUrl` (no default), `tokenFile` (defaults to
+  `nixnet.meshGateway.apiTokenRuntimeFile`'s own default — the two modules
+  share one token when both are enabled).
+- `bands[].{min,max,name}` (default `[ ]`) — octet ranges mapped to a
+  **live NetBird group name** each.
+- `catchAllGroup` (required whenever `bands` is non-empty) — the group
+  every reconciled peer joins, except a band named in
+  `excludeFromCatchAll.forBand` (default `null` — every band's members
+  also join the catch-all).
+- `onBootSec` (default `5min`), `interval` (default `10min`).
+
+`nixnet.ingress.*` (`modules/ingress.nix`):
+
+- `enable`, `tunnelId` (required), `credentialsFile` (default
+  `/run/secrets/cloudflared-credentials.json`).
+- `ingress[].{hostname,service,path}` (default `[ ]`) — this module
+  appends the `http_status:404` catch-all itself.
+- `edgeIpVersion` (default `"auto"`), `transportProtocol` (default
+  `"auto"`).
+- `dnsReconcile.enable`, `.apiTokenFile` (default
+  `/run/secrets/cloudflared-cf-api-token`), `.zone` (required),
+  `.onCalendar` (default `*:0/15`), `.mgmtRecords` (attrset of
+  hostname → internal IP, UPSERTed as proxied=false A-records).
+
+`lib.svcProxyConfig` (`lib/svc-proxy-config.nix`) — a function, not a
+module option tree; called as
+`inputs.nixnet.lib.svcProxyConfig { inherit lib services machines zone proxyClusterIP l4ClusterIpPrefix; }`.
+See the file's own header for the full `services.<name>` input shape and
+the HTTP-vs-L4-direct split it renders.
 
 ## Non-NixOS hosts (via `system-manager`)
 

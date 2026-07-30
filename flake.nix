@@ -1,5 +1,5 @@
 {
-  description = "Provider-agnostic transport failover: a health-checked, hysteresis-damped best-path publisher for both remote peers (LAN/overlay-VPN/...) and local uplinks (wired/wireless/cellular/...), plus resident-daemon health watchdogs (NetBird, Cloudflare Tunnel) for any declaratively-managed network connection that can fail and needs non-interactive recovery.";
+  description = "Provider-agnostic transport failover: a health-checked, hysteresis-damped best-path publisher for both remote peers (LAN/overlay-VPN/...) and local uplinks (wired/wireless/cellular/...), plus resident-daemon health watchdogs (NetBird, Cloudflare Tunnel) for any declaratively-managed network connection that can fail and needs non-interactive recovery -- plus the networking mechanism itself: a NetBird overlay client/routing-peer, an embed multi-peer mesh gateway, NetBird ACL group reconciliation, Cloudflare Tunnel ingress provisioning, and a split-horizon in-cluster proxy/DNS config generator.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -30,6 +30,22 @@
       nixosModules.cloudflared-provider = ./modules/cloudflared-provider.nix;
 
       # ---------------------------------------------------------------
+      # The networking-ownership modules (added this pass): none of these
+      # contribute a peer/uplink transport and none require nixosModules.core
+      # -- they provision/manage the underlying network connections
+      # themselves (a NetBird overlay client, an embed multi-peer gateway, an
+      # ACL group reconciler, a Cloudflare Tunnel) rather than health-checking
+      # an address someone else already brought up. NixOS-only for now (each
+      # uses at least one primitive -- boot.kernel.sysctl,
+      # networking.firewall.extraCommands, or upstream services.cloudflared --
+      # outside system-manager's smaller option surface; see core.nix's own
+      # header for that boundary).
+      nixosModules.overlay = ./modules/overlay.nix;
+      nixosModules.mesh-gateway = ./modules/mesh-gateway.nix;
+      nixosModules.netbird-group-reconcile = ./modules/netbird-group-reconcile.nix;
+      nixosModules.ingress = ./modules/ingress.nix;
+
+      # ---------------------------------------------------------------
       # Same files, rendered onto system-manager's smaller option surface
       # instead of a real NixOS rebuild (design.md §9). nixnet only ever
       # touches environment.etc, systemd.services/timers/paths, and a
@@ -46,6 +62,12 @@
         nixnet = (pkgsFor system).callPackage ./package.nix { };
         default = self.packages.${system}.nixnet;
       });
+
+      # Pure functions, not NixOS modules -- called from a consumer's own
+      # flake `outputs` or host config `let`, the same way `nixpkgs.lib`
+      # itself is consumed. See lib/svc-proxy-config.nix's own header for
+      # the full contract.
+      lib.svcProxyConfig = import ./lib/svc-proxy-config.nix;
 
       formatter = forAllSystems (system: (pkgsFor system).nixpkgs-fmt);
     };
