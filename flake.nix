@@ -30,8 +30,8 @@
       nixosModules.cloudflared-provider = ./modules/cloudflared-provider.nix;
 
       # ---------------------------------------------------------------
-      # The networking-ownership modules (added this pass): none of these
-      # contribute a peer/uplink transport and none require nixosModules.core
+      # The networking-ownership modules: none of these contribute a
+      # peer/uplink transport and none require nixosModules.core
       # -- they provision/manage the underlying network connections
       # themselves (a NetBird overlay client, an embed multi-peer gateway, an
       # ACL group reconciler, a Cloudflare Tunnel) rather than health-checking
