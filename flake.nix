@@ -70,6 +70,17 @@
       # the full contract.
       lib.svcProxyConfig = import ./lib/svc-proxy-config.nix;
 
+      # The eval-time regression net in ./checks (a real, if minimal, NixOS
+      # evaluation of modules/core.nix -- see that file's own header for
+      # why not a bare evalModules stub, and for what's deliberately
+      # out of scope: runtime facts, verified live instead).
+      checks = forAllSystems (system:
+        import ./checks {
+          pkgs = pkgsFor system;
+          nixpkgs = nixpkgs.outPath;
+          nixnetModule = ./modules/core.nix;
+        });
+
       formatter = forAllSystems (system: (pkgsFor system).nixpkgs-fmt);
     };
 }

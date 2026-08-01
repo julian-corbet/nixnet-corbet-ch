@@ -114,7 +114,7 @@ let
         # /var/lib/netbird/config.json directly -- that file (and its
         # parent dir) is root-only (0600/0700, real private-key material,
         # and deliberately NOT group-readable even by the "netbird" group
-        # nixnetd's DynamicUser joins), so a direct read here would always
+        # nixnetd's fixed user joins), so a direct read here would always
         # fail-closed for this unprivileged process regardless of whether
         # netbird itself is actually healthy. The control socket is
         # world-accessible (srw-rw-rw-) by netbird's own design specifically
@@ -518,7 +518,7 @@ in
     # ordinary cross-module systemd.services.* extension, the same
     # mechanism any two unrelated NixOS modules can use to jointly shape a
     # third unit. It's needed because the exec-probe script above runs as
-    # a child of nixnetd's own (unprivileged, DynamicUser) process, and
+    # a child of nixnetd's own (unprivileged, fixed-user) process, and
     # `netbird status` needs group-level access to NetBird's control
     # socket. See docs/providers.md's "Deviation: nixnetd
     # SupplementaryGroups" note.

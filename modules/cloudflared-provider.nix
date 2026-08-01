@@ -207,7 +207,7 @@ in
       # on another module having already done so.
       "d /run/nixnet/reprovision 0750 root root -"
       # Deliberately NOT /var/lib/nixnet: that path is nixnetd's own
-      # `StateDirectory=nixnet` (core.nix), owned by ITS DynamicUser --
+      # `StateDirectory=nixnet` (core.nix), owned by its own fixed user --
       # this module must work with or without core.nix enabled at all, and
       # even when both are enabled, two independent systemd mechanisms
       # (StateDirectory= vs a plain tmpfiles `d` rule) fighting over the

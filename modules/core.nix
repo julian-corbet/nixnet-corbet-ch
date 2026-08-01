@@ -460,16 +460,35 @@ let
     mkdir -p "$runtime_dir"
     hosts_dir=$(dirname "${cfg.daemon.hostsFile}")
     mkdir -p "$hosts_dir"
-    # hostsFile deliberately lives outside nixnetd's DynamicUser StateDirectory
-    # (see the option's own doc comment) specifically so it stays reachable by
-    # every other reader on the box. nixnetd itself writes here as an
-    # unprivileged, per-boot-random DynamicUser UID with no fixed group to
-    # grant ownership through, so the directory has to be sticky+world-
-    # writable (mode 1777, same model as /tmp) for nixnetd's own atomic
-    # write-tmp-then-rename to succeed -- there is exactly one writer
-    # (nixnetd) in practice, and the content itself (hostname -> address
-    # mappings) is no more sensitive than what's already public via DNS.
-    chmod 1777 "$hosts_dir"
+    # hostsFile deliberately lives outside nixnetd's StateDirectory (see the
+    # option's own doc comment) specifically so it stays reachable by every
+    # other reader on the box. nixnetd is the sole writer, so the directory
+    # and file are chowned to its own fixed user/group (nixnetd:nixnetd,
+    # declared below) rather than left root-owned -- this script runs as
+    # root (a NixOS activation script, or a system-manager oneshot/
+    # preActivationAssertion), so it CAN hand ownership to nixnetd directly,
+    # and a stable owner is what actually lets nixnetd's own atomic
+    # write-tmp-then-rename succeed later (see git history for why the
+    # previous approach here -- mode 1777 on the directory, reasoned as
+    # "same model as /tmp" -- never worked: that model is backwards. /tmp's
+    # sticky bit specifically PREVENTS a non-owner from renaming over
+    # another user's file, even with the directory world-writable; it
+    # can't grant the opposite of what it's for. A fixed owner is the only
+    # way for the daemon to legitimately win that rename against a
+    # root-owned file the seed step wrote first).
+    #
+    # Best-effort, not `|| exit`: on system-manager, this same script also
+    # runs once as a `preActivationAssertions` hook (see below), ordered
+    # BEFORE user creation -- at that specific early call the "nixnetd"
+    # user may not exist yet, so `chown` can legitimately fail there. Never
+    # fatal to this script's own job (guaranteeing the file exists, so a
+    # `symlinkJoin`/etc-activation reading it never dangles) -- the LATER,
+    # correctly-ordered call (the NixOS activation script proper, or
+    # system-manager's nixnet-seed-hosts.service, both of which run after
+    # users are created) re-chowns it correctly before nixnetd itself ever
+    # starts.
+    chown nixnetd:nixnetd "$hosts_dir" 2>/dev/null || true
+    chmod 0755 "$hosts_dir"
 
     tmp=$(mktemp "${cfg.daemon.hostsFile}.seed.XXXXXX")
     trap 'rm -f "$tmp"' EXIT
@@ -500,6 +519,7 @@ let
 
     mv -f "$tmp" "${cfg.daemon.hostsFile}"
     chmod 0644 "${cfg.daemon.hostsFile}"
+    chown nixnetd:nixnetd "${cfg.daemon.hostsFile}" 2>/dev/null || true
   '';
 
 in
@@ -518,18 +538,17 @@ in
       runtimeDir = mkOption { type = types.str; default = "nixnet"; description = "Under /run."; };
       hostsFile = mkOption {
         type = types.path;
-        # NOT "${cfg.daemon.stateDir}/hosts" -- found 2026-07-25 in production:
-        # nixnetd runs with DynamicUser=true, so systemd relocates its
-        # StateDirectory to /var/lib/private/nixnet (a symlinked-from
-        # /var/lib/nixnet convenience path) and, crucially, makes the shared
-        # /var/lib/private/ PARENT directory 0700 root:root -- a hardcoded
-        # systemd isolation boundary with no per-service override. Any file
-        # nixnetd writes under stateDir inherits that same unreachability for
-        # every OTHER process on the box, including systemd-resolved and
-        # every plain NSS "files" lookup -- exactly the readers /etc/hosts
-        # exists to serve. A sibling directory outside stateDir (still under
-        # /var/lib, so the persistence argument below still holds) sidesteps
-        # the private-parent entirely.
+        # NOT "${cfg.daemon.stateDir}/hosts" -- found 2026-07-25 in production (now historical:
+        # nixnetd no longer runs with DynamicUser=true, see systemd.services.nixnetd below, so the
+        # relocation this originally sidestepped can't happen anymore either). At the time,
+        # DynamicUser=true made systemd relocate StateDirectory to /var/lib/private/nixnet (a
+        # symlinked-from /var/lib/nixnet convenience path) with the shared /var/lib/private/
+        # PARENT directory 0700 root:root -- a hardcoded systemd isolation boundary with no
+        # per-service override. Any file nixnetd wrote under stateDir inherited that same
+        # unreachability for every OTHER process on the box, including systemd-resolved and every
+        # plain NSS "files" lookup -- exactly the readers /etc/hosts exists to serve. Kept as a
+        # sibling directory outside stateDir regardless of the fix below: nothing needs it moved
+        # back, and every consumer's rendered config.json already carries this exact path.
         default = "/var/lib/nixnet-hosts/hosts";
         description = ''
           Where nixnetd actually keeps /etc/hosts's live content --
@@ -627,23 +646,9 @@ in
           nixnet.daemon.stateDir (${toString cfg.daemon.stateDir}) must
           live under /var/lib/ -- the systemd unit uses StateDirectory=,
           which systemd only ever creates under /var/lib/ and which is
-          what gives the DynamicUser nixnetd runs as correct ownership of
+          what gives the fixed user nixnetd runs as correct ownership of
           it. A path elsewhere would silently keep the *directory name*
           but not actually point at the location you configured.
-        '';
-      }
-      {
-        assertion = !(hasPrefix ("${toString cfg.daemon.stateDir}/") (toString cfg.daemon.hostsFile));
-        message = ''
-          nixnet.daemon.hostsFile (${toString cfg.daemon.hostsFile}) must NOT
-          live under nixnet.daemon.stateDir (${toString cfg.daemon.stateDir}).
-          Found in production 2026-07-25: nixnetd's StateDirectory= is silently
-          relocated by systemd (DynamicUser=true) to /var/lib/private/<name>,
-          and the shared /var/lib/private/ parent is 0700 root:root with no
-          per-service override -- anything nested under stateDir inherits that
-          same unreachability for every other reader on the box, including
-          /etc/hosts's whole reason to exist. hostsFile has its own sibling
-          directory (see its option default) precisely to avoid this.
         '';
       }
     ] ++ (flatten (mapAttrsToList
@@ -699,6 +704,19 @@ in
       replaceExisting = true;
     });
 
+    # nixnetd's own fixed identity (replaces DynamicUser=true -- see
+    # systemd.services.nixnetd's own comment below for why DynamicUser never
+    # actually worked here). A plain system user/group: nixnetd owns
+    # cfg.daemon.stateDir and the hostsFile sibling directory (both chowned
+    # to it, see seedHostsScript above and StateDirectory= below), needs no
+    # login shell and no home directory of its own.
+    users.users.nixnetd = {
+      isSystemUser = true;
+      group = "nixnetd";
+      description = "nixnet transport failover daemon";
+    };
+    users.groups.nixnetd = { };
+
     # system-manager: no `system.activationScripts.<name>` at all (only a
     # fixed, non-extensible `.users` stub -- see options.nixnet's
     # `isSystemManager` note above), so the same seeding logic runs as an
@@ -706,10 +724,17 @@ in
     # `before`/`wants` wiring nixnetd itself carries below (added
     # unconditionally -- a harmless dangling unit reference on NixOS, where
     # this service doesn't exist and the activation script above already
-    # covers it).
+    # covers it). Also ordered after userborn.service -- system-manager's own
+    # user-creation step -- so "nixnetd" reliably exists by the time this
+    # script's chown runs (see seedHostsScript's own comment on why an
+    # earlier, unordered call is allowed to have that chown no-op instead).
+    # Harmless on NixOS too: userborn.service doesn't exist there, so this
+    # is the same kind of no-op dangling reference nixnetd's own `after`
+    # below already relies on.
     systemd.services.nixnet-seed-hosts = mkIf isSystemManager {
       description = "Seed cfg.daemon.hostsFile before nixnetd's first tick (system-manager backend)";
       before = [ "nixnetd.service" ];
+      after = [ "userborn.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
@@ -732,7 +757,31 @@ in
 
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/nixnetd -config /etc/nixnet/config.json";
-        DynamicUser = true;
+        # NOT DynamicUser=true. Found live in production 2026-08-01: the
+        # boot-time seed script (seedHostsScript above) runs as root and
+        # creates hostsFile before nixnetd's first tick, every single boot.
+        # A DynamicUser's UID is freshly allocated per boot and owns
+        # neither that file nor its directory, so nixnetd's own atomic
+        # write-tmp-then-rename (Rust: `NamedTempFile::persist`, a
+        # rename(2)) hit EPERM on every single publish attempt --
+        # unconditionally, not intermittently: POSIX's sticky-bit rule
+        # (the directory was mode 1777) restricts unlink/rename to the
+        # file's owner, the directory's owner, or a privileged process,
+        # and a non-root DynamicUser is never any of those against a
+        # root-owned file. This was reasoned as "same model as /tmp" when
+        # written; that model is backwards -- /tmp's sticky bit exists
+        # specifically to STOP a non-owner from doing exactly the rename
+        # nixnetd needed to do. The daemon had never once successfully
+        # published a winner since hostsFile was moved outside
+        # StateDirectory (2026-07-25); only the boot-time seed's own
+        # content (or nothing) was ever visible in /etc/hosts. A fixed
+        # user closes this for good: nixnetd owns the file and directory
+        # outright (chowned by the seed script, see above), so the rename
+        # is always same-owner and sticky bit is a non-issue. See
+        # ../checks/default.nix's "nixnetd-fixed-user" checks for the
+        # regression test.
+        User = "nixnetd";
+        Group = "nixnetd";
         RuntimeDirectory = cfg.daemon.runtimeDir;
         StateDirectory = baseNameOf (toString cfg.daemon.stateDir);
         NoNewPrivileges = true;
