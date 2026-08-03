@@ -121,16 +121,22 @@ ${confineRules}${snatRules}}
       # this work regardless of what the old rule looked like -- and is
       # exactly the property whose absence let a renamed chain leak in the
       # first place.
+      # `legacyChains` extends the same treatment to a chain some OTHER
+      # config created and can no longer reach -- see that option's own
+      # description for why an abandoned extraCommands chain is unremovable
+      # by any later generation.
       if command -v iptables >/dev/null 2>&1; then
-        iptables -t raw -S PREROUTING 2>/dev/null \
-          | grep -- '-j NIXNET-EXT-CONFINE' \
-          | sed 's/^-A /-D /' \
-          | while read -r rule; do
-              # shellcheck disable=SC2086 # the rule is a pre-split argv line
-              iptables -t raw $rule 2>/dev/null || true
-            done
-        iptables -t raw -F NIXNET-EXT-CONFINE 2>/dev/null || true
-        iptables -t raw -X NIXNET-EXT-CONFINE 2>/dev/null || true
+        for chain in NIXNET-EXT-CONFINE ${lib.escapeShellArgs cfg.legacyChains}; do
+          iptables -t raw -S PREROUTING 2>/dev/null \
+            | grep -- "-j $chain\$" \
+            | sed 's/^-A /-D /' \
+            | while read -r rule; do
+                # shellcheck disable=SC2086 # the rule is a pre-split argv line
+                iptables -t raw $rule 2>/dev/null || true
+              done
+          iptables -t raw -F "$chain" 2>/dev/null || true
+          iptables -t raw -X "$chain" 2>/dev/null || true
+        done
       fi
     '';
   };
@@ -213,6 +219,30 @@ in
       default = [ ];
       example = [ "192.0.2.125" "192.0.2.126" ];
       description = "LAN hosts the confined external range MAY still reach. Everything else on the LAN is dropped for that range.";
+    };
+
+    legacyChains = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "OLD-EXT-CONFINE" ];
+      description = ''
+        Names of iptables chains in the `raw` table left behind by a
+        HAND-ROLLED confinement this module has replaced, to be removed on
+        every apply.
+
+        Exists because a chain installed through
+        `networking.firewall.extraCommands` outlives the generation that
+        declared it: teardown only runs for whichever generation is being
+        stopped, so once a chain's declaration is gone, nothing declarative
+        can ever remove it again and it sits in the ruleset forever.
+        Naming it here removes it the declarative way, rather than leaving
+        an operator to run `iptables -X` by hand on a live box.
+
+        This module always cleans up its OWN former chain without being
+        asked; this option is for a chain some other config created.
+        Idempotent and safe to leave set permanently, though once you have
+        confirmed the chain is gone it is just noise.
+      '';
     };
 
     ruleset = lib.mkOption {
