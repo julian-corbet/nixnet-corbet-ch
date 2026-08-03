@@ -227,26 +227,32 @@ let
 
   overlayRules = overlayCfg.nixnet.overlay.ruleset;
 
-  # Comment lines are stripped before the source-text checks below. The
-  # module's own header explains at length WHY it no longer uses
-  # extraCommands, and a naive grep over the raw file would trip on that
-  # explanation permanently -- turning a real regression guard into a check
-  # that can only be satisfied by deleting the documentation.
-  overlayCode = lib.concatStringsSep "\n"
-    (lib.filter (l: builtins.match "[[:space:]]*#.*" l == null)
-      (lib.splitString "\n" (builtins.readFile ../modules/overlay.nix)));
-
   overlayResults = [
     # THE regression. If either of these strings ever comes back, a deny rule
     # is once again one `networking.firewall.enable = false` away from
     # silently not existing.
-    (check "overlay/no-firewall-extraCommands"
-      (!(lib.hasInfix "networking.firewall.extraCommands" overlayCode))
-      "modules/overlay.nix references networking.firewall.extraCommands again")
+    # Asserted against the EVALUATED value, not the module's source text.
+    # A source grep cannot tell a live `networking.firewall.extraCommands =`
+    # from the prose explaining why this module stopped using one, so it
+    # fails the moment the file documents its own history -- and the only
+    # way to satisfy it becomes deleting the documentation. What actually
+    # matters is that this module CONTRIBUTES nothing there, which is
+    # exactly what the rendered config says.
+    # Keyed on THIS module's own fingerprint rather than on the field being
+    # empty: nixpkgs' firewall module contributes its own nat/forward
+    # teardown helpers to extraCommands unconditionally, so "empty" is never
+    # true and an emptiness check would fail against a perfectly correct
+    # module. What must be absent is anything nixnet put there -- its chain
+    # name, and the overlay interface its masquerade named.
+    (check "overlay/contributes-no-firewall-extraCommands"
+      (!(lib.hasInfix "NIXNET-EXT-CONFINE" overlayCfg.networking.firewall.extraCommands)
+        && !(lib.hasInfix "wt0" overlayCfg.networking.firewall.extraCommands))
+      "networking.firewall.extraCommands: ${builtins.toJSON overlayCfg.networking.firewall.extraCommands}")
 
-    (check "overlay/no-firewall-extraStopCommands"
-      (!(lib.hasInfix "networking.firewall.extraStopCommands" overlayCode))
-      "modules/overlay.nix references networking.firewall.extraStopCommands again")
+    (check "overlay/contributes-no-firewall-extraStopCommands"
+      (!(lib.hasInfix "NIXNET-EXT-CONFINE" overlayCfg.networking.firewall.extraStopCommands)
+        && !(lib.hasInfix "wt0" overlayCfg.networking.firewall.extraStopCommands))
+      "networking.firewall.extraStopCommands: ${builtins.toJSON overlayCfg.networking.firewall.extraStopCommands}")
 
     (check "overlay/owns-its-own-table"
       (lib.hasInfix "table inet nixnet-overlay {" overlayRules)
