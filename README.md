@@ -191,11 +191,32 @@ of these contribute a peer/uplink transport and none require
 - **`nixnet.overlay`** (`modules/overlay.nix`) — turn this host into a
   NetBird overlay client, optionally the account's routing peer
   (`advertiseRoutes`), with an external-device confinement rule
-  (`confineExternalRange`/`confineExternalAllow`) closing the blanket
+  (`confineExternalRanges`/`confineExternalAllow`) closing the blanket
   forward-accept hole a routing peer otherwise leaves open. Distinct from
   `nixnet.netbird` (above): that module is about REACHING a specific peer
   through the failover engine; this one is about THIS host's own overlay
   membership. A host commonly runs both.
+
+  Its packet-path rules live in an nftables table this module **owns**
+  (`inet nixnet-overlay`), applied by its own unit — not in
+  `networking.firewall.extraCommands`. That matters for more than tidiness:
+  `extraCommands` is honoured by the iptables backend alone, so on an
+  nftables-backed firewall it is an eval error and on a host with
+  `networking.firewall.enable = false` it is discarded **with no error at
+  all**. A deny rule that can silently not exist is not a deny rule. Because
+  nftables lets several tables hook the same point and runs them all, this
+  table coexists with the nixpkgs firewall (either backend), a third-party
+  nftables ruleset, and NetBird's own tables, without any of them knowing it
+  is there. `nixnet.overlay.ruleset` is the rendered text, read-only, so you
+  can `nix eval` exactly what a host will load before it loads it.
+
+  Confinement is per address family and `confineExternalRanges` is a list:
+  a confined v4 source range cannot match v6 packets, so confining an
+  advertised v6 prefix takes its own v6 entry. Declaring one without the
+  other is an assertion error rather than a quietly unreachable rule — and
+  IPv6 forwarding is only enabled when a v6 prefix is actually advertised,
+  since turning on a forwarding plane this module writes no rules for is
+  worse than leaving it off.
 - **`nixnet.meshGateway`** (`modules/mesh-gateway.nix`) — one process
   holding N self-hosted-NetBird identities (an embed client per configured
   peer), L4-forwarding each to a real backend. Gives a service (or a
@@ -395,7 +416,7 @@ peer's list.
 - `advertiseRoutes` (default `[ ]`) — LAN CIDRs this peer routes into the
   overlay; non-empty turns on kernel forwarding + source-NAT for the
   reverse direction.
-- `confineExternalRange`/`confineExternalAllow` (default `null`/`[ ]`) —
+- `confineExternalRanges`/`confineExternalAllow` (default `[ ]`/`[ ]`) —
   restrict an untrusted overlay band to only the LAN hosts it's allowed to
   reach, everything else dropped.
 - `overlayInterface` (default `"wt0"`, upstream's default tunnel

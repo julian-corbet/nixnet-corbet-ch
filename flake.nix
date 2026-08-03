@@ -82,6 +82,7 @@
           nixpkgs = nixpkgs.outPath;
           nixnetModule = ./modules/core.nix;
           meshGatewayModule = ./modules/mesh-gateway.nix;
+          overlayModule = ./modules/overlay.nix;
         });
 
       formatter = forAllSystems (system: (pkgsFor system).nixpkgs-fmt);

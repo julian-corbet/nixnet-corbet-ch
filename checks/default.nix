@@ -16,7 +16,7 @@
 # published real winners into /etc/hosts successfully. See the fix
 # commit for that reproduction.
 
-{ pkgs, nixpkgs, nixnetModule, meshGatewayModule }:
+{ pkgs, nixpkgs, nixnetModule, meshGatewayModule, overlayModule }:
 
 let
   lib = pkgs.lib;
@@ -196,6 +196,135 @@ let
       "wants: ${builtins.toJSON (mgGateway.wants or null)}")
   ];
 
+  # ---------------------------------------------------------------------
+  # overlay: the confinement must not be silently droppable.
+  #
+  # These rules used to ride on networking.firewall.extraCommands, which the
+  # iptables backend alone honours -- so on a host with the nixpkgs firewall
+  # disabled (what every nftables-native firewall requires) a DENY rule
+  # vanished with no error at all. The checks below pin the properties that
+  # make that impossible now: an owned table, rendered per address family,
+  # and no dependence on the firewall module's escape hatch.
+  # ---------------------------------------------------------------------
+  overlayCfg = evalModules [
+    overlayModule
+    {
+      nixnet.overlay = {
+        enable = true;
+        managementUrl = "https://mesh.example.com";
+        hostname = "router";
+        setupKeyFile = "/run/secrets/nixnet-overlay-key";
+        overlayInterface = "wt0";
+        # Dual-stack on purpose: a v4-only fixture cannot catch a v6 rule
+        # landing in a chain no v6 packet can reach, which is the exact
+        # mistake the per-family split exists to prevent.
+        advertiseRoutes = [ "192.0.2.0/24" "2001:db8:42::/64" ];
+        confineExternalRanges = [ "198.51.100.192/26" "2001:db8:ff::/64" ];
+        confineExternalAllow = [ "192.0.2.6" "2001:db8:42::6" ];
+      };
+    }
+  ];
+
+  overlayRules = overlayCfg.nixnet.overlay.ruleset;
+
+  # Comment lines are stripped before the source-text checks below. The
+  # module's own header explains at length WHY it no longer uses
+  # extraCommands, and a naive grep over the raw file would trip on that
+  # explanation permanently -- turning a real regression guard into a check
+  # that can only be satisfied by deleting the documentation.
+  overlayCode = lib.concatStringsSep "\n"
+    (lib.filter (l: builtins.match "[[:space:]]*#.*" l == null)
+      (lib.splitString "\n" (builtins.readFile ../modules/overlay.nix)));
+
+  overlayResults = [
+    # THE regression. If either of these strings ever comes back, a deny rule
+    # is once again one `networking.firewall.enable = false` away from
+    # silently not existing.
+    (check "overlay/no-firewall-extraCommands"
+      (!(lib.hasInfix "networking.firewall.extraCommands" overlayCode))
+      "modules/overlay.nix references networking.firewall.extraCommands again")
+
+    (check "overlay/no-firewall-extraStopCommands"
+      (!(lib.hasInfix "networking.firewall.extraStopCommands" overlayCode))
+      "modules/overlay.nix references networking.firewall.extraStopCommands again")
+
+    (check "overlay/owns-its-own-table"
+      (lib.hasInfix "table inet nixnet-overlay {" overlayRules)
+      "rendered ruleset:\n${overlayRules}")
+
+    # Family separation, both directions. A v4 source range must jump to the
+    # v4 chain and a v6 source range to the v6 chain -- crossing them yields
+    # rules that read as coverage but can never match a packet.
+    (check "overlay/v4-source-jumps-to-v4-chain"
+      (lib.hasInfix "ip saddr 198.51.100.192/26 jump ext-confine-v4" overlayRules)
+      "rendered ruleset:\n${overlayRules}")
+
+    (check "overlay/v6-source-jumps-to-v6-chain"
+      (lib.hasInfix "ip6 saddr 2001:db8:ff::/64 jump ext-confine-v6" overlayRules)
+      "rendered ruleset:\n${overlayRules}")
+
+    (check "overlay/v6-route-dropped-in-the-v6-chain-only"
+      (let
+        v6ChainBody = lib.last (lib.splitString "chain ext-confine-v6 {" overlayRules);
+        v4ChainBody = lib.head (lib.splitString "chain ext-confine-v6 {" overlayRules);
+      in
+      lib.hasInfix "ip6 daddr 2001:db8:42::/64 drop" v6ChainBody
+      && !(lib.hasInfix "ip6 daddr" v4ChainBody))
+      "rendered ruleset:\n${overlayRules}")
+
+    # The confinement has to run ahead of any filter-priority chain, or
+    # NetBird's own dynamic accept could be evaluated first.
+    (check "overlay/confinement-hooks-prerouting-at-raw-priority"
+      (lib.hasInfix "type filter hook prerouting priority raw;" overlayRules)
+      "rendered ruleset:\n${overlayRules}")
+
+    # Masquerade is v4-only by design: NATing an advertised v6 prefix would
+    # destroy the end-to-end addressing that is the reason to advertise it.
+    (check "overlay/masquerades-v4-only"
+      (lib.hasInfix "ip saddr 192.0.2.0/24 oifname \"wt0\" masquerade" overlayRules
+        && !(lib.hasInfix "ip6 saddr 2001:db8:42::/64 oifname \"wt0\" masquerade" overlayRules))
+      "rendered ruleset:\n${overlayRules}")
+
+    # v6 forwarding must not be enabled unless a v6 prefix is actually
+    # advertised -- turning on a forwarding plane this module writes no rules
+    # for is strictly worse than leaving it off.
+    (check "overlay/v6-forwarding-follows-a-v6-route"
+      ((overlayCfg.boot.kernel.sysctl."net.ipv6.conf.all.forwarding" or null) == 1)
+      "sysctl: ${builtins.toJSON overlayCfg.boot.kernel.sysctl}")
+
+    (check "overlay/unit-survives-a-firewall-restart"
+      (lib.elem "firewall.service"
+        (overlayCfg.systemd.services.nixnet-overlay-firewall.partOf or [ ]))
+      "partOf: ${builtins.toJSON (overlayCfg.systemd.services.nixnet-overlay-firewall.partOf or null)}")
+  ];
+
+  # A second evaluation proving the v6 forwarding sysctl is NOT set when only
+  # v4 is advertised. Without this, the check above would pass just as happily
+  # against a module that turned v6 forwarding on unconditionally.
+  overlayV4OnlyCfg = evalModules [
+    overlayModule
+    {
+      nixnet.overlay = {
+        enable = true;
+        managementUrl = "https://mesh.example.com";
+        hostname = "router";
+        setupKeyFile = "/run/secrets/nixnet-overlay-key";
+        advertiseRoutes = [ "192.0.2.0/24" ];
+        confineExternalRanges = [ "198.51.100.192/26" ];
+      };
+    }
+  ];
+
+  overlayV4OnlyResults = [
+    (check "overlay/v4-only-does-not-enable-v6-forwarding"
+      (!(overlayV4OnlyCfg.boot.kernel.sysctl ? "net.ipv6.conf.all.forwarding"))
+      "sysctl: ${builtins.toJSON overlayV4OnlyCfg.boot.kernel.sysctl}")
+
+    (check "overlay/v4-only-renders-no-v6-chain"
+      (!(lib.hasInfix "ext-confine-v6" overlayV4OnlyCfg.nixnet.overlay.ruleset))
+      "rendered ruleset:\n${overlayV4OnlyCfg.nixnet.overlay.ruleset}")
+  ];
+
   # Source-text checks for the two assertions, rather than reading the
   # evaluated `config.assertions` list: that list is the FULL system's,
   # every module's, not just nixnet's -- forcing every entry's `.message`
@@ -229,7 +358,7 @@ let
       "did not find the surviving assertion's text in modules/core.nix")
   ];
 
-  allResults = results ++ meshGatewayResults ++ sourceResults;
+  allResults = results ++ meshGatewayResults ++ overlayResults ++ overlayV4OnlyResults ++ sourceResults;
 
   failed = builtins.filter (r: !r.ok) allResults;
 

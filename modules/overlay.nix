@@ -20,6 +20,131 @@
 
 let
   cfg = config.nixnet.overlay;
+
+  # An address family is decided per-entry rather than per-option, so one
+  # `advertiseRoutes` list can carry both families and each rule lands in the
+  # right half of a single `inet` table.
+  isV6 = s: lib.hasInfix ":" s;
+  v4Routes = lib.filter (c: !isV6 c) cfg.advertiseRoutes;
+  v6Routes = lib.filter isV6 cfg.advertiseRoutes;
+
+  # `confineExternalAllow` takes bare host addresses; nft wants a prefix
+  # length on a set-free comparison to be unambiguous, and a bare address
+  # compares fine, so pass it through untouched and only pick the matcher.
+  daddr = a: if isV6 a then "ip6 daddr ${a}" else "ip daddr ${a}";
+  saddr = a: if isV6 a then "ip6 saddr ${a}" else "ip saddr ${a}";
+
+  tableName = "nixnet-overlay";
+
+  indent = n: lib.concatMapStringsSep "\n" (l: "    ${l}") n;
+
+  # Confinement is built PER ADDRESS FAMILY, and that is not cosmetic: a
+  # confined v4 source range can only ever match v4 packets, so putting a v6
+  # destination drop in the chain it jumps to yields a rule nothing can
+  # reach. Mixing them reads like v6 is covered while leaving it wide open.
+  # Each family gets its own chain holding only its own allowances and
+  # drops, and each confined range jumps to the chain of its own family.
+  confinedRanges = cfg.confineExternalRanges;
+  confinedV4 = lib.filter (r: !isV6 r) confinedRanges;
+  confinedV6 = lib.filter isV6 confinedRanges;
+
+  confineChain = fam: allowed: routes: ''
+  chain ext-confine-${fam} {
+${indent (map (h: "${daddr h} return") allowed ++ map (c: "${daddr c} drop") routes)}
+  }
+'';
+
+  v4Confine = lib.optionalString (confinedV4 != [ ])
+    (confineChain "v4" (lib.filter (a: !isV6 a) cfg.confineExternalAllow) v4Routes);
+  v6Confine = lib.optionalString (confinedV6 != [ ])
+    (confineChain "v6" (lib.filter isV6 cfg.confineExternalAllow) v6Routes);
+
+  confineJumps =
+    map (r: "iifname \"${cfg.overlayInterface}\" ${saddr r} jump ext-confine-v4") confinedV4
+    ++ map (r: "iifname \"${cfg.overlayInterface}\" ${saddr r} jump ext-confine-v6") confinedV6;
+
+  confineRules = lib.optionalString (confinedRanges != [ ]) ''
+${v4Confine}${v6Confine}
+  chain prerouting {
+    type filter hook prerouting priority raw; policy accept;
+${indent confineJumps}
+  }
+'';
+
+  # IPv4 only, deliberately. Masquerading IPv6 would break the end-to-end
+  # addressing that is the entire reason to advertise a v6 prefix at all --
+  # a v6 LAN reachable from the overlay wants its real source address, not
+  # this peer's. If a v6 route is advertised it is confined by the same
+  # table above and simply not source-NATed.
+  snatRules = lib.optionalString (v4Routes != [ ]) ''
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+${indent (map (c: "ip saddr ${c} oifname \"${cfg.overlayInterface}\" masquerade") v4Routes)}
+  }
+'';
+
+  ruleset = ''
+table inet ${tableName} {
+${confineRules}${snatRules}}
+'';
+
+  # The atomic replace idiom: declare the table (a no-op when it already
+  # exists), delete it, then define it for real -- all inside ONE `nft -f`
+  # transaction, so the ruleset is never observably half-applied and no
+  # chain can outlive a rename. That last property is why this module no
+  # longer needs teardown commands that mirror the setup commands by name:
+  # the previous generation's chains are destroyed wholesale, whatever they
+  # were called. Name-coupled teardown is what leaked an orphan chain the
+  # last time one of these was renamed.
+  applyScript = pkgs.writeShellApplication {
+    name = "nixnet-overlay-firewall-apply";
+    runtimeInputs = [ pkgs.nftables pkgs.iptables ];
+    text = ''
+      nft -f - <<'NFT_EOF'
+      table inet ${tableName} {}
+      delete table inet ${tableName}
+      ${ruleset}
+      NFT_EOF
+
+      # One-time migration cleanup. Before this module owned its own table,
+      # the confinement was an iptables chain installed through
+      # networking.firewall.extraCommands. A host switching to this version
+      # still has that chain and its jump sitting in raw PREROUTING, where
+      # nothing declarative will ever remove them again -- extraStopCommands
+      # only ran for the generation that declared them. Idempotent, and a
+      # no-op on any host that never ran the older version.
+      # The jump is deleted by rewriting whatever `-S` reports rather than by
+      # reconstructing the rule from current config: the chain was installed
+      # by an EARLIER generation, whose source range is not necessarily the
+      # one configured now (and, after the option became a list, is not even
+      # expressible as one value). Matching on the target name is what makes
+      # this work regardless of what the old rule looked like -- and is
+      # exactly the property whose absence let a renamed chain leak in the
+      # first place.
+      if command -v iptables >/dev/null 2>&1; then
+        iptables -t raw -S PREROUTING 2>/dev/null \
+          | grep -- '-j NIXNET-EXT-CONFINE' \
+          | sed 's/^-A /-D /' \
+          | while read -r rule; do
+              # shellcheck disable=SC2086 # the rule is a pre-split argv line
+              iptables -t raw $rule 2>/dev/null || true
+            done
+        iptables -t raw -F NIXNET-EXT-CONFINE 2>/dev/null || true
+        iptables -t raw -X NIXNET-EXT-CONFINE 2>/dev/null || true
+      fi
+    '';
+  };
+
+  teardownScript = pkgs.writeShellApplication {
+    name = "nixnet-overlay-firewall-teardown";
+    runtimeInputs = [ pkgs.nftables ];
+    text = ''
+      nft -f - <<'NFT_EOF'
+      table inet ${tableName} {}
+      delete table inet ${tableName}
+      NFT_EOF
+    '';
+  };
 in
 {
   options.nixnet.overlay = {
@@ -59,20 +184,27 @@ in
       '';
     };
 
-    confineExternalRange = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "198.51.100.0/28"; # TEST-NET-2 placeholder overlay CIDR
+    confineExternalRanges = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "198.51.100.0/28" ]; # TEST-NET-2 placeholder overlay CIDR
       description = ''
-        Overlay CIDR of UNTRUSTED external devices (a least-trust group).
-        On the routing peer, traffic from these source IPs to the LAN is
+        Overlay CIDRs of UNTRUSTED external devices (a least-trust group).
+        On the routing peer, traffic from these source ranges to the LAN is
         DROPPED except the hosts in `confineExternalAllow`. Closes the
-        blanket `-i <overlay-if> -j ACCEPT` forward hole a routing peer
-        otherwise leaves: route DISTRIBUTION only constrains an honest
-        client — a compromised guest can add its own route to the LAN CIDR
-        and reach the whole LAN otherwise. The rule sits in the raw
-        PREROUTING chain, which runs before FORWARD in either iptables
-        layer, so it can't be reordered under NetBird's own dynamic rules.
+        blanket accept-from-overlay forward hole a routing peer otherwise
+        leaves: route DISTRIBUTION only constrains an honest client — a
+        compromised guest can add its own route to the LAN CIDR and reach
+        the whole LAN otherwise. The rules hook `prerouting` at `raw`
+        priority in this module's own `inet` table, so they run ahead of any
+        filter-priority chain and cannot be reordered under NetBird's own
+        dynamic rules.
+
+        A LIST, and per address family, because a confined v4 source range
+        can only match v4 packets: confining an advertised v6 prefix takes
+        its own v6 entry here. Listing only a v4 range while advertising a
+        v6 prefix leaves that prefix reachable, so it is an assertion error
+        rather than a silent hole.
       '';
     };
 
@@ -83,6 +215,20 @@ in
       description = "LAN hosts the confined external range MAY still reach. Everything else on the LAN is dropped for that range.";
     };
 
+    ruleset = lib.mkOption {
+      type = lib.types.lines;
+      readOnly = true;
+      description = ''
+        The exact nftables text this module will load, rendered from the
+        options above. Read-only: set the options, not this.
+
+        Exposed because a rule you cannot read before it is applied is a rule
+        you are trusting blind — `nix eval` this on any host to see precisely
+        what its overlay confinement and source-NAT amount to, without
+        needing an `nft` binary on the box or a switch to have happened.
+      '';
+    };
+
     overlayInterface = lib.mkOption {
       type = lib.types.str;
       default = "wt0";
@@ -90,13 +236,115 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkMerge [
+    # Rendered unconditionally, OUTSIDE the enable gate, so a consumer can
+    # inspect what enabling this would apply before committing to it.
+    { nixnet.overlay.ruleset = ruleset; }
+
+    (lib.mkIf cfg.enable {
     services.netbird.enable = true;
 
-    # A routing peer must forward between the overlay interface and the LAN bridge.
-    boot.kernel.sysctl = lib.mkIf (cfg.advertiseRoutes != [ ]) {
-      "net.ipv4.ip_forward" = lib.mkDefault 1;
-      "net.ipv6.conf.all.forwarding" = lib.mkDefault 1;
+    assertions = [
+      # Both of these used to be silent no-ops: every firewall rule this
+      # module writes is gated on advertiseRoutes, so a confinement declared
+      # without one was simply never installed -- the most dangerous possible
+      # failure for a rule whose entire job is to deny traffic.
+      {
+        assertion = cfg.confineExternalRanges == [ ] || cfg.advertiseRoutes != [ ];
+        message = ''
+          nixnet.overlay.confineExternalRanges is set but advertiseRoutes is empty.
+          The confinement only has meaning on a routing peer -- with no advertised
+          CIDR there is no LAN traffic to confine, and nothing would be installed.
+          Either advertise the LAN this peer routes, or drop the confinement.
+        '';
+      }
+      {
+        assertion = cfg.confineExternalAllow == [ ] || cfg.confineExternalRanges != [ ];
+        message = ''
+          nixnet.overlay.confineExternalAllow lists hosts but confineExternalRanges
+          is empty, so there is no confined range for them to be exceptions to.
+          These allowances would have no effect.
+        '';
+      }
+      # The half-configured case, and the reason this is an error rather than
+      # a warning: a v4-only confinement alongside an advertised v6 prefix
+      # reads as "the overlay is confined" while leaving the whole v6 LAN
+      # reachable by every external device.
+      {
+        assertion = cfg.confineExternalRanges == [ ] || v6Routes == [ ] || confinedV6 != [ ];
+        message = ''
+          nixnet.overlay advertises the IPv6 prefix(es) ${lib.concatStringsSep ", " v6Routes}
+          and declares a confinement, but confineExternalRanges contains no IPv6
+          range. A v4 source range cannot match v6 packets, so those prefixes would
+          be reachable by every external device the confinement is meant to fence
+          off. Add the external band's IPv6 range, or stop advertising IPv6 here.
+        '';
+      }
+      {
+        assertion = cfg.confineExternalRanges == [ ] || v4Routes == [ ] || confinedV4 != [ ];
+        message = ''
+          nixnet.overlay advertises the IPv4 CIDR(s) ${lib.concatStringsSep ", " v4Routes}
+          and declares a confinement, but confineExternalRanges contains no IPv4
+          range, so nothing confines v4 traffic to them.
+        '';
+      }
+    ];
+
+    # A routing peer must forward between the overlay interface and the LAN.
+    boot.kernel.sysctl = lib.mkMerge [
+      (lib.mkIf (v4Routes != [ ]) { "net.ipv4.ip_forward" = lib.mkDefault 1; })
+      # v6 forwarding is enabled ONLY when a v6 prefix is actually advertised.
+      # It used to be turned on unconditionally alongside v4 while this module
+      # wrote no v6 rules at all, which left a routing peer forwarding IPv6
+      # both unconfined and un-NATed -- an open path around the very
+      # confinement the v4 side was carefully building. Enabling a forwarding
+      # plane you do not filter is strictly worse than not enabling it.
+      (lib.mkIf (v6Routes != [ ]) { "net.ipv6.conf.all.forwarding" = lib.mkDefault 1; })
+    ];
+
+    # ── The overlay's own packet-path rules, in a table this module owns ──
+    #
+    # These are NOT host firewall policy (which ports are open, who may
+    # administer this box) -- they are the routing-peer mechanism's own
+    # requirements: source-NAT so a client-less LAN device can reach out
+    # through this peer, and a confinement so an untrusted overlay band
+    # cannot reach past the hosts it is allowed. They belong to whoever owns
+    # the overlay, which is this module.
+    #
+    # They used to be installed through networking.firewall.extraCommands.
+    # That coupled a mechanism to a policy module AND to one specific
+    # backend: extraCommands is honoured only by the iptables backend, so on
+    # a host whose firewall is nftables-backed it is an eval error, and on a
+    # host with networking.firewall disabled entirely -- the configuration
+    # every nftables-native firewall project requires -- these rules are
+    # discarded with NO ERROR AT ALL. Silently losing a deny rule is the
+    # worst failure mode available, and it was one `mkForce false` away on
+    # any host that adopted such a firewall.
+    #
+    # An owned `inet` table sidesteps all of it. nftables lets several tables
+    # hook the same point and runs them all, so this coexists with the
+    # nixpkgs firewall (either backend), with a third-party nftables
+    # ruleset, and with NetBird's own tables, without any of them needing to
+    # know this exists. One `inet` table also covers v4 and v6 together,
+    # which is what makes confining an advertised v6 prefix possible at all.
+    systemd.services.nixnet-overlay-firewall = lib.mkIf (cfg.advertiseRoutes != [ ]) {
+      description = "nixnet overlay packet-path rules (own nftables table: ${tableName})";
+      after = [ "network-pre.target" "firewall.service" "nftables.service" ];
+      wantedBy = [ "multi-user.target" ];
+      # Anything that rebuilds the host ruleset can flush this table out from
+      # under us -- nixpkgs' own nftables module defaults to `flush ruleset`
+      # on every start, which takes every table on the box, not just its own.
+      # partOf makes their restart restart us, so the rules come back instead
+      # of silently staying gone. Only wired to units this host actually has:
+      # a partOf on an absent unit would be dead weight.
+      partOf = lib.optional config.networking.firewall.enable "firewall.service"
+        ++ lib.optional config.networking.nftables.enable "nftables.service";
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = lib.getExe applyScript;
+        ExecStop = lib.getExe teardownScript;
+      };
     };
 
     # ── LAN → overlay egress SOURCE-NAT ──────────────────────────────────
@@ -108,38 +356,10 @@ in
     # back. FORWARDING itself is already permitted — NetBird, as a routing
     # peer, blanket-accepts inbound-from-overlay in the FORWARD chain — so
     # no explicit forward rule is needed for reachability. That blanket
-    # accept is also why untrusted externals need confineExternalRange
+    # accept is also why untrusted externals need confineExternalRanges
     # above (a source-scoped raw-PREROUTING DROP, layer-agnostic). Gated
     # on advertiseRoutes so only a routing peer carries it; idempotent -C
     # guard.
-    networking.firewall.extraCommands = lib.mkIf (cfg.advertiseRoutes != [ ]) (
-      lib.concatMapStringsSep "\n" (cidr: ''
-        iptables -t nat -C POSTROUTING -s ${cidr} -o ${cfg.overlayInterface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${cidr} -o ${cfg.overlayInterface} -j MASQUERADE
-      '') cfg.advertiseRoutes
-      + lib.optionalString (cfg.confineExternalRange != null) ''
-        # External-device LAN confinement (raw PREROUTING, pre-FORWARD in any layer):
-        # source ${cfg.confineExternalRange} may reach ONLY confineExternalAllow on the
-        # LAN; every other advertised-CIDR destination is DROPPED. Overlay→overlay
-        # traffic falls through (policy layer governs it). Idempotent; cleaned in
-        # stopCommands.
-        iptables -t raw -N NIXNET-EXT-CONFINE 2>/dev/null || true
-        iptables -t raw -F NIXNET-EXT-CONFINE
-        ${lib.concatMapStringsSep "\n        " (h: "iptables -t raw -A NIXNET-EXT-CONFINE -d ${h}/32 -j RETURN") cfg.confineExternalAllow}
-        ${lib.concatMapStringsSep "\n        " (cidr: "iptables -t raw -A NIXNET-EXT-CONFINE -d ${cidr} -j DROP") cfg.advertiseRoutes}
-        iptables -t raw -C PREROUTING -i ${cfg.overlayInterface} -s ${cfg.confineExternalRange} -j NIXNET-EXT-CONFINE 2>/dev/null || iptables -t raw -I PREROUTING -i ${cfg.overlayInterface} -s ${cfg.confineExternalRange} -j NIXNET-EXT-CONFINE
-      ''
-    );
-    networking.firewall.extraStopCommands = lib.mkIf (cfg.advertiseRoutes != [ ]) (
-      lib.concatMapStringsSep "\n" (cidr: ''
-        iptables -t nat -D POSTROUTING -s ${cidr} -o ${cfg.overlayInterface} -j MASQUERADE 2>/dev/null || true
-      '') cfg.advertiseRoutes
-      + lib.optionalString (cfg.confineExternalRange != null) ''
-        iptables -t raw -D PREROUTING -i ${cfg.overlayInterface} -s ${cfg.confineExternalRange} -j NIXNET-EXT-CONFINE 2>/dev/null || true
-        iptables -t raw -F NIXNET-EXT-CONFINE 2>/dev/null || true
-        iptables -t raw -X NIXNET-EXT-CONFINE 2>/dev/null || true
-      ''
-    );
-
     # ── Headless enrollment ──────────────────────────────────────────────
     # One-shot: bring the client up with the setup key if not already
     # joined. Idempotent — skips when Management is already Connected.
@@ -184,5 +404,6 @@ in
           --hostname "${cfg.hostname}"
       '';
     };
-  };
+    })
+  ];
 }
