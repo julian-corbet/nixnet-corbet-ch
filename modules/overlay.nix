@@ -125,15 +125,29 @@ ${confineRules}${snatRules}}
       # config created and can no longer reach -- see that option's own
       # description for why an abandoned extraCommands chain is unremovable
       # by any later generation.
+      # NOTE the ordering above: the nft table is applied BEFORE any of this
+      # runs, so a failure in the cleanup below can never leave the host
+      # without its confinement. That is deliberate -- the cleanup is
+      # housekeeping for a chain that is already redundant, and must never
+      # be able to take the actual rules down with it.
       if command -v iptables >/dev/null 2>&1; then
         for chain in NIXNET-EXT-CONFINE ${lib.escapeShellArgs cfg.legacyChains}; do
-          iptables -t raw -S PREROUTING 2>/dev/null \
+          # Collected into a variable with `|| true` rather than piped
+          # straight into the loop: this script runs under `set -o pipefail`
+          # (writeShellApplication), and grep exits 1 when a chain has no
+          # jumps left -- which is the NORMAL steady state once a chain has
+          # already been cleaned. Piping directly made the whole script exit
+          # 1 on the second and every subsequent apply, so the unit failed
+          # permanently the moment its own cleanup had succeeded once.
+          jumps=$(iptables -t raw -S PREROUTING 2>/dev/null \
             | grep -- "-j $chain\$" \
-            | sed 's/^-A /-D /' \
-            | while read -r rule; do
-                # shellcheck disable=SC2086 # the rule is a pre-split argv line
-                iptables -t raw $rule 2>/dev/null || true
-              done
+            | sed 's/^-A /-D /' || true)
+          if [ -n "$jumps" ]; then
+            printf '%s\n' "$jumps" | while read -r rule; do
+              # shellcheck disable=SC2086 # the rule is a pre-split argv line
+              iptables -t raw $rule 2>/dev/null || true
+            done
+          fi
           iptables -t raw -F "$chain" 2>/dev/null || true
           iptables -t raw -X "$chain" 2>/dev/null || true
         done
