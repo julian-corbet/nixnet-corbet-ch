@@ -108,11 +108,38 @@ let
     before = [ "nixnet-mesh-gateway.service" ];
     wantedBy = [ "multi-user.target" ];
     path = [ pkgs.sops ];
+    # The age key -- and, whenever it isn't a store path, the sealed
+    # secret -- can sit on a filesystem some OTHER unit mounts: a ZFS
+    # dataset, an NFS export, a LUKS-backed volume. RequiresMountsFor
+    # derives that ordering from the PATHS THEMSELVES, so no consumer ever
+    # has to name a mount unit by hand (a name it would have to spell in
+    # systemd's escaped form, and re-spell whenever the path moved).
+    # systemd resolves each path to its covering mount, pulls it in, and
+    # orders it before this unit.
+    #
+    # Without this, the unseal races the mount -- and a lost race is not
+    # intermittent-and-self-correcting, it is permanent: a Type=oneshot
+    # failure latches, and nothing re-queues the gateway that depended on
+    # it. Observed in production as exactly a 10-second loss (unseal at
+    # T+0, the dataset holding the age key mounted at T+10), which took
+    # every embedded identity off the overlay until a human noticed.
+    unitConfig.RequiresMountsFor = [ (toString cfg.ageKeyFile) (toString secretFile) ];
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
       Environment = "SOPS_AGE_KEY_FILE=${cfg.ageKeyFile}";
+      # Defence in depth behind that ordering: a secret store can be
+      # briefly unreadable for reasons no ordering edge expresses (a
+      # network mount reconnecting, a key being rewritten under us).
+      # Retry, bounded, instead of latching a failed state only a human
+      # can clear. `on-failure` is the one Restart= mode Type=oneshot
+      # accepts -- `always`/`on-success` are rejected for oneshot, which
+      # is correct here anyway: a SUCCESSFUL unseal must stay done.
+      Restart = "on-failure";
+      RestartSec = "5s";
     };
+    startLimitIntervalSec = 300;
+    startLimitBurst = 10;
     script = ''
       set -u
       mkdir -p "$(dirname ${lib.escapeShellArg outFile})"
@@ -207,11 +234,21 @@ in
         "nixnet-mesh-gateway-setupkey-unseal.service"
         "nixnet-mesh-gateway-apitoken-unseal.service"
       ];
-      requires = [
+      # Deliberately `wants`, NOT `requires`, on the two unseals. A hard
+      # requirement makes a single failed unseal cancel this unit's start
+      # job outright -- and nothing ever re-queues it, so the unseal
+      # succeeding later (on its own retry) changes nothing and the
+      # overlay stays down until a human runs systemctl. `wants` keeps
+      # the `after` ordering above (this unit still waits for the unseal
+      # job to settle) while degrading a secret-store hiccup into a
+      # visible crash-loop that converges by itself: the gateway starts,
+      # fails to read the secret, and retries under its own
+      # Restart=always until the unseal's own retry lands.
+      wants = [
+        "network-online.target"
         "nixnet-mesh-gateway-setupkey-unseal.service"
         "nixnet-mesh-gateway-apitoken-unseal.service"
       ];
-      wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         # Runs before EVERY start of THIS unit (crash, a deliberate

@@ -17,7 +17,7 @@
       # The generic engine. `nixosModules.default = nixosModules.core` so
       # a bare `imports = [ inputs.nixnet.nixosModules.default ]` gets
       # the peer+uplink engine with zero providers — providers are opt-in
-      # additional imports (design.md §11/§12).
+      # additional imports.
       # ---------------------------------------------------------------
       nixosModules.core = ./modules/core.nix;
       nixosModules.default = self.nixosModules.core;
@@ -48,7 +48,8 @@
 
       # ---------------------------------------------------------------
       # Same files, rendered onto system-manager's smaller option surface
-      # instead of a real NixOS rebuild (design.md §9). nixnet only ever
+      # instead of a real NixOS rebuild (see the README's "Non-NixOS hosts
+      # (via `system-manager`)" section). nixnet only ever
       # touches environment.etc, systemd.services/timers/paths, and a
       # rendered JSON config — none of the primitives system-manager
       # categorically can't reach (no boot.kernel.sysctl, no kernel
@@ -71,14 +72,16 @@
       lib.svcProxyConfig = import ./lib/svc-proxy-config.nix;
 
       # The eval-time regression net in ./checks (a real, if minimal, NixOS
-      # evaluation of modules/core.nix -- see that file's own header for
-      # why not a bare evalModules stub, and for what's deliberately
-      # out of scope: runtime facts, verified live instead).
+      # evaluation of modules/core.nix and modules/mesh-gateway.nix -- see
+      # that file's own header for why not a bare evalModules stub, and
+      # for what's deliberately out of scope: runtime facts, verified live
+      # instead).
       checks = forAllSystems (system:
         import ./checks {
           pkgs = pkgsFor system;
           nixpkgs = nixpkgs.outPath;
           nixnetModule = ./modules/core.nix;
+          meshGatewayModule = ./modules/mesh-gateway.nix;
         });
 
       formatter = forAllSystems (system: (pkgsFor system).nixpkgs-fmt);

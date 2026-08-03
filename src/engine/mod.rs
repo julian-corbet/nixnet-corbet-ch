@@ -255,6 +255,19 @@ impl Engine {
         // completes.
         self.write_status();
 
+        // ...and re-assert the hosts block from the winners restored out
+        // of state.json, for the same reason: until this call existed,
+        // NOTHING was published until some group's winner actually
+        // CHANGED. A restart on a settled fleet changes no winner, so the
+        // activation script's boot seed -- which keys each entry by the
+        // peer's Nix ATTRIBUTE NAME, not its configured `hostnames` list
+        // -- stayed in /etc/hosts indefinitely, and every alias a peer
+        // declared beyond its attribute name was simply absent. Observed
+        // in production: `getent hosts <alias>` returned NXDOMAIN on a
+        // host whose nixnetd had been up, healthy, and reporting correct
+        // winners for hours.
+        self.publish_restored_peers();
+
         // A host with zero peer groups and zero uplink groups configured
         // (nixnet enabled ahead of any real config -- a legitimate,
         // expected state per this daemon's own "resident, ready for
@@ -558,6 +571,29 @@ impl Engine {
         }
     }
 
+    /// Publishes the peer block once at startup, from the winners
+    /// `state.json` restored, so a restart re-asserts what this daemon
+    /// had already selected instead of leaving the activation script's
+    /// boot seed in place until the next winner change.
+    ///
+    /// Deliberately a no-op when nothing was restored (a first-ever
+    /// start, or a wiped stateDir): every group's `last_published_addr`
+    /// is empty then, so publishing would render an EMPTY managed block
+    /// -- actively worse than the seed it would overwrite, since the seed
+    /// is the only last-known-good content that exists at that point. The
+    /// first real probe tick publishes as it always did.
+    fn publish_restored_peers(&self) {
+        let state = self.state.lock().unwrap();
+        if state
+            .peers
+            .values()
+            .all(|g| g.last_published_addr.is_empty())
+        {
+            return;
+        }
+        self.publish_peers_locked(&state);
+    }
+
     /// Rewrites the whole managed hosts block from every peer group's
     /// current `last_published_addr` (not just the group that just
     /// changed) -- the publish backend is a single shared file, so any
@@ -766,6 +802,100 @@ mod tests {
 
         shutdown.trigger();
         handle.join().expect("run() thread panicked");
+    }
+
+    /// Regression test for the 2026-08-03 production incident: `run()`
+    /// published nothing at startup, so a restart on a settled fleet --
+    /// where by definition no winner CHANGES -- left the activation
+    /// script's boot seed sitting in `/etc/hosts` indefinitely. That seed
+    /// keys each entry by the peer's Nix ATTRIBUTE NAME, so every further
+    /// name in its `hostnames` list was simply absent, and
+    /// `getent hosts <alias>` returned NXDOMAIN against a daemon that was
+    /// up, healthy, and reporting the correct winner the whole time.
+    ///
+    /// Uses a group with zero transports deliberately: that spawns no
+    /// probe threads (so `run()` blocks on shutdown instead of doing real
+    /// network I/O) while still exercising the real `run()` path, which
+    /// is where the bug was -- never in `publish_peers_locked`, which
+    /// always worked whenever something actually called it.
+    #[test]
+    fn startup_publishes_restored_winners_without_a_winner_change() {
+        let (eng, dir) = new_test_engine();
+        let hosts_path = dir.path().join("hosts");
+
+        // Exactly what state.json's restore() reinstates on a restart:
+        // the winner this daemon had already selected, plus every
+        // hostname its config declares for that peer.
+        let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        g.hostnames = vec!["host-b".to_string(), "host-b.alias".to_string()];
+        g.last_published_addr = "192.0.2.10".to_string();
+        {
+            let mut state = eng.state.lock().unwrap();
+            state.peers.insert("host-b".to_string(), g);
+        }
+
+        let eng = Arc::new(eng);
+        let shutdown = Shutdown::new();
+        let eng2 = Arc::clone(&eng);
+        let sd2 = shutdown.clone();
+        let handle = std::thread::spawn(move || eng2.run(sd2));
+
+        std::thread::sleep(Duration::from_millis(200));
+        let published = std::fs::read_to_string(&hosts_path).unwrap_or_default();
+
+        shutdown.trigger();
+        handle.join().expect("run() thread panicked");
+
+        assert!(
+            published.contains("192.0.2.10\thost-b host-b.alias"),
+            "startup did not re-assert the restored winner with its full \
+             hostnames list -- published block was:\n{published}"
+        );
+    }
+
+    /// The other direction, and the reason the startup publish is
+    /// conditional rather than unconditional: a first-ever start (nothing
+    /// to restore) must NOT publish, because rendering an empty managed
+    /// block would overwrite the activation script's seed -- the only
+    /// last-known-good content in the file before the first probe tick
+    /// completes. Publishing nothing is strictly better than publishing
+    /// emptiness.
+    #[test]
+    fn startup_publish_skipped_when_nothing_was_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        let seed = "# BEGIN nixnet\n192.0.2.10\thost-b\n# END nixnet\n";
+        std::fs::write(&hosts_path, seed).unwrap();
+
+        let eng = Engine {
+            hosts: HostsPublisher::new(&hosts_path).unwrap(),
+            routes: RoutePublisher {
+                ip_path: "/bin/true".to_string(),
+            },
+            status_path: dir.path().join("status.json"),
+            state_path: dir.path().join("state.json"),
+            state: Mutex::new(EngineState {
+                peers: HashMap::new(),
+                uplinks: HashMap::new(),
+            }),
+        };
+        // A configured peer whose winner was never established, i.e. no
+        // state.json existed to restore a `last_published_addr` from.
+        let g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        eng.state
+            .lock()
+            .unwrap()
+            .peers
+            .insert("host-b".to_string(), g);
+
+        eng.publish_restored_peers();
+
+        assert_eq!(
+            std::fs::read_to_string(&hosts_path).unwrap(),
+            seed,
+            "a start with nothing restored overwrote the activation seed \
+             with an empty managed block"
+        );
     }
 
     /// Exercises the core winner-selection rule: among currently-healthy

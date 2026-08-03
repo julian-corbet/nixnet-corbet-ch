@@ -21,10 +21,19 @@ jobs:
       - name: cargo test
         run: cargo test --all-targets
 
-  nix-build:
+  nix:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
+      # Both commands are here on purpose -- neither subsumes the other.
+      # `nix flake check` builds the `checks` output (checks/default.nix's
+      # eval-time module assertions) but only *evaluates* `packages`, so it
+      # never compiles the Rust crate. `nix build .#nixnet` builds the
+      # derivation and therefore runs the Rust test suite in its checkPhase,
+      # but never touches the `checks` output. Drop either one and a whole
+      # half of the repo silently stops being tested.
       - name: nix flake check
+        run: nix flake check --print-build-logs
+      - name: nix build .#nixnet
         run: nix build .#nixnet --print-build-logs

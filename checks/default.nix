@@ -16,38 +16,43 @@
 # published real winners into /etc/hosts successfully. See the fix
 # commit for that reproduction.
 
-{ pkgs, nixpkgs, nixnetModule }:
+{ pkgs, nixpkgs, nixnetModule, meshGatewayModule }:
 
 let
   lib = pkgs.lib;
+
+  # The minimal-but-complete NixOS baseline every evaluation below needs.
+  baseline = {
+    boot.loader.grub.enable = false;
+    fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+    system.stateVersion = "25.05";
+  };
+
+  evalModules = mods:
+    (import (nixpkgs + "/nixos/lib/eval-config.nix") {
+      system = "x86_64-linux";
+      modules = mods ++ [ baseline ];
+    }).config;
 
   # Evaluate nixnet (always enabled, one minimal peer so
   # systemd.services.nixnetd actually renders) plus whatever `extraConfig`
   # a test needs, against a minimal-but-complete NixOS configuration.
   evalFor = extraConfig:
-    (import (nixpkgs + "/nixos/lib/eval-config.nix") {
-      system = "x86_64-linux";
-      modules = [
-        nixnetModule
-        {
-          nixnet.enable = true;
-          nixnet.peers.example = {
-            hostnames = [ "example" ];
-            transports = [{
-              address = "192.0.2.10";
-              priority = 10;
-              probe = { method = "tcp"; port = 22; };
-            }];
-          };
-        }
-        extraConfig
-        {
-          boot.loader.grub.enable = false;
-          fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
-          system.stateVersion = "25.05";
-        }
-      ];
-    }).config;
+    evalModules [
+      nixnetModule
+      {
+        nixnet.enable = true;
+        nixnet.peers.example = {
+          hostnames = [ "example" ];
+          transports = [{
+            address = "192.0.2.10";
+            priority = 10;
+            probe = { method = "tcp"; port = 22; };
+          }];
+        };
+      }
+      extraConfig
+    ];
 
   # One test result. `detail` is only read when `ok == false` (in the
   # failure report below), but it's always a plain string here so
@@ -90,6 +95,85 @@ let
 
   ];
 
+  # ---------------------------------------------------------------------
+  # mesh-gateway: the 2026-08-03 overlay outage.
+  #
+  # A separate evaluation, because mesh-gateway is a standalone module
+  # with its own required options and none of core.nix's fixture above
+  # applies to it. Every value here is a placeholder -- these checks read
+  # rendered unit WIRING (ordering edges, dependency strength, restart
+  # policy), never anything that would need a real key, a real API, or a
+  # real binary. `ageKeyFile`/`*Secret` are deliberately absolute string
+  # paths rather than `./fixture` files: `types.path` accepts them
+  # unchanged, so the rendered RequiresMountsFor= is a stable, assertable
+  # literal instead of a store hash that changes on every edit.
+  # ---------------------------------------------------------------------
+  mgAgeKey = "/var/lib/example/age.key";
+  mgSetupKey = "/var/lib/example/setupkey.enc";
+
+  mgCfg = evalModules [
+    meshGatewayModule
+    {
+      nixnet.meshGateway = {
+        enable = true;
+        package = pkgs.coreutils; # never executed at eval time
+        managementUrl = "https://mesh.example.com";
+        apiUrl = "https://mesh.example.com/api";
+        ageKeyFile = mgAgeKey;
+        setupKeySecret = mgSetupKey;
+        apiTokenSecret = "/var/lib/example/apitoken.enc";
+      };
+    }
+  ];
+
+  mgUnseal = mgCfg.systemd.services.nixnet-mesh-gateway-setupkey-unseal;
+  mgGateway = mgCfg.systemd.services.nixnet-mesh-gateway;
+  mgUnsealUnits = [
+    "nixnet-mesh-gateway-setupkey-unseal.service"
+    "nixnet-mesh-gateway-apitoken-unseal.service"
+  ];
+
+  meshGatewayResults = [
+    # THE regression this block exists for. The unseal ran before the
+    # filesystem holding its age key was mounted -- a 10-second loss --
+    # and because a Type=oneshot failure latches, the overlay stayed down
+    # until a human intervened. RequiresMountsFor= makes systemd derive
+    # that ordering from the path itself, so no consumer has to name a
+    # mount unit.
+    (check "mesh-gateway/unseal-orders-after-age-key-mount"
+      (lib.elem mgAgeKey (lib.toList (mgUnseal.unitConfig.RequiresMountsFor or [ ])))
+      "unitConfig.RequiresMountsFor: ${builtins.toJSON (mgUnseal.unitConfig.RequiresMountsFor or null)}")
+
+    (check "mesh-gateway/unseal-orders-after-secret-mount"
+      (lib.elem mgSetupKey (lib.toList (mgUnseal.unitConfig.RequiresMountsFor or [ ])))
+      "unitConfig.RequiresMountsFor: ${builtins.toJSON (mgUnseal.unitConfig.RequiresMountsFor or null)}")
+
+    # Defence in depth: a transient unreadable secret must retry, not
+    # latch. Type=oneshot rejects Restart=always/on-success, so on-failure
+    # is both the correct and the only usable mode here.
+    (check "mesh-gateway/unseal-retries-on-failure"
+      ((mgUnseal.serviceConfig.Restart or null) == "on-failure")
+      "serviceConfig.Restart: ${builtins.toJSON (mgUnseal.serviceConfig.Restart or null)}")
+
+    # The dependency-strength half of the same incident: with `requires`,
+    # a failed unseal CANCELS the gateway's start job and nothing ever
+    # re-queues it, so the unseal succeeding later fixes nothing. These
+    # two checks are a matched pair -- the ordering edge must SURVIVE
+    # while the hard requirement must be GONE. Dropping both would
+    # "pass" the second check while silently making startup racy.
+    (check "mesh-gateway/does-not-hard-require-unseals"
+      (!(lib.any (u: lib.elem u (mgGateway.requires or [ ])) mgUnsealUnits))
+      "requires: ${builtins.toJSON (mgGateway.requires or null)}")
+
+    (check "mesh-gateway/still-orders-after-unseals"
+      (lib.all (u: lib.elem u (mgGateway.after or [ ])) mgUnsealUnits)
+      "after: ${builtins.toJSON (mgGateway.after or null)}")
+
+    (check "mesh-gateway/still-wants-unseals"
+      (lib.all (u: lib.elem u (mgGateway.wants or [ ])) mgUnsealUnits)
+      "wants: ${builtins.toJSON (mgGateway.wants or null)}")
+  ];
+
   # Source-text checks for the two assertions, rather than reading the
   # evaluated `config.assertions` list: that list is the FULL system's,
   # every module's, not just nixnet's -- forcing every entry's `.message`
@@ -123,7 +207,7 @@ let
       "did not find the surviving assertion's text in modules/core.nix")
   ];
 
-  allResults = results ++ sourceResults;
+  allResults = results ++ meshGatewayResults ++ sourceResults;
 
   failed = builtins.filter (r: !r.ok) allResults;
 
