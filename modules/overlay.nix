@@ -15,7 +15,7 @@
 #
 # Wraps upstream `services.netbird` — never reimplements NetBird's own
 # install/config management, the same boundary every provider in this repo
-# draws (docs/providers.md §1.3).
+# draws (docs/providers.md's "What a provider MUST do" section).
 { config, lib, pkgs, ... }:
 
 let

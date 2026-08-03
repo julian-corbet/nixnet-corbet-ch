@@ -1,17 +1,18 @@
 # modules/netbird-provider.nix
 #
-# The first-party reference provider (design.md §7). Wraps upstream
+# The first-party reference provider. Wraps upstream
 # `services.netbird` — never reimplements NetBird's own install/config
 # management — and adds exactly three things on top: a dynamic
-# address+health source per configured peer (via the exec-probe contract,
-# docs/providers.md §6.2), a precise drift detector, and non-interactive
+# address+health source per configured peer (via the exec-probe contract
+# in docs/providers.md's "What a provider MAY do" section), a precise
+# drift detector, and non-interactive
 # headless reprovisioning, ESCALATING through two distinct repair actions
 # rather than jumping straight to the most destructive one.
 #
 # This is the concrete fix for the incident that motivated nixnet: local
 # NetBird identity state going empty/stale and the daemon silently falling
-# back to a default management endpoint. See §7.4 "the concrete incident
-# fix" for the exact drift definition this module checks.
+# back to a default management endpoint. See identityHealthCheckBash and
+# driftCheckScript below for the exact drift definition this module checks.
 #
 # REPROVISION ESCALATION ORDER (root-caused 2026-07-25, production peer
 # fork): reprovisionScript below tries a PLAIN `netbird up
@@ -65,17 +66,18 @@ let
   hostname = if cfg.hostnameOverride != null then cfg.hostnameOverride else config.networking.hostName;
 
   # One address+health-probe script PER configured peer, values baked in at
-  # eval time (mirrors the tailscale-provider example in docs/providers.md
-  # §6.4) — simpler than threading per-peer config through CLI args at run
+  # eval time (mirrors the tailscale-provider example in docs/providers.md's
+  # "Minimal example (for a hypothetical tailscale-provider)" section) —
+  # simpler than threading per-peer config through CLI args at run
   # time, and keeps every argv[0] a single self-contained store path with
   # no runtime lookup of "which peer am I" needed.
   #
   # Uses pkgs.writeShellApplication so every tool used (netbird, jq,
   # coreutils) is resolved to an absolute store path baked into the
-  # wrapper's own PATH — never the caller's ambient PATH. This is the
-  # concrete system-manager-portability technique design.md's Go/PATH
-  # rationale (§1) calls for: nixnetd's own exec never depends on host
-  # PATH, and neither does the script it execs.
+  # wrapper's own PATH — never the caller's ambient PATH. This is what
+  # makes the provider portable to hosts whose ambient PATH nixnet does
+  # not control: nixnetd's own exec never depends on host PATH, and
+  # neither does the script it execs.
   mkAddressProbe = peerName: peerCfg:
     pkgs.writeShellApplication {
       name = "nixnet-netbird-address-probe-${peerName}";
@@ -90,8 +92,8 @@ let
 
         fail_drift_shaped() {
           # A drift-shaped signal (identity/state problem), as opposed to
-          # a plain reachability failure -- see design.md §7.4's
-          # distinction. Counts consecutive occurrences and only touches
+          # a plain reachability failure, which never triggers a
+          # reprovision. Counts consecutive occurrences and only touches
           # the reactive trigger file after
           # driftFailureThreshold in a row, its own small hysteresis to
           # avoid false positives during normal daemon startup.
@@ -424,7 +426,8 @@ in
         match an existing nixnet.peers.<name> (declared by you,
         with its own `hostnames` and any other transports) -- this
         provider only ever ADDS one more transport to that peer's list,
-        via ordinary Nix list-option merging (docs/providers.md §6.1.2).
+        via ordinary Nix list-option merging (see docs/providers.md's
+        "What a provider MUST do" section).
       '';
     };
 
@@ -467,7 +470,8 @@ in
     ];
 
     # Wraps upstream services.netbird -- never reimplements NetBird's own
-    # install/config management (docs/providers.md §6.1.3).
+    # install/config management (docs/providers.md's "What a provider MUST
+    # do" section).
     services.netbird.enable = true;
 
     # nixnetd's unit hard-requires SupplementaryGroups = [ "netbird" ]
@@ -496,7 +500,8 @@ in
     # nixnet.peers.<name>.transports list the consumer's own
     # machine config (and any other provider) also contributes into.
     # netbird-provider never touches nixnet.daemon.* and never
-    # writes to /run/nixnet/* directly (docs/providers.md §6.1.2).
+    # writes to /run/nixnet/* directly (docs/providers.md's "What a
+    # provider MUST do" section).
     nixnet.peers = mkMerge (mapAttrsToList
       (peerName: peerCfg: {
         ${peerName}.transports = [{
@@ -514,7 +519,8 @@ in
     # This unit is owned by core (systemd.services.nixnetd, defined in
     # core.nix) -- adding a SupplementaryGroups entry to it here is NOT
     # netbird-provider reaching into nixnet.daemon.* (the
-    # contract's actual boundary, docs/providers.md §6.1.2); it's an
+    # contract's actual boundary, docs/providers.md's "What a provider
+    # MUST do" section); it's an
     # ordinary cross-module systemd.services.* extension, the same
     # mechanism any two unrelated NixOS modules can use to jointly shape a
     # third unit. It's needed because the exec-probe script above runs as
@@ -540,8 +546,7 @@ in
         Type = "oneshot";
         ExecStart = "${driftCheckScript}/bin/nixnet-netbird-drift-check";
         # Root: needs to read /var/lib/netbird/config.json (root-only) and
-        # run `netbird status` at full privilege, matching design.md §7.3's
-        # documented privilege level.
+        # run `netbird status` at full privilege.
       };
     };
 
@@ -550,7 +555,9 @@ in
     # driftFailureThreshold consecutive drift-shaped failures. This
     # root-owned path unit is what turns that file-touch into fast
     # reactive recovery, without ever granting the unprivileged probe
-    # process itself any systemctl/root capability (design.md §7.4).
+    # process itself any systemctl/root capability -- the trigger-file
+    # pattern described in docs/providers.md's "What a provider MAY do"
+    # section.
     systemd.paths.nixnet-netbird-reprovision-trigger = mkIf cfg.reprovision.enable {
       description = "Watch for nixnet netbird reprovision triggers";
       wantedBy = [ "multi-user.target" ];
@@ -566,7 +573,7 @@ in
         Type = "oneshot";
         ExecStart = "${reprovisionScript}/bin/nixnet-netbird-reprovision";
         # Root: required to drive `netbird up`/`down` and read the
-        # setup-key secret (design.md §8) -- narrowly-scoped, rate-limited
+        # root-readable setupKeyFile secret -- narrowly-scoped, rate-limited
         # oneshot, never a resident privileged process.
       };
     };

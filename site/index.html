@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
 
   <title>nixnet &mdash; provider-agnostic transport failover for NixOS</title>
-  <meta name="description" content="nixnet picks the best currently-healthy path to a peer or a local uplink — LAN or VPN overlay, wired or cellular — and publishes the winner into /etc/hosts or a route metric, so ssh, mount and curl need zero mesh-awareness. Rust daemon plus NixOS and system-manager modules. v0.1, not yet run against real hosts.">
+  <meta name="description" content="nixnet picks the best currently-healthy path to a peer or a local uplink — LAN or VPN overlay, wired or cellular — and publishes the winner into /etc/hosts or a route metric, so ssh, mount and curl need zero mesh-awareness. Rust daemon plus NixOS and system-manager modules, running in production.">
 
   <meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
@@ -159,7 +159,7 @@ uplinks:
       </div>
       <div class="feature">
         <h3>Unprivileged by default</h3>
-        <p>Runs as <code>DynamicUser</code> under <code>ProtectSystem=strict</code>. A peers-only install using TCP or HTTP probes gets no elevated capabilities at all; <code>CAP_NET_RAW</code> and <code>CAP_NET_ADMIN</code> are granted only when a transport actually needs them.</p>
+        <p>Runs as a dedicated system user under <code>ProtectSystem=strict</code>, never <code>root</code>. A peers-only install using TCP or HTTP probes gets no elevated capabilities at all; <code>CAP_NET_RAW</code> and <code>CAP_NET_ADMIN</code> are granted only when a transport actually needs them.</p>
       </div>
       <div class="feature">
         <h3>Nix-unaware daemon</h3>
@@ -219,18 +219,32 @@ every ordinary NSS files-then-dns lookup</code></pre>
   <div class="container">
     <h2>Status</h2>
     <p>
-      <strong>v0.1 &mdash; fresh project.</strong> The winner-selection and
-      hysteresis engine, all four probe methods, both publish backends and the
-      <code>sd_notify</code> watchdog integration are implemented for real, not
-      stubbed, and the test suite runs in-derivation on every
-      <code>nix build</code>. What has <em>not</em> happened yet is a real
-      deployment: nothing here has run against live hosts. Default probe
-      intervals and hold times are reasoned, not measured &mdash; the repo's
-      <code>experiments/</code> notes track exactly which values still need a
-      real deployment behind them, and
-      <a href="https://github.com/julian-corbet/nixnet-corbet-ch/blob/main/docs/providers.md#deviations-from-the-v1-design-document">docs/providers.md</a>
-      lists every place the code deviates from the v1 design document rather
-      than leaving it implicit. Treat it accordingly.
+      <strong>v0.1 &mdash; running in production.</strong> The winner-selection
+      and hysteresis engine, all four probe methods, both publish backends and
+      the <code>sd_notify</code> watchdog integration are implemented for real,
+      not stubbed; the test suite runs in-derivation on every
+      <code>nix build</code>, and an eval-time check suite guards the module
+      surface. It runs day to day across several hosts, on both the NixOS and
+      the <code>system-manager</code> backend.
+    </p>
+    <p>
+      That deployment is where the sharpest bugs came from &mdash; the ones no
+      amount of eval-time checking finds, because they are facts about a running
+      kernel rather than about what Nix evaluates to: the daemon's process
+      identity versus the hosts file it must <code>rename(2)</code> over, a
+      secret unseal racing the mount holding its key, and a restart publishing
+      nothing because publishing was wired only to <em>winner changes</em> and a
+      settled fleet has none. Each fix landed with a regression check beside it.
+    </p>
+    <p>
+      Calibrate before adopting: default probe intervals and hold times are
+      reasoned, not measured &mdash; the repo's <code>experiments/</code> notes
+      are the open ledger of which values still need real numbers. The
+      peer/<code>/etc/hosts</code> half is considerably better exercised than
+      the uplink/route-metric half. And
+      <a href="https://github.com/julian-corbet/nixnet-corbet-ch/blob/main/docs/providers.md#documented-deviations-and-judgment-calls">docs/providers.md</a>
+      lists every place the code fills a gap the option surface didn't pin down,
+      rather than leaving it implicit.
     </p>
   </div>
 </section>

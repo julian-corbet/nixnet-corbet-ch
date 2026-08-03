@@ -2,9 +2,10 @@
 #
 # nixnet's whole generic engine: nixnet.peers.<name> and
 # nixnet.uplinks.<name>, sharing one transport submodule type and
-# rendered into one config.json for nixnetd (design.md §3). This file is
+# rendered into one config.json for nixnetd. This file is
 # shared verbatim between nixosModules.core and systemManagerModules.core
-# (flake.nix) — see §9 for why that's safe: nixnet only ever touches
+# (flake.nix) — see the README's "Non-NixOS hosts (via `system-manager`)"
+# section for why that's safe: nixnet only ever touches
 # environment.etc, systemd.services/timers/paths, and a rendered JSON file,
 # none of which system-manager categorically can't reach.
 #
@@ -22,7 +23,8 @@ let
   cfg = config.nixnet;
 
   # ---------------------------------------------------------------------
-  # system-manager backend detection (design.md §9). system-manager exposes
+  # system-manager backend detection (see the README's "Non-NixOS hosts
+  # (via `system-manager`)" section). system-manager exposes
   # no `networking.hosts` at all and only a fixed `system.activationScripts.
   # users` stub (not an extensible attrsOf), so both the /etc/hosts merge
   # below and the activation-script seeding mechanism need a system-manager
@@ -35,11 +37,10 @@ let
   isSystemManager = options ? system-manager;
 
   # ---------------------------------------------------------------------
-  # Shared transport submodule (design.md §3.1) — reused verbatim by both
+  # Shared transport submodule — reused verbatim by both
   # peers.<name>.transports and uplinks.<name>.transports. One type, one
-  # engine code path; see the design rationale table in design.md §1 for
-  # why this is "one schema, two readable tables" rather than one table
-  # with a `kind` discriminator.
+  # engine code path: peers and uplinks stay two readable tables sharing
+  # one schema, rather than one table with a `kind` discriminator.
   # ---------------------------------------------------------------------
   probeType = types.submodule {
     options = {
@@ -108,15 +109,15 @@ let
       };
 
       exec = mkOption {
-        # DEVIATION from the design document's literal `types.path`
-        # typing (§3.1): the design doc's own netbird-provider example
-        # (§7.2) assigns `probe.exec = "${script} ${peerName}"` — a full
+        # NOT the more obvious `types.path`: the provider contract types
+        # `probe.exec` as a command line (docs/providers.md's "What a
+        # provider MAY do" section), e.g. `"${script} ${peerName}"` — a full
         # command line (program + argument), not a bare path, which
         # `types.path` cannot represent (it would either fail to coerce
         # or silently only keep the first word, neither of which is what
-        # the example clearly intends). Typed `types.str` here instead,
+        # such an assignment intends). Typed `types.str` here instead,
         # documented as "a full command line" throughout, and see
-        # nixnetd's internal/probe package for the corresponding
+        # nixnetd's `src/probe/exec.rs` for the corresponding
         # no-shell, word-split exec — this preserves the "no PATH
         # dependency, one narrow well-tested exec" property system-manager
         # hosts need just as much as `types.path` would have.
@@ -127,7 +128,7 @@ let
           resolved to an absolute Nix store path for argv[0] (e.g. a
           `pkgs.writeShellApplication` result concatenated with a space
           and an argument). Run each tick with no shell involved — see
-          docs/providers.md §6.2.
+          docs/providers.md's "What a provider MAY do" section.
         '';
       };
     };
@@ -141,7 +142,8 @@ let
         description = ''
           A concrete reachable address for this transport. Peer
           transports: required unless supplied dynamically by a
-          provider's exec probe (§6.2's `address` envelope field). Uplink
+          provider's exec probe (the `address` field of its JSON envelope,
+          see docs/providers.md). Uplink
           transports: usually left null — `probe.target` (reached via
           `interface`) is what's actually probed there.
         '';
@@ -176,8 +178,8 @@ let
     };
 
     # target defaults to address, for every transport (peer or uplink
-    # alike — this submodule is shared, see design.md §1's schema-shape
-    # rationale). For uplinks, address is normally null, so this default
+    # alike — this submodule is shared, see the shared-transport-submodule
+    # comment above). For uplinks, address is normally null, so this default
     # just leaves target null too, same as if there were no default at
     # all; the assertion in the parent module is what actually enforces
     # "required for uplinks."
@@ -397,7 +399,8 @@ let
   };
 
   # ---------------------------------------------------------------------
-  # Capability computation (design.md §8): a peers-only install with only
+  # Capability computation (see the README's "Security" section): a
+  # peers-only install with only
   # TCP/HTTP probes gets no elevated capabilities at all.
   # ---------------------------------------------------------------------
   allTransports =
@@ -408,7 +411,7 @@ let
   needsNetRaw = any (t: t.probe.method == "icmp" || t.probe.bindToInterface) allTransports;
 
   # ---------------------------------------------------------------------
-  # config.json rendering (design.md §3.3) — the *only* interface between
+  # config.json rendering — the *only* interface between
   # Nix and nixnetd. nixnetd never reads anything else Nix-shaped.
   # ---------------------------------------------------------------------
   renderedConfig = {
@@ -442,7 +445,7 @@ let
   nixnetPackage = pkgs.callPackage ../package.nix { };
 
   # ---------------------------------------------------------------------
-  # Boot-time hosts seeding (design.md §5.1): synchronous, so
+  # Boot-time hosts seeding: synchronous, so
   # cfg.daemon.hostsFile is NEVER dangling even before nixnetd's first
   # tick. Runs as an activation script on NixOS; system-manager has no
   # `networking.hosts` to merge in at all, so this is simply empty there
@@ -560,8 +563,9 @@ in
           boot, so a symlink chain ending there can never resolve until
           something has run *this specific boot* to (re)create it -- and
           on the system-manager backend specifically, nothing has, at the
-          point system-manager-engine resolves this symlink (see
-          design.md §9 / §5.1). Living under /var/lib instead means that
+          point system-manager-engine resolves this symlink (see the
+          `system-manager.preActivationAssertions` block at the end of
+          this file). Living under /var/lib instead means that
           once this file exists for the first time ever on a given host,
           it never goes missing again across any future boot or
           redeploy, which is what actually makes the system-manager
@@ -798,7 +802,7 @@ in
       };
     };
   }
-  # NixOS only: an activation script (design.md §5.1) -- runs synchronously,
+  # NixOS only: an activation script -- runs synchronously,
   # to completion, before systemd starts any unit on a fresh boot; on a
   # `nixos-rebuild switch` (not a fresh boot) activation runs synchronously
   # too, ahead of restarting changed units. Merged in via `//` (a plain Nix
@@ -822,7 +826,8 @@ in
     };
   })
   # system-manager only: the actual fix for the etc-activation ordering bug
-  # (design.md §9). system-manager-engine's activate() runs, in order: (1)
+  # (see the README's "Non-NixOS hosts (via `system-manager`)" section).
+  # system-manager-engine's activate() runs, in order: (1)
   # preActivationAssertions, (2) etc-file activation, (3) systemd-tmpfiles
   # --create (i.e. systemd.tmpfiles.rules), (4) systemd services -- so both
   # nixnet-seed-hosts.service (a systemd service, step 4) AND a

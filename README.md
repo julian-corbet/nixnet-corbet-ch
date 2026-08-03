@@ -117,7 +117,7 @@ nixnet.peers / uplinks
             |
             v
       +------------+
-      |  nixnetd   |   one probe goroutine + ticker per transport
+      |  nixnetd   |   one probe thread + ticker per transport
       +-----+------+
             |
       winner changes?
@@ -307,12 +307,11 @@ group/policy names):
   `/var/lib/nixnet-hosts/hosts` — under `/var/lib`, not `runtimeDir`:
   `/run` is a fresh, empty tmpfs on every boot, so a symlink chain ending
   there can never resolve before something has (re)created it *this
-  specific boot* — see the `system-manager` note below. Deliberately a
-  sibling of `stateDir`, not nested under it: `nixnetd` runs with
-  `DynamicUser=true`, which relocates `stateDir` under the shared,
-  `0700 root:root` `/var/lib/private/` parent — anything nested there
-  becomes unreadable to every other process on the box, defeating the
-  whole point of `/etc/hosts`).
+  specific boot* — see the `system-manager` note below. A sibling of
+  `stateDir` rather than nested under it, so the file `/etc/hosts`
+  resolves to stays clear of whatever systemd does to `StateDirectory=`;
+  it must be readable by every process on the box, which is the entire
+  point of `/etc/hosts`).
 - `daemon.defaultProbe.{intervalMs,timeoutMs,upThreshold,downThreshold}` —
   the single source of truth every transport's own `probe.*` field falls
   back to when not set explicitly (defaults `3000`/`800`/`2`/`3` — ◐
@@ -369,9 +368,8 @@ The shared **transport** type (`peers.<name>.transports[]` and
   tick, per the [provider contract](docs/providers.md).
 
 `nixnet.netbird.*` (`modules/netbird-provider.nix`) — see
-[Quickstart](#quickstart) for a worked example and
-[`docs/providers.md`](docs/providers.md) §7 for the full drift-detection
-and reprovisioning design:
+[Quickstart](#quickstart) for a worked example and the module's own
+header comment for the full drift-detection and reprovisioning design:
 
 - `enable`, `managementUrl`, `setupKeyFile` (a reusable, non-interactive
   NetBird setup key — sops/agenix-provided, root-readable),
@@ -502,9 +500,15 @@ correctly with no action needed from a consumer.
 
 ## Security
 
-`nixnetd` runs as `DynamicUser`, `NoNewPrivileges`,
-`ProtectSystem = "strict"`, with `RuntimeDirectory`/`StateDirectory`
-scoped to exactly `/run/nixnet` and `/var/lib/nixnet`. It is granted
+`nixnetd` runs as a dedicated `nixnetd` system user — never `root`, and
+deliberately **not** `DynamicUser`: the daemon has to own the hosts file
+it atomically renames over, and a per-boot-random dynamic UID owns
+neither that file nor its directory, so every publish fails with `EPERM`
+(POSIX restricts `rename(2)` over an existing file to its owner, the
+directory's owner, or a privileged process). It runs with
+`NoNewPrivileges`, `ProtectSystem = "strict"`, and
+`RuntimeDirectory`/`StateDirectory` scoped to exactly `/run/nixnet` and
+`/var/lib/nixnet`. It is granted
 `CAP_NET_ADMIN` only if some uplink has `publish.routeMetric = true`
 (the common case), and `CAP_NET_RAW` only if some transport uses
 `probe.method = "icmp"` or `probe.bindToInterface = true`. A peers-only
@@ -536,15 +540,35 @@ in sync.
 
 ## Status
 
-Fresh project: the engine, both publish backends, and the netbird
-reference provider are implemented for real per the v1 design document,
-but nothing here has run across real hosts yet. A handful of places
-where the code necessarily fills a gap or extends the letter of the
-design document are documented explicitly in
-[`docs/providers.md`](docs/providers.md#deviations-from-the-v1-design-document)
-rather than left implicit. Values marked ◐ above are reasoned, not
-measured; `experiments/README.md` tracks what still needs measuring
-against a real deployment.
+**Running in production**, across several hosts and both backends (NixOS
+and `system-manager`). The engine, both publish backends, and the netbird
+reference provider are complete implementations rather than stubs, and
+the networking-ownership modules above manage a real overlay, a real
+mesh gateway and real public ingress day to day.
+
+That deployment is also where the sharpest bugs have come from — the ones
+no amount of eval-time checking finds, because they are facts about a
+running kernel and a running systemd rather than about what Nix evaluates
+to. Three, so far: the daemon's own process identity versus the hosts
+file it must rename over; a secret-unseal that raced the mount holding
+its key and hard-failed the mesh gateway until a human intervened; and a
+restart publishing nothing at all, because publishing was wired only to
+*winner changes* and a settled fleet has none. Each landed with a
+regression check — a unit test or an eval-time assertion — next to the
+fix.
+
+Calibrate accordingly before adopting:
+
+- Values marked ◐ above are **reasoned, not measured**.
+  `experiments/README.md` is the open ledger of exactly which ones still
+  need real numbers behind them.
+- The **peer/`/etc/hosts` half is far better exercised than the
+  uplink/route-metric half**, which has had comparatively little real
+  exposure. Treat uplink failover as the less-proven surface.
+- Places where the code fills a gap the option surface didn't pin down
+  are documented explicitly in
+  [`docs/providers.md`](docs/providers.md#documented-deviations-and-judgment-calls)
+  rather than left implicit.
 
 ## Non-goals (v1)
 

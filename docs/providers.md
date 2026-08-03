@@ -28,8 +28,9 @@ code, not a stub.
    (mapAttrsToList ...)`). A provider module must never touch
    `nixnet.daemon.*`, never write to `/run/nixnet/*` directly, and
    never assume anything about how core probes or publishes — it only ever
-   contributes *candidates*. (See §4 below for the one narrow, documented
-   exception this repo's own reference provider needed.)
+   contributes *candidates*. (See "Deviation: `nixnetd`'s
+   `SupplementaryGroups` set by netbird-provider" below for the one narrow,
+   documented exception this repo's own reference provider needed.)
 3. **Never reimplement functionality the underlying tool already
    provides.** If the provider wraps another NixOS module (e.g.
    `services.netbird`), it must set that module's own options and consume
@@ -123,58 +124,56 @@ exec-probe scripts) if you want a worked example past "minimal."
 
 ---
 
-## Deviations from the v1 design document
+## Documented deviations and judgment calls
 
-This section exists because the code doesn't match the design document
-line-for-line in a few places. Each entry below explains what changed, in
-which file, and why — so a reviewer (or a future contributor extending
-this) doesn't have to reverse-engineer the reasoning from a diff.
+Each entry below is a judgment call made while implementing — a place where
+the obvious or literal-minded shape was rejected for a concrete reason. Each
+one says what was chosen instead, in which file, and why — so a reviewer (or
+a future contributor extending this) doesn't have to reverse-engineer the
+reasoning from a diff.
 
 ### Deviation: `probe.exec` is a command line, not a bare `types.path`
 
-The design document's §3.1 pseudocode types `probe.exec` as
-`types.nullOr types.path` — but its own §7.2 usage example immediately
-assigns `probe.exec = "${nixnetNetbirdAddressProbe} ${name}";`, which is a
+The obvious typing for `probe.exec` is `types.nullOr types.path` — but a
+bare path cannot represent what a real provider assigns. This repo's own
+reference provider sets
+`probe.exec = "${nixnetNetbirdAddressProbe} ${name}";`, which is a
 **full command line** (a store path followed by a space and an argument),
-not a bare path. `types.path` cannot represent that. `modules/core.nix`
+not a bare path. `modules/core.nix`
 types `probe.exec` as `types.nullOr types.str` instead, documented
 throughout as "a full command line, argv[0] already an absolute Nix store
 path." `src/probe/exec.rs`'s `run` tokenizes that string with a
 small quote-aware word-splitter and execs `argv[0]` directly — **never**
-through `/bin/sh** — which is actually a *stricter* reading of the design's
-own "no PATH dependency, one narrow well-tested exec" goal (§1's rationale
-table) than shelling out via `sh -c` would have been.
+through `/bin/sh` — which is *stricter* than shelling out via `sh -c` would
+have been: no PATH dependency, one narrow well-tested exec.
 
-### Deviation: address-drift republish, beyond a literal reading of §4.2
+### Deviation: republish on address drift, not only on a winner change
 
-Design document §4.2's winner-selection pseudocode returns early — no
-publish call at all — whenever the winner index hasn't changed:
-
-> `if newWinner == currentWinner: return   # no-op; nothing is republished`
-
-Taken completely literally, this would mean: if a provider's exec probe
+The obvious winner-selection loop returns early — no publish call at all —
+whenever the winner index hasn't changed
+(`if newWinner == currentWinner: return`).
+Taken completely literally, that would mean: if a provider's exec probe
 changes the **winning** transport's own dynamically-discovered address
 (exactly the netbird-provider scenario — a peer re-enrolls and gets a new
 overlay IP, but is still the highest-priority *healthy* transport before
 and after), nothing ever gets republished, because the winner *index*
 never moved. That would silently defeat the entire "dynamic address
-source" mechanism §6.2 describes as the reason the exec-probe JSON
-envelope's `address` field exists at all.
+source" mechanism the exec-probe JSON envelope's `address` field exists for
+in the first place (see "What a provider MAY do" above).
 
 `src/engine/mod.rs`'s `reconcile_locked` additionally republishes
 whenever the current winner's effective address differs from what was
 last actually published — winner-index unchanged or not. This is a
 narrow, additive extension: it changes *when* a publish happens, never
-*which* transport wins or how hysteresis/minHold is computed, so it
-doesn't touch any of the properties §1's rationale table argues for.
+*which* transport wins or how hysteresis/minHold is computed.
 
 ### Deviation: transport identity is list position, not a name field
 
-The design document's `transportType` (§3.1) has no name/id field on a
-transport — only the observability-only `providerId`. But §4.1's own
-pseudocode log line format (`"transport=%s state=%s->Up after=%d" %
-(id, ...)`) and §5.3's `status.json` shape (a `transports` object keyed by
-some string) both assume transports have string identities somewhere.
+`modules/core.nix`'s transport submodule has no name/id field on a
+transport — only the observability-only `providerId`. But the state-change
+log line (`"transport=%s state=%s->Up after=%d"`) and `status.json`'s
+`transports` object (keyed by some string) both need transports to have
+string identities somewhere.
 
 `src/engine/mod.rs` resolves this gap by using each transport's
 position in its `transports` list as its stable identity for
@@ -188,29 +187,29 @@ discovered the hard way.
 
 ### Deviation: `nixnetd`'s `SupplementaryGroups` set by netbird-provider
 
-`docs/providers.md` §3 says a provider must never touch
+"What a provider MUST do" above says a provider module must never touch
 `nixnet.daemon.*`. `modules/netbird-provider.nix` sets
 `systemd.services.nixnetd.serviceConfig.SupplementaryGroups = [ "netbird" ];`
 when enabled — which is **not** the same boundary: `nixnet.daemon.*`
 is nixnet's own Nix *option surface* (cadence, paths, thresholds — the
-things §6.1.2 actually says a provider must leave alone); `systemd.services.nixnetd`
+things that rule actually covers); `systemd.services.nixnetd`
 is the raw NixOS systemd-unit option any two unrelated modules can
 jointly extend, the same way, say, a hardening module and a logging
 module might both add settings to the same third-party unit. It's needed
 because `netbird-provider`'s exec-probe script runs as a child process of
-`nixnetd`'s own unprivileged (`DynamicUser`) process, and `netbird status`
-needs group-level read access to NetBird's control socket that a bare
-dynamic UID doesn't have. This is scoped as narrowly as possible (one
+`nixnetd`'s own unprivileged process, and `netbird status` needs
+group-level read access to NetBird's control socket that the `nixnetd`
+system user doesn't otherwise have. This is scoped as narrowly as possible (one
 group membership, only when `netbird-provider` is actually enabled) and
 documented at the point it's set, in `modules/netbird-provider.nix`.
 
 ### Clarification (not a deviation): `daemon.defaultProbe` is load-bearing
 
-Design document §3.1's `probe` submodule hardcodes its own field defaults
-(3000/800/2/3) directly; §3.2 separately declares
-`nixnet.daemon.defaultProbe` with the *same* numbers, but never
-actually wires the two together — read completely literally,
-`daemon.defaultProbe` would be a dead option nobody consults.
+The obvious shape hardcodes the `probe` submodule's own field defaults
+(3000/800/2/3) directly and separately declares
+`nixnet.daemon.defaultProbe` with the *same* numbers, without ever
+actually wiring the two together — which leaves
+`daemon.defaultProbe` a dead option nobody consults.
 `modules/core.nix`'s `probeType` submodule instead sets each field's
 default to `cfg.daemon.defaultProbe.<field>`, and
 `src/config.rs`'s hand-written-JSON fallback path mirrors the

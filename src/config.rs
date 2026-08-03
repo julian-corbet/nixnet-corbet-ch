@@ -54,7 +54,7 @@ pub struct Probe {
     /// not a bare path -- see `docs/providers.md`'s "Deviation: probe.exec
     /// is a command line, not a bare path" for why this departs from a
     /// literal `types.path`. Tokenized and exec'd directly (never via a
-    /// shell) by `internal/probe`'s Rust port (`crate::probe`).
+    /// shell) by `crate::probe`.
     #[serde(deserialize_with = "null_as_empty_string")]
     pub exec: String,
 }
