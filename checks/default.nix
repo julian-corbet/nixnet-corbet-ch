@@ -111,6 +111,9 @@ let
   mgAgeKey = "/var/lib/example/age.key";
   mgSetupKey = "/var/lib/example/setupkey.enc";
 
+  # A deliberately STORE-path secret, to pin the filtering direction below.
+  mgStoreSecret = pkgs.writeText "nixnet-fake-sealed-secret" "not-a-real-secret";
+
   mgCfg = evalModules [
     meshGatewayModule
     {
@@ -121,7 +124,10 @@ let
         apiUrl = "https://mesh.example.com/api";
         ageKeyFile = mgAgeKey;
         setupKeySecret = mgSetupKey;
-        apiTokenSecret = "/var/lib/example/apitoken.enc";
+        # NOT a sibling of setupKeySecret by accident: this one is a store
+        # path so the two apitoken/setupkey units together cover both sides
+        # of the store-path filter in one evaluation.
+        apiTokenSecret = mgStoreSecret;
       };
     }
   ];
@@ -151,6 +157,22 @@ let
     # Defence in depth: a transient unreadable secret must retry, not
     # latch. Type=oneshot rejects Restart=always/on-success, so on-failure
     # is both the correct and the only usable mode here.
+    # The other direction of the same filter. A store path must NOT appear:
+    # /nix/store is up before systemd starts anything, and `toString` on a
+    # store path drops its string context, so letting one through would make
+    # this unit's derivation reference it without declaring the dependency.
+    (check "mesh-gateway/unseal-excludes-store-paths"
+      (!(lib.any
+        (lib.hasPrefix builtins.storeDir)
+        (lib.toList (mgCfg.systemd.services.nixnet-mesh-gateway-apitoken-unseal.unitConfig.RequiresMountsFor or [ ]))))
+      "apitoken unseal RequiresMountsFor: ${builtins.toJSON (mgCfg.systemd.services.nixnet-mesh-gateway-apitoken-unseal.unitConfig.RequiresMountsFor or null)}")
+
+    # ...and the age key must still survive that filter on the very same unit,
+    # so "exclude store paths" can never degrade into "exclude everything".
+    (check "mesh-gateway/unseal-keeps-age-key-alongside-store-secret"
+      (lib.elem mgAgeKey (lib.toList (mgCfg.systemd.services.nixnet-mesh-gateway-apitoken-unseal.unitConfig.RequiresMountsFor or [ ])))
+      "apitoken unseal RequiresMountsFor: ${builtins.toJSON (mgCfg.systemd.services.nixnet-mesh-gateway-apitoken-unseal.unitConfig.RequiresMountsFor or null)}")
+
     (check "mesh-gateway/unseal-retries-on-failure"
       ((mgUnseal.serviceConfig.Restart or null) == "on-failure")
       "serviceConfig.Restart: ${builtins.toJSON (mgUnseal.serviceConfig.Restart or null)}")

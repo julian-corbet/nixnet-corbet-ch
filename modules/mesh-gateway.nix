@@ -123,7 +123,21 @@ let
     # it. Observed in production as exactly a 10-second loss (unseal at
     # T+0, the dataset holding the age key mounted at T+10), which took
     # every embedded identity off the overlay until a human noticed.
-    unitConfig.RequiresMountsFor = [ (toString cfg.ageKeyFile) (toString secretFile) ];
+    #
+    # Store paths are filtered back out, for two independent reasons. The
+    # boring one: /nix/store is mounted before anything systemd starts, so
+    # ordering on it buys nothing. The load-bearing one: `toString` on a
+    # store path STRIPS its string context, and a context-free store path
+    # reaching a derivation makes that derivation reference it without
+    # declaring the dependency -- nix warns about precisely this, and a
+    # sealed secret committed alongside a consumer's config IS a store path
+    # (an `ageKeyFile` on a real filesystem is not). Filtering is both the
+    # semantically correct answer and the one that keeps the reference
+    # honest.
+    unitConfig.RequiresMountsFor =
+      lib.filter
+        (p: !(lib.hasPrefix builtins.storeDir p))
+        [ (toString cfg.ageKeyFile) (toString secretFile) ];
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
