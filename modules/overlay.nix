@@ -16,10 +16,19 @@
 # Wraps upstream `services.netbird` — never reimplements NetBird's own
 # install/config management, the same boundary every provider in this repo
 # draws (docs/providers.md's "What a provider MUST do" section).
-{ config, lib, pkgs, ... }:
+{ config, lib, options, pkgs, ... }:
 
 let
   cfg = config.nixnet.overlay;
+  tl = import ../lib/tooling.nix { inherit lib; };
+
+  # This module writes an nftables table of its own (below), so it owes the host the same thing
+  # modules/firewall.nix does: the means to READ that table. The failure is not hypothetical — a
+  # production host was enforcing THIS module's `inet nixnet-overlay` table with no `nft` installed
+  # anywhere on it. `applyScript` runs nft from a store path, so the table went up and stayed up
+  # and nothing complained; the operator simply had no way to ask whether the confinement was
+  # still there. lib/tooling.nix names the tool per backend, `null` included.
+  tooling = tl.resolve { inherit pkgs options; names = cfg.tooling; };
 
   # An address family is decided per-entry rather than per-option, so one
   # `advertiseRoutes` list can carry both families and each rule lands in the
@@ -278,6 +287,25 @@ in
       default = "wt0";
       description = "The NetBird tunnel interface name on this host (upstream default is wt0; a `hardened = true` client uses a different name).";
     };
+
+    tooling = lib.mkOption {
+      type = lib.types.listOf (lib.types.enum (lib.attrNames tl.tools));
+      default = [ "nft" ];
+      description = ''
+        Tools for INSPECTING the nftables table this module installs, added to the host.
+
+        The `ruleset` option above lets you read the rules from the BUILD host without an `nft`
+        anywhere; this is the other half of that, on the machine actually enforcing them. Defaults
+        to `[ "nft" ]` because a host that carries a confinement should be able to answer whether
+        it still carries it — a production host enforcing this module's table had no `nft` at all,
+        which nothing detects, because applying the table never needs one.
+
+        Same option, same default and same per-backend resolution as `nixnet.firewall.tooling`;
+        setting both on one host installs one copy. Set to `[ ]` to opt out where the distro
+        already ships the tool. On nix-darwin there is no nftables at all (macOS filters with pf)
+        and the selection is reported in `warnings` rather than silently installing nothing.
+      '';
+    };
   };
 
   config = lib.mkMerge [
@@ -287,6 +315,18 @@ in
 
     (lib.mkIf cfg.enable {
     services.netbird.enable = true;
+
+    # The means to read the table this module is about to install. `environment.systemPackages` is
+    # the same option name under NixOS and under system-manager (the latter buildEnv's it into
+    # /run/system-manager/sw and prepends that to PATH), so no backend branch belongs here — the
+    # part that varies per backend is the package name, and lib/tooling.nix holds it.
+    environment.systemPackages = tooling.packages;
+
+    warnings = lib.optional (tooling.unavailable != [ ])
+      (tl.unavailableWarning {
+        option = "nixnet.overlay.tooling";
+        inherit (tooling) backend unavailable;
+      });
 
     assertions = [
       # Both of these used to be silent no-ops: every firewall rule this

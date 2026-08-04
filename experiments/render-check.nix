@@ -252,6 +252,64 @@ let
     nixnet.firewall.table = lib.mkForce "nixnet-overlay";
   };
 
+  # ── Inspection tooling ────────────────────────────────────────────────────────────────────────
+  #
+  # The failure being tested for: a host enforcing a nixnet-authored nftables table with no `nft`
+  # installed on it at all. It cannot be caught by any assertion on the RULESET, because the
+  # ruleset was fine — the ruleset is always fine, it loads from a store path — so the check has to
+  # look at what lands on the host beside it.
+  tl = import ../lib/tooling.nix { inherit lib; };
+
+  hasNft = cfg: lib.any (p: lib.hasPrefix "nftables" (p.pname or p.name or ""))
+    cfg.environment.systemPackages;
+
+  # Narrowed to nixnet's own warnings, same reason `failed` is: an unrelated nixpkgs warning on the
+  # baseline would otherwise read as this module having complained.
+  nixnetWarnings = cfg: lib.filter (w: lib.hasInfix "nixnet" w) cfg.warnings;
+
+  # The opt-out, on a host that is otherwise identical.
+  noTooling = eval {
+    nixnet.interfaces = {
+      wt0 = mgmtIface;
+      eth0.addressing = { v4 = "dhcp"; v6 = "dhcp"; };
+    };
+    nixnet.firewall = firewallBase // { tooling = [ ]; };
+  };
+
+  # The OVERLAY module on its own, with the firewall not enabled at all: it writes a table of its
+  # own, so it owes the host the tool independently of whether host policy is also nixnet's.
+  overlayOnly = eval {
+    imports = [ ../modules/overlay.nix ];
+    nixnet.overlay = {
+      enable = true;
+      managementUrl = "https://overlay.example.org";
+      hostname = "host-a";
+      setupKeyFile = "/run/secrets/nixnet-setup-key";
+    };
+  };
+
+  overlayOnlyNoTooling = eval {
+    imports = [ ../modules/overlay.nix ];
+    nixnet.overlay = {
+      enable = true;
+      managementUrl = "https://overlay.example.org";
+      hostname = "host-a";
+      setupKeyFile = "/run/secrets/nixnet-setup-key";
+      tooling = [ ];
+    };
+  };
+
+  # The catalogue's resolver, exercised directly against each backend's own option namespace. A
+  # nix-darwin CONFIG cannot be evaluated from here at all, so the darwin answer is proved where it
+  # is actually decided — in the resolution — rather than left as an untested branch. `pkgs` is a
+  # stand-in attrset: the point is which name is looked up, not what it builds.
+  fakePkgs = { nftables = "the-nftables-package"; };
+  resolveOn = options: tl.resolve { pkgs = fakePkgs; inherit options; names = [ "nft" ]; };
+
+  onNixos = resolveOn { system.stateVersion = { }; };
+  onSystemManager = resolveOn { system-manager.allowAnyDistro = { }; };
+  onDarwin = resolveOn { system.defaults = { }; };
+
 in
 rec {
   # ── DERIVED: the DHCP client accepts ─────────────────────────────────────────────────────────
@@ -379,6 +437,44 @@ rec {
   goodConfigPasses = (lib.length (failed dhcpHost)) == 0;
   staticConfigPasses = (lib.length (failed staticHost)) == 0;
 
+  # ── Inspection tooling: the host can read what it enforces ───────────────────────────────────
+  # A host enforcing nixnet's table gets `nft`, by default, without asking.
+  firewallInstallsNft = hasNft dhcpHost;
+  # ...and so does a host that only runs the OVERLAY, which writes its own table and used to be the
+  # case that had no owner for this at all.
+  overlayInstallsNft = hasNft overlayOnly;
+
+  # BOTH DIRECTIONS. An opt-out that does not opt out is worse than no option, and a package that
+  # appears on every host regardless of the selection proves nothing about the selection.
+  noToolingInstallsNothing = !(hasNft noTooling);
+  overlayNoToolingInstallsNothing = !(hasNft overlayOnlyNoTooling);
+  # And the boundary: a host NOT enforcing a nixnet ruleset is not handed firewall tooling either.
+  disabledFirewallInstallsNothing = !(hasNft disabledHost);
+
+  # A satisfied selection says nothing; only an unsatisfiable one speaks.
+  toolingSilentWhenSatisfied = nixnetWarnings dhcpHost == [ ];
+
+  # The per-backend resolution, at the point it is actually decided. Both Linux backends resolve to
+  # a package -- system-manager included, which is the half that could otherwise silently install
+  # nothing on the exact hosts that cannot fall back on a NixOS profile.
+  nixosResolvesToPackage = onNixos.backend == "nixos"
+    && onNixos.packages == [ "the-nftables-package" ] && onNixos.unavailable == [ ];
+  systemManagerResolvesToPackage = onSystemManager.backend == "system-manager"
+    && onSystemManager.packages == [ "the-nftables-package" ] && onSystemManager.unavailable == [ ];
+
+  # nix-darwin: macOS has pf, not nftables. The requirement is not that nothing is installed --
+  # that is what a forgotten branch does too -- it is that the selection comes back NAMED as
+  # unsatisfiable, which is what makes the modules' `warnings` fire instead of staying quiet.
+  darwinResolvesToNothingAndSaysSo = onDarwin.backend == "nix-darwin"
+    && onDarwin.packages == [ ] && onDarwin.unavailable == [ "nft" ];
+  darwinDeclaredNullNotMissing = tl.tools.nft ? nix-darwin && tl.tools.nft.nix-darwin == null;
+  unavailableWarningNamesOption =
+    lib.hasInfix "nixnet.firewall.tooling"
+      (tl.unavailableWarning {
+        option = "nixnet.firewall.tooling";
+        inherit (onDarwin) backend unavailable;
+      });
+
   ok = dhcpV4Accept && dhcpV6Accept
     && staticHostHasNoDhcpV4 && staticHostHasNoDhcpV6
     && slaacHasNoDhcpV6 && slaacKeepsIcmpV6
@@ -396,5 +492,11 @@ rec {
     && noUnconditionalAccept && hasRateLimitAccept && hasRateLimitDrop
     && revertTimerNotWantedByTarget && applyBeforeNetworkPre
     && lockoutFires && typoFires && unstatedAddressingFires && noPortsFires
-    && goodConfigPasses && staticConfigPasses;
+    && goodConfigPasses && staticConfigPasses
+    && firewallInstallsNft && overlayInstallsNft
+    && noToolingInstallsNothing && overlayNoToolingInstallsNothing
+    && disabledFirewallInstallsNothing && toolingSilentWhenSatisfied
+    && nixosResolvesToPackage && systemManagerResolvesToPackage
+    && darwinResolvesToNothingAndSaysSo && darwinDeclaredNullNotMissing
+    && unavailableWarningNamesOption;
 }

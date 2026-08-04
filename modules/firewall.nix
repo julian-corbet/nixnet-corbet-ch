@@ -28,12 +28,25 @@
 let
   cfg = config.nixnet.firewall;
   rs = import ../lib/ruleset.nix { inherit lib; };
+  tl = import ../lib/tooling.nix { inherit lib; };
 
   # Same backend detection core.nix uses, for the same reason: system-manager has NO
   # `networking.nftables` at all (its whole networking surface is `networking.enableIPv6` and a
   # `networking.firewall` MOCK that accepts the full NixOS schema, warns, and touches nothing).
-  # Detected through system-manager's own option namespace, which never exists under real NixOS.
-  isSystemManager = options ? system-manager;
+  # Detected through system-manager's own option namespace, which never exists under real NixOS —
+  # now via lib/tooling.nix's `backendOf`, which is the same test generalised to all three
+  # backends, so this module and the tooling catalogue can never disagree about which one it is on.
+  isSystemManager = tl.backendOf options == "system-manager";
+
+  # ── The tools this host needs to READ what this module makes it enforce ─────────────────────
+  #
+  # Motivated by a real failure, not by tidiness: a host was enforcing a nixnet-authored `inet`
+  # table with no `nft` installed at all. Enforcement never needed it — `applyScript` loads the
+  # ruleset from a store path — so nothing broke and nothing warned; only every attempt to LOOK at
+  # the firewall did, and the workaround was to fetch nftables over a network the firewall is a
+  # candidate cause of having lost. lib/tooling.nix owns the per-backend naming, including the
+  # backend that has no answer.
+  tooling = tl.resolve { inherit pkgs options; names = cfg.tooling; };
 
   # ── The facts, read from wherever nixnet already declares them ──────────────────────────────
   #
@@ -631,6 +644,31 @@ in
       };
     };
 
+    tooling = lib.mkOption {
+      type = lib.types.listOf (lib.types.enum (lib.attrNames tl.tools));
+      default = [ "nft" ];
+      description = ''
+        Tools for INSPECTING the ruleset this module enforces, installed onto the host.
+
+        Defaults to `[ "nft" ]`, and the default is the behaviour: a host that enforces an
+        nftables ruleset must be able to look at one. Found in production the other way round — a
+        host enforcing a nixnet table with no `nft` on it anywhere, because applying the ruleset
+        reads it from a store path and therefore never needed the binary. Nothing failed; every
+        diagnosis did, and the only way to ask the host a question about its own firewall was to
+        fetch the tool over the network the firewall may be the reason you cannot use.
+
+        Set to `[ ]` to opt out — appropriate where the distro already ships `nft` and a second
+        copy on PATH is not wanted. Unknown names are an evaluation error rather than a silent
+        no-op.
+
+        Resolution is per BACKEND (lib/tooling.nix). On NixOS and on system-manager this is a
+        nixpkgs build added to `environment.systemPackages`; system-manager does not drive the
+        distro's package manager, so a nixpkgs build placed on PATH is the answer there rather than
+        a pacman/apt package. On nix-darwin there is NO nftables — macOS filters with pf — and the
+        selection is reported as unsatisfiable in `warnings` instead of installing nothing quietly.
+      '';
+    };
+
     ruleset = lib.mkOption {
       type = lib.types.lines;
       readOnly = true;
@@ -858,9 +896,24 @@ in
               nixnet.firewall: this host advertises overlay routes and enables a drop-policy forward
               chain, but nixnet.overlay.overlayInterface is null, so the routed overlay accepts
               could not be derived. Routed traffic will be dropped by this chain.
-            '';
+            ''
+          # A selection this backend cannot satisfy is SAID, never silently dropped. Same reasoning
+          # as the tool catalogue's own `null`: "installed nothing because there is nothing to
+          # install" and "installed nothing" are the same observation from outside unless one of
+          # them speaks.
+          ++ lib.optional (tooling.unavailable != [ ])
+            (tl.unavailableWarning {
+              option = "nixnet.firewall.tooling";
+              inherit (tooling) backend unavailable;
+            });
 
-        environment.systemPackages = lib.optionals cfg.autoRevert.enable [ confirm ];
+        # `environment.systemPackages` is the SAME option name on both Linux backends -- NixOS
+        # links it into the system profile, system-manager buildEnv's it into
+        # /run/system-manager/sw and puts that on PATH -- so the install site needs no backend
+        # branch at all. What needed one is the package NAME, and that lives in lib/tooling.nix.
+        environment.systemPackages =
+          lib.optionals cfg.autoRevert.enable [ confirm ]
+          ++ tooling.packages;
 
         systemd.services.nixnet-firewall-revert = lib.mkIf cfg.autoRevert.enable {
           description = "nixnet: restore the previous ruleset (confirmation window expired)";

@@ -154,6 +154,22 @@ host on the default spent every boot unfirewalled from the window's expiry until
 Not: this is not remote-lockout protection for an unattended deploy. That is the deploy layer's rollback, and
 conflating the two produced the bug above.
 
+### FW-6 — a host that enforces a ruleset can read it
+**GIVEN** a host where `nixnet.firewall` or `nixnet.overlay` is enabled, on a backend that has nftables, **THEN**
+`nft` is installed on that host; **GIVEN** a backend that does not have it — nix-darwin, where the kernel filters
+with pf — **THEN** evaluation SAYS the selection is unsatisfiable instead of installing nothing.
+
+Why: found in production. A host was enforcing a nixnet-authored `inet` table with no `nft` on it anywhere.
+Nothing failed and nothing warned, because applying a ruleset never needs the binary — it loads from a store
+path. Every question about the ruleset needs it, and the answer mid-incident was to fetch nftables over the
+network the firewall is a candidate cause of having lost. Enforcing a policy you cannot read is the same
+blindness `FW-3` names from the other side: there, the host could not tell you the apply failed; here, it cannot
+tell you what it applied.
+
+Not: not a diagnostic toolbox. One tool, the one that reads the thing this repo wrote, selected by name and
+removable with `tooling = [ ]` on a host whose distro already ships it. And never a substitute for the rendered
+`ruleset` option — that is readable from the build host, which is where you look when the host is unreachable.
+
 ## Transport failover — winners, publication, demotion
 ### TF-1 — the winner is deterministic and damped
 **GIVEN** a subject with N priority-ordered transports in mixed health, **THEN** the winner is the lowest
