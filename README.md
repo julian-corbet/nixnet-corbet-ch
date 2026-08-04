@@ -317,6 +317,164 @@ group/policy names):
   raised anywhere. This is exactly "a policy referencing a group that
   does not exist" — always rename in place.
 
+## The firewall — one owner, derived rules
+
+`nixnet.firewall` (`modules/firewall.nix`, generator in `lib/ruleset.nix`)
+renders and applies this host's nftables ruleset: a default-deny input
+chain, an optional forward chain, no egress filtering. It is imported by
+`modules/core.nix` rather than offered as a separate module, and that is
+the whole design.
+
+**Why it lives here.** It used to be its own repo. A firewall repo cannot
+know how the host gets its address, so a default-drop input chain dropped
+the DHCP RENEW leg on a DHCP-addressed edge host. The initial DISCOVER
+goes out over AF_PACKET and never traverses netfilter, so the box came up
+addressed and looked healthy; the lease expired ~21h later and the host
+went dark with symptoms naming DNS, the metadata service and the overlay —
+everything except the firewall, because the change and the outage were
+most of a day apart. The missing rule is one line and nobody forgot it:
+the repo that rendered the ruleset had no way to see the fact that
+motivates it.
+
+So rules **derive from declared facts**, and each derived rule names its
+fact in the ruleset itself:
+
+- **DHCP client accepts** ← `nixnet.interfaces.<i>.addressing.v4 = "dhcp"`
+  (or `.v6`). A statically-addressed host does not carry them; a
+  SLAAC-addressed one gets no DHCPv6 accept either, because router
+  advertisements are ICMPv6, which the preamble already accepts. The
+  declaration also says *which* interface renews, so the accept is scoped
+  to it. Client direction only — accepting `dport 67` would quietly make
+  every DHCP-addressed host reachable as a DHCP *server*.
+- **Overlay confinement CIDRs** ← the octet band already declared in
+  `nixnet.netbirdGroupReconcile.bands`, plus
+  `nixnet.firewall.overlayConfinement.network` (the overlay's own /24 —
+  address space, not a boundary). The confined band defaults to
+  `excludeFromCatchAll.forBand`, the one the account already treats as
+  least-trust. The band is computed into exact CIDRs (an unaligned band
+  `3-9` renders `.3/32, .4/30, .8/31`, never a prefix that swallows
+  addresses nobody put in it) and published into
+  `nixnet.overlay.confineExternalRanges` as a default. Hand-writing the
+  same boundary twice is how the two quietly stop matching, and the
+  direction that fails is silent: a prefix narrower than the band leaves
+  the peers outside it unconfined with every rule still present.
+- **Forward accepts for the routed overlay path** ←
+  `nixnet.overlay.advertiseRoutes`. Every base chain at a hook sees the
+  packet and **any** chain's drop is final, so a drop-policy forward chain
+  in nixnet's table overrides the accepts the overlay module's own table
+  (and NetBird) rely on. On a routing peer those accepts are derived
+  rather than remembered.
+
+**What fails at evaluation, on the build host:**
+
+- a default-deny ruleset with neither `management.interfaces` nor
+  `trustedInterfaces` — the config that builds, activates, reports
+  success and strands a machine reachable only over the interface nobody
+  named;
+- an interface named in any rule that is not in `nixnet.interfaces` (a
+  misspelled interface matches nothing and fails **open**, silently, with
+  the rule still sitting there looking correct);
+- an interface whose `addressing` leaves a family unset — `unmanaged` is a
+  real answer and a different one from silence;
+- `forward.rules` without `forward.enable`, and a rule with neither
+  `ports` nor `portRanges`;
+- `nixnet.firewall.table` colliding with the table `nixnet.overlay`
+  renders into (both replace their table with `add; delete; define`, so
+  the one that applies second deletes the other's chains — leaving either
+  no input policy or no overlay confinement, both units green);
+- `nixnet.overlay.confineExternalRanges` not covering the derived band;
+- `networking.firewall`/`networking.nftables` left enabled alongside this
+  one — two default-drop input chains at one hook intersect rather than
+  combine, and neither configuration looks wrong on its own.
+
+**Guards that are not negotiable:**
+
+- **Never `flush ruleset`.** The ruleset replaces exactly one table with
+  `add; delete; define`, and turning the module off deletes that one table
+  and nothing else. This is also why the module owns its apply unit
+  instead of handing the text to `networking.nftables`: that module
+  defaults `flushRuleset` to true whenever it is given a raw ruleset and
+  concatenates the `flush ruleset` into the same transaction, which would
+  wipe k3s, docker, podman, libvirt and nixnet's own overlay table off the
+  host on every apply.
+- **Management interfaces first**, before the host's own rules and not
+  overridable by them.
+- **A failed apply is not a host with no firewall.** The apply unit runs
+  under `set -eu` with no `|| true` anywhere, so the loader's exit status
+  *is* the signal; the load is one `nft -f` transaction, so a failure
+  leaves the previous ruleset byte-identical; and a *finished* apply with
+  nixnet's table absent exits non-zero rather than reporting success — the
+  state a production host was found in, from a serial console, with
+  nothing on the host saying so. The unit deliberately has **no
+  `ExecStop`**: a changed ruleset makes the switch stop-and-start it, and
+  a teardown-on-stop would delete the firewall *before* trying to load its
+  replacement, turning a bad ruleset into an open host.
+- **Dead-man switch** (`autoRevert`, on by default): snapshot our table,
+  arm a timer, restore unless `nixnet-firewall-confirm` runs. It arms on a
+  ruleset **change**, never on a boot — arming every boot meant the timer
+  fired on every headless boot, nobody typed the confirmation, and the
+  revert (with no prior table to restore) deleted the firewall outright.
+- **Silent drops** for traffic that is dropped anyway: on the host this
+  generalises, 66% of kernel log lines were the firewall logging ordinary
+  LAN broadcast housekeeping — the noise that hid a real WireGuard drop.
+
+**Two tables, one host.** On a routing peer nixnet writes two nftables
+tables: this one (host policy) and `nixnet.overlay`'s (the overlay
+mechanism's confinement and source-NAT). That remains two writers — the
+firewall derives the confinement and asserts the two agree, it does not
+render the overlay's rules into its own table. The overlay's table name is
+read out of the text that module will actually load, not hardcoded, so
+renaming it there cannot silently stop the collision check from matching.
+
+**Both planes, one text, one unit.** `nixnet.firewall.ruleset` is
+read-only and rendered even when `enable` is false, so `nix eval` shows
+exactly what a host would load before it loads it. It is written to the
+store and copied to `/etc/nftables/nixnet.nft` for reading, and
+`nixnet-firewall.service` — same name on NixOS and on `system-manager` —
+loads the **store path**, so the unit's own text moves whenever a rule
+does. That is the only diff either delivery engine acts on:
+`system-manager` restarts a unit when the unit's store path changes and
+has no "a file this unit reads changed" notion at all, and it has no
+`networking.nftables` either (its `networking.firewall` is a mock that
+accepts the whole NixOS schema, warns, and touches nothing — for a
+firewall, silent success is the worst failure mode there is).
+
+`nixnet.firewall.enable = false` does not mean *absent*: the unit still
+runs, and its job becomes asserting nixnet's table is gone, so a
+generation that turns the firewall off cannot leave the previous one's
+rules in the kernel. On NixOS, `networking.firewall.enable = false` is
+required and asserted.
+
+```nix
+networking.firewall.enable = false;   # nixnet owns the input chain now
+
+nixnet.interfaces = {
+  wt0.addressing  = { v4 = "static"; v6 = "none"; };  # overlay tunnel
+  eth0.addressing = { v4 = "dhcp";   v6 = "slaac"; }; # DHCP: earns the renewal accepts
+};
+
+nixnet.firewall = {
+  enable = true;
+  management.interfaces = [ "wt0" ];   # the way back in, never removable
+  allow = [
+    { protocol = "tcp"; ports = [ 80 443 ]; comment = "public web"; }
+    { protocol = "udp"; portRanges = [{ from = 49160; to = 49360; }];
+      sourcesV4 = [ "192.0.2.0/24" ]; comment = "turn relay"; }
+  ];
+  silentDrops = [ { match = "udp dport 5355"; comment = "LLMNR"; } ];
+};
+```
+
+`experiments/render-check.nix` is the eval-time check for all of it —
+real NixOS evaluations, both directions on every derivation (a
+declared-DHCP host **gets** the accepts, a static host **does not**) and
+every refusal asserted by the message it must produce, not just by a
+count:
+
+```
+nix-instantiate --eval --strict experiments/render-check.nix -A ok
+```
+
 ## Options reference
 
 `nixnet.*` (`modules/core.nix`):
@@ -351,6 +509,15 @@ group/policy names):
   question as peers').
 - `uplinks.<name>.publish.routeMetric` (default `true`),
   `.metricBase` (default `100`), `.metricStep` (default `10`).
+- `interfaces.<name>.addressing.v4` / `.v6` (default `null` on both) — how
+  this interface gets its address: `static`, `dhcp`, `slaac` (v6 only),
+  `none`, `unmanaged`. Declared in `modules/firewall.nix`, which extends
+  this same submodule, because it is the fact the DHCP client accepts
+  derive from (see [The firewall](#the-firewall--one-owner-derived-rules)).
+  `null` means *nobody said*, deliberately not the same state as
+  `unmanaged` (*somebody said this is not nixnet's*). nixnet never
+  configures addressing — it records how addressing happens so everything
+  downstream derives from it.
 - `interfaces.<name>.mac` (default `null`), `.addresses` (an attrset keyed
   by role, e.g. `{ lan = "192.0.2.10"; }`, default `{ }`) — a FACT table
   of this host's own NICs, independent of `peers`/`uplinks` (which pick a
@@ -387,6 +554,45 @@ The shared **transport** type (`peers.<name>.transports[]` and
   (not a bare path — see `docs/providers.md`'s deviation note), argv[0]
   already an absolute Nix store path. Run with no shell involved, every
   tick, per the [provider contract](docs/providers.md).
+
+`nixnet.firewall.*` (`modules/firewall.nix`) — see
+[The firewall](#the-firewall--one-owner-derived-rules) for the failures
+each of these exists to prevent:
+
+- `enable` — render and apply the ruleset. Off by default, and off means
+  the table is asserted **absent** rather than unmentioned: the apply unit
+  exists either way (one oneshot per boot), so no host carries a previous
+  generation's rules. The assertions below only apply when it is on.
+- `table` (default `"nixnet"`) — the one `inet` table this module owns.
+  Never flushed, never shared; asserted not to collide with the table
+  `nixnet.overlay` renders into.
+- `management.interfaces` (default `[ ]`) — interfaces that ALWAYS keep
+  the management port open, emitted before the host's own rules and not
+  overridable by them. `management.port` (default `22`),
+  `management.rateLimitNew` (default `null`; an nftables `limit rate`
+  expression such as `"6/minute"`, which replaces the unconditional accept
+  with a rate-limited accept plus an explicit drop).
+- `trustedInterfaces` (default `[ ]`) — accept ALL inbound traffic on
+  these. A much bigger grant than `management.interfaces`, which opens
+  exactly one port.
+- `allow` — accept rules: `protocol` (`tcp`/`udp`), `ports`, `portRanges`
+  (`{ from; to; }`, mixes freely with `ports` in one nftables set),
+  `sourcesV4`/`sourcesV6` (empty means ANY — a real choice, not a default
+  to reach for), `interface`, `comment` (rendered into the ruleset, which
+  is what a future reader debugs from).
+- `silentDrops` — `{ match; comment; }` pairs dropped without logging.
+- `forward.enable` (default `false`) / `forward.rules` — a forward chain,
+  off by default because any base chain's drop is final across all tables.
+  On a routing peer the overlay path is accepted automatically.
+- `overlayConfinement.network` (default `null`) — the overlay's own /24;
+  set it to derive `nixnet.overlay.confineExternalRanges` from the
+  declared octet band. `overlayConfinement.band` (default: the band in
+  `excludeFromCatchAll.forBand`), `overlayConfinement.ranges` (read-only,
+  the derived CIDRs — `nix eval` it).
+- `autoRevert.enable` (default `true`) / `.seconds` (default `120`) — the
+  dead-man switch, armed on a ruleset change and disarmed by running
+  `nixnet-firewall-confirm`.
+- `ruleset` — read-only, the exact text both planes apply.
 
 `nixnet.netbird.*` (`modules/netbird-provider.nix`) — see
 [Quickstart](#quickstart) for a worked example and the module's own

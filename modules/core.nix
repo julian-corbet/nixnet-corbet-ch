@@ -527,6 +527,17 @@ let
 
 in
 {
+  # The packet filter is part of this host's network reality, not a neighbouring concern, so it is
+  # imported here rather than offered as an opt-in module: a firewall that could be left out is a
+  # firewall that can be evaluated without the facts it derives from. It reads `nixnet.interfaces`
+  # (declared below) and extends that same submodule with the per-family `addressing` fact -- the
+  # fact whose absence, in a separate repo, cost a DHCP-addressed edge host most of a day.
+  #
+  # Until `nixnet.firewall.enable` this costs exactly one oneshot unit per boot, whose job while
+  # disabled is to assert nixnet's nftables table is ABSENT -- so a host that turns the firewall
+  # off is never left carrying the previous generation's rules in the kernel.
+  imports = [ ./firewall.nix ];
+
   options.nixnet = {
     enable = mkEnableOption "nixnet transport failover (peer + uplink health-checked publish)";
 

@@ -1,0 +1,929 @@
+# modules/firewall.nix
+#
+# nixnet.firewall — this host's packet filter, in the repo that owns the rest of the host's network
+# reality. It lived in a repo of its own; this is it folded back in, and the fold is the point.
+#
+# WHY ONE OWNER. A firewall repo cannot know how the host gets its address. So its default-drop
+# input chain dropped the DHCP RENEW leg on a DHCP-addressed edge host, the lease expired ~21h
+# later, and the box went dark with symptoms naming DNS, the metadata service and the overlay —
+# everything except the firewall, because the firewall change and the outage were most of a day
+# apart. The rule that was missing is one line long and nobody forgot it: the repo that rendered
+# the ruleset had no way to see the fact that motivates it.
+#
+# So rules here DERIVE from facts nixnet already holds, and every derivation names the fact:
+#   - the DHCP client accepts exist because an interface DECLARES `addressing.v4/v6 = "dhcp"`
+#     (`nixnet.interfaces.<i>`, this file extends that same fact table with the addressing field);
+#     a statically-addressed host does not carry them, and the accept is scoped to the interface
+#     that renews.
+#   - the overlay confinement CIDRs are computed from the trust BAND the operator already declares
+#     for group reconciliation, instead of being a second, hand-written statement of the same
+#     boundary that can quietly stop matching it.
+#   - a routing peer's forward accepts are computed from `nixnet.overlay.advertiseRoutes`.
+#
+# IMPORTED BY core.nix, not standalone: it reads `nixnet.interfaces`, which core declares. One
+# import, one evaluation, one place where "this host is DHCP-addressed" and "this host drops
+# unmatched input" meet.
+{ lib, config, options, pkgs, ... }:
+
+let
+  cfg = config.nixnet.firewall;
+  rs = import ../lib/ruleset.nix { inherit lib; };
+
+  # Same backend detection core.nix uses, for the same reason: system-manager has NO
+  # `networking.nftables` at all (its whole networking surface is `networking.enableIPv6` and a
+  # `networking.firewall` MOCK that accepts the full NixOS schema, warns, and touches nothing).
+  # Detected through system-manager's own option namespace, which never exists under real NixOS.
+  isSystemManager = options ? system-manager;
+
+  # ── The facts, read from wherever nixnet already declares them ──────────────────────────────
+  #
+  # Sibling modules are read defensively (`or`), the same idiom netbird-access-model.nix uses:
+  # `config.nixnet.overlay` does not exist as an option at all when that module was never
+  # imported, and `or` catches the failure anywhere along the path. `config.nixnet.interfaces` is
+  # NOT read that way — core.nix imports this file, so the fact table is always there, and a
+  # defensive read would only hide a broken import.
+  interfaces = config.nixnet.interfaces;
+
+  overlayCfg = config.nixnet.overlay or {
+    enable = false;
+    advertiseRoutes = [ ];
+    confineExternalRanges = [ ];
+    overlayInterface = null;
+    ruleset = "";
+  };
+
+  groupReconcileCfg = config.nixnet.netbirdGroupReconcile or {
+    bands = [ ];
+    excludeFromCatchAll.forBand = null;
+  };
+
+  # ── DERIVATION 1: DHCP client accepts ───────────────────────────────────────────────────────
+  dhcpV4Interfaces = lib.attrNames (lib.filterAttrs (_: i: i.addressing.v4 == "dhcp") interfaces);
+  dhcpV6Interfaces = lib.attrNames (lib.filterAttrs (_: i: i.addressing.v6 == "dhcp") interfaces);
+
+  # ── DERIVATION 2: overlay confinement ranges ────────────────────────────────────────────────
+  #
+  # The operator declares the trust boundary ONCE, as an octet band, because that is the form
+  # group membership is reconciled from (`nixnet.netbirdGroupReconcile.bands`: a peer whose overlay
+  # address ends in that range lands in that group). The confinement then needs the same boundary
+  # as a CIDR — and writing it out by hand is a second statement of one fact, which is a fact that
+  # can disagree with itself. Here it is computed; the only thing declared additionally is the
+  # overlay's own /24, which is address space, not a boundary.
+  confinement = cfg.overlayConfinement;
+  confinementActive = confinement.network != null;
+
+  # The band scheme keys off the LAST octet, so the network it lives in has to be a /24. Anything
+  # else means the two declarations are not describing the same address space at all.
+  networkMatch =
+    if confinement.network == null then null
+    else builtins.match "([0-9]+\\.[0-9]+\\.[0-9]+)\\.0/24" confinement.network;
+  networkBase = if networkMatch == null then null else lib.head networkMatch;
+
+  # Defaults to the band already singled out as least-trust: `excludeFromCatchAll.forBand` is the
+  # band whose members join ONLY their own group and never the catch-all — i.e. the one the account
+  # already treats as external. Naming it a second time here is optional, not required.
+  confinedBandName =
+    if confinement.band != null then confinement.band
+    else groupReconcileCfg.excludeFromCatchAll.forBand or null;
+
+  confinedBands = lib.filter (b: b.name == confinedBandName) (groupReconcileCfg.bands or [ ]);
+
+  derivedConfinementRanges =
+    if !confinementActive || networkBase == null then [ ]
+    else lib.concatMap (b: rs.octetRangeToCidrs networkBase b.min b.max) confinedBands;
+
+  # ── DERIVATION 3: the routed overlay path ───────────────────────────────────────────────────
+  # A routing peer forwards between the overlay interface and the LAN it advertises. Whether this
+  # host is one is already declared: `nixnet.overlay.advertiseRoutes`.
+  isRoutingPeer = (overlayCfg.enable or false) && (overlayCfg.advertiseRoutes or [ ]) != [ ];
+  overlayInterface = overlayCfg.overlayInterface or null;
+
+  routedOverlayForwardLines =
+    lib.optionals (cfg.forward.enable && isRoutingPeer && overlayInterface != null)
+      (rs.forwardInterfaceLines overlayInterface
+        "routed overlay path, derived from nixnet.overlay.advertiseRoutes");
+
+  # ── The other table ─────────────────────────────────────────────────────────────────────────
+  #
+  # nixnet.overlay writes an nftables table of its OWN (its confinement and source-NAT are the
+  # overlay mechanism's requirements, not host policy), so on a routing peer two nixnet-authored
+  # tables hook the same packet path. Its table name is read out of the text it will actually load
+  # rather than hardcoded here, so renaming it there cannot silently stop this check from matching.
+  overlayTableNames =
+    let lines = lib.splitString "\n" (overlayCfg.ruleset or "");
+    in map (l: lib.elemAt (lib.splitString " " (lib.strings.trim l)) 2)
+      (lib.filter (l: lib.hasPrefix "table inet " (lib.strings.trim l)) lines);
+
+  # ── Interfaces this firewall names ──────────────────────────────────────────────────────────
+  # Including the DERIVED one: a rule that names an interface this host never declared fails open
+  # exactly the same way whether a human typed the name or a derivation produced it.
+  namedInterfaces = lib.unique (
+    cfg.management.interfaces
+    ++ cfg.trustedInterfaces
+    ++ (lib.filter (i: i != null) (map (r: r.interface) (cfg.allow ++ cfg.forward.rules)))
+    ++ (lib.optional (routedOverlayForwardLines != [ ]) overlayInterface)
+  );
+
+  undeclaredInterfaces = lib.filter (n: !(interfaces ? ${n})) namedInterfaces;
+  addressinglessInterfaces = lib.filter
+    (n: (interfaces ? ${n})
+      && (interfaces.${n}.addressing.v4 == null || interfaces.${n}.addressing.v6 == null))
+    namedInterfaces;
+
+  # ── Rendering ───────────────────────────────────────────────────────────────────────────────
+  indent = n: lines:
+    lib.concatStringsSep "\n"
+      (map (l: if l == "" then "" else "${lib.strings.replicate n " "}${l}") lines);
+
+  # max 0: a title longer than the rule width would otherwise make replicate throw on a negative
+  # count — a crash in a comment renderer, which is a silly way to fail a firewall build.
+  section = title: lines:
+    let pad = lib.strings.replicate (lib.max 0 (68 - lib.stringLength title)) "-"; in
+    lib.optionalString (lines != [ ])
+      "\n    # -- ${title} ${pad}\n${indent 4 lines}\n";
+
+  forwardChain = lib.optionalString cfg.forward.enable ''
+
+      chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state established,related accept
+    ${indent 4 (routedOverlayForwardLines ++ lib.concatMap rs.ruleLines cfg.forward.rules)}
+      }'';
+
+  rulesetText = ''
+    # Generated by nixnet's firewall module. Do not edit — edit the host's nixnet.firewall.* options.
+    #
+    # NOTE the add-then-delete-then-define idiom below. It replaces ONLY this table, atomically,
+    # and never issues `flush ruleset`: other tables on this host belong to k3s, docker, podman,
+    # libvirt (all of which write chains via iptables-nft) and to nixnet's own overlay module, and
+    # flushing would delete them without a word. `add` first is what makes `delete` safe when the
+    # table does not exist yet — deleting a missing table is an error that would abort the whole
+    # transaction.
+    table inet ${cfg.table}
+    delete table inet ${cfg.table}
+
+    table inet ${cfg.table} {
+      chain input {
+        type filter hook input priority filter; policy drop;
+
+    ${indent 4 rs.preambleLines}
+    ${section "DHCP client — derived from nixnet.interfaces.*.addressing" (rs.dhcpClientLines { v4Interfaces = dhcpV4Interfaces; v6Interfaces = dhcpV6Interfaces; })}${section "management — generated first, not overridable by host rules" (rs.managementLines cfg)}${section "trusted interfaces" (map (i: "iifname \"${i}\" accept  # nixnet: trusted interface") cfg.trustedInterfaces)}${section "silent drops (dropped anyway; kept out of the kernel log)" (rs.silentDropLines cfg.silentDrops)}${section "host rules" (lib.concatMap rs.ruleLines cfg.allow)}  }
+    ${forwardChain}
+      # No output chain: nixnet does not filter egress. A host that needs it should say so
+      # explicitly rather than inherit it as a side effect of enabling a firewall.
+    }
+  '';
+
+  rulesetHash = builtins.hashString "sha256" cfg.ruleset;
+
+  # ── Dead-man switch ─────────────────────────────────────────────────────────────────────────
+  stateDir = "/var/lib/nixnet-firewall";
+  pendingFile = "${stateDir}/pending.nft";
+  appliedHashFile = "${stateDir}/applied-hash";
+
+  confirm = pkgs.writeShellApplication {
+    name = "nixnet-firewall-confirm";
+    runtimeInputs = [ pkgs.systemd ];
+    text = ''
+      # Disarm the revert timer. Run this once you have confirmed you still have a working
+      # connection THROUGH the new ruleset — ideally from a SECOND session, not the one you already
+      # had open, since an established connection survives rules that would refuse a new one.
+      systemctl stop nixnet-firewall-revert.timer 2>/dev/null || true
+      rm -f ${pendingFile}
+      echo "nixnet: ruleset confirmed; auto-revert disarmed."
+    '';
+  };
+
+  revertScript = pkgs.writeShellScript "nixnet-firewall-revert" ''
+    if [ -f ${pendingFile} ]; then
+      echo "nixnet: confirmation window expired — restoring the previous ruleset."
+      ${pkgs.nftables}/bin/nft -f ${pendingFile}
+      rm -f ${pendingFile}
+    fi
+  '';
+
+  # Snapshot OUR TABLE ONLY, never `nft list ruleset`. A full dump would restore every table on the
+  # host — so a revert firing after docker, k3s or the overlay module legitimately changed their
+  # own tables during the confirmation window would stomp those changes too. Same own-table
+  # discipline the apply path enforces.
+  #
+  # One script for both planes, and it ARMS THE TIMER ITSELF rather than leaving that to whatever
+  # wants the timer unit: arming is the thing that must happen only on a real change, so it belongs
+  # next to the comparison that decides that.
+  snapshotScript = pkgs.writeShellScript "nixnet-firewall-snapshot" ''
+    mkdir -p ${stateDir}
+    chmod 0700 ${stateDir}
+
+    # ── ARM ONLY ON A REAL CHANGE ──────────────────────────────────────────────────────────────
+    # The dead-man switch exists to protect the moment an operator applies a NEW ruleset and might
+    # lock themselves out. A plain reboot is not that moment, and arming there is actively harmful:
+    # the confirmation has to be typed by a human, nobody types it on a headless box, so the timer
+    # fired on EVERY boot and the "revert" deleted the firewall outright (with no prior table, the
+    # restore file is just `add table; delete table`). A CI-deployed host therefore spent every
+    # boot running with no firewall at all, from ~`seconds` in until the next reboot. Found in
+    # production; every unattended host on the default was exposed.
+    #
+    # Remote-lockout protection for an unattended deploy is the deploy layer's rollback, not this
+    # timer's. This switch covers exactly what it can: a ruleset that differs from the last one
+    # applied on this box.
+    if [ -f ${appliedHashFile} ] && [ "$(cat ${appliedHashFile})" = "${rulesetHash}" ]; then
+      rm -f ${pendingFile}
+      echo "nixnet: ruleset unchanged since last apply — not arming auto-revert."
+      exit 0
+    fi
+
+    if ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
+      { echo "table inet ${cfg.table}"; echo "delete table inet ${cfg.table}"; \
+        ${pkgs.nftables}/bin/nft list table inet ${cfg.table}; } > ${pendingFile}
+    else
+      # No prior table: reverting means removing ours entirely, not restoring nothing.
+      { echo "table inet ${cfg.table}"; echo "delete table inet ${cfg.table}"; } > ${pendingFile}
+    fi
+
+    # Recorded BEFORE the countdown, not on confirmation. If the revert does fire, the next boot
+    # must load this ruleset and LEAVE it alone rather than re-arming and re-reverting forever —
+    # one unconfirmed window per change, not one per boot.
+    printf %s "${rulesetHash}" > ${appliedHashFile}
+
+    # --no-block: on the NixOS plane this runs from a unit ordered before nftables.service, and a
+    # blocking start would have systemd waiting on a job we are ourselves in the middle of.
+    ${pkgs.systemd}/bin/systemctl --no-block start nixnet-firewall-revert.timer
+  '';
+
+  # ── The apply path ──────────────────────────────────────────────────────────────────────────
+  #
+  # The ruleset goes into the store, and the apply unit names that store path. So the unit's own
+  # text moves whenever a rule moves, which is the ONLY diff both delivery engines act on:
+  # system-manager restarts a unit when the unit's store path changes and has no "a file this unit
+  # reads changed" notion at all, and NixOS' switch compares unit files the same way. A unit
+  # pointing at a fixed /etc path would sit inert with a changed ruleset until the next reboot.
+  rulesetFile = pkgs.writeText "nixnet-firewall.nft" cfg.ruleset;
+
+  # `set -eu`, and no `|| true` anywhere: FW-3. The loader's exit status IS the signal, and a
+  # swallowed one is how a production host came to be running with no packet filter at all,
+  # discovered from a serial console rather than from anything the host said.
+  applyScript = pkgs.writeShellScript "nixnet-firewall-apply" ''
+    set -eu
+    ${lib.optionalString cfg.autoRevert.enable "${snapshotScript}"}
+    ${pkgs.nftables}/bin/nft -f ${rulesetFile}
+
+    # The other half a loader cannot report: a unit that FINISHED while nixnet's table is not
+    # present. Presence is checkable, so check it — a green apply unit over an absent firewall is
+    # exactly the state that went unnoticed.
+    if ! ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
+      echo "nixnet: table inet ${cfg.table} is NOT present after a successful load — refusing to report success." >&2
+      exit 1
+    fi
+  '';
+
+  # What the unit does when the firewall is DISABLED — it still runs. `enable = false` has to mean
+  # the table is gone, not "nixnet stopped talking about it": a host that turns the firewall off in
+  # one generation would otherwise keep the previous generation's rules in the kernel until reboot,
+  # with nothing declarative left that even mentions them.
+  #
+  # add-then-delete, because deleting a table that does not exist is an error, and this runs on
+  # every host that has never had one.
+  teardownScript = pkgs.writeShellScript "nixnet-firewall-teardown" ''
+    set -eu
+    ${pkgs.nftables}/bin/nft "add table inet ${cfg.table}; delete table inet ${cfg.table}"
+    if ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
+      echo "nixnet: table inet ${cfg.table} is still present after teardown." >&2
+      exit 1
+    fi
+  '';
+
+  # ONE unit name on both planes, and NO ExecStop. Both are load-bearing:
+  #
+  #   * one name, because the observable "did this host's firewall apply?" must be the same
+  #     question everywhere — `systemctl is-failed nixnet-firewall.service` on a NixOS box and on a
+  #     foreign distro alike.
+  #   * no ExecStop, because a changed ruleset makes the switch stop-and-start this unit. An
+  #     ExecStop that deleted the table would tear the firewall down BEFORE trying to load the new
+  #     one, so a ruleset that fails to load would leave the host with nothing instead of with the
+  #     previous ruleset. The load is one `nft -f` transaction; failing it changes nothing, and
+  #     that property is worth more than a tidy stop.
+  #
+  # Delegating to nixpkgs' `networking.nftables` was the obvious alternative and is wrong twice
+  # over: its `flushRuleset` is mkDefault TRUE whenever a raw ruleset is set and it concatenates
+  # that `flush ruleset` into the same transaction — wiping k3s, docker, podman, libvirt and
+  # nixnet's own overlay table off the host on every apply — and it reloads rather than restarts on
+  # change, where a failed `ExecReload` leaves the unit ACTIVE and SUCCESSFUL (measured: systemd
+  # marks the job failed, not the unit). A firewall that failed to apply and reports success is the
+  # exact failure this repo is being rebuilt around.
+  applyUnit =
+    {
+      description =
+        if cfg.enable
+        then "nixnet: apply the host packet filter (table inet ${cfg.table})"
+        else "nixnet: assert nixnet's packet-filter table is absent";
+      wantedBy = [ (if isSystemManager then "system-manager.target" else "multi-user.target") ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${if cfg.enable then applyScript else teardownScript}";
+      };
+    }
+    // lib.optionalAttrs (!isSystemManager) {
+      # Same ordering nixpkgs' own nftables unit uses: the filter is in force before anything
+      # brings an interface up, and it is not subject to the default dependency web that would
+      # order it after the network it is supposed to precede.
+      after = [ "sysinit.target" ];
+      before = [ "network-pre.target" "shutdown.target" ];
+      wants = [ "network-pre.target" ];
+      conflicts = [ "shutdown.target" ];
+      unitConfig.DefaultDependencies = false;
+    };
+
+  ruleType = lib.types.submodule {
+    options = {
+      protocol = lib.mkOption {
+        type = lib.types.enum [ "tcp" "udp" ];
+        default = "tcp";
+        description = "Transport protocol this rule matches.";
+      };
+      ports = lib.mkOption {
+        type = lib.types.listOf lib.types.port;
+        default = [ ];
+        description = "Discrete destination ports. Rendered as an nftables set alongside `portRanges` when there is more than one entry total.";
+      };
+      portRanges = lib.mkOption {
+        type = lib.types.listOf (lib.types.submodule {
+          options = {
+            from = lib.mkOption { type = lib.types.port; description = "First port, inclusive."; };
+            to = lib.mkOption { type = lib.types.port; description = "Last port, inclusive."; };
+          };
+        });
+        default = [ ];
+        example = [{ from = 49160; to = 49360; }];
+        description = ''
+          Destination port ranges. For a service that needs more than a handful of ports (a TURN
+          relay range, say) — enumerating each one individually in `ports` would work but reads as
+          noise and invites a typo'd gap. Mixes freely with `ports` in the same rule; nftables sets
+          accept discrete values and ranges side by side.
+        '';
+      };
+      sourcesV4 = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "192.0.2.0/24" ];
+        description = ''
+          IPv4 source prefixes. Empty means ANY v4 source — which is a real choice, not a default to
+          reach for absentmindedly. On a host with a public address, an empty list here is the whole
+          internet.
+        '';
+      };
+      sourcesV6 = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "IPv6 source prefixes. Empty means ANY v6 source. Rendered as separate rules — v4 and v6 need different matchers.";
+      };
+      interface = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Restrict to one inbound interface. `null` matches any. A named interface must exist in
+          `nixnet.interfaces` with its addressing declared — a misspelled interface here matches
+          nothing and fails OPEN silently, so it is an eval error instead.
+        '';
+      };
+      comment = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Rendered into the ruleset. Worth writing: `nft list ruleset` is what a future reader debugs from, and an unexplained port is indistinguishable from a mistake.";
+      };
+    };
+  };
+
+  # The addressing fact, per family. Separate enums rather than one shared list: there is no v4
+  # SLAAC, and a type error names the mistake better than an assertion can.
+  addressingType = lib.types.submodule {
+    options = {
+      v4 = lib.mkOption {
+        type = lib.types.nullOr (lib.types.enum [ "static" "dhcp" "none" "unmanaged" ]);
+        default = null;
+        example = "dhcp";
+        description = ''
+          How this interface gets its IPv4 address. `null` (the default) means NOBODY SAID, which is
+          deliberately not the same state as `unmanaged` ("somebody said this is not nixnet's") —
+          collapsing the two is how a fact goes missing without anyone noticing.
+
+          nixnet does not configure addressing: it neither runs a DHCP client nor assigns an
+          address. It records how addressing HAPPENS so everything downstream derives from it —
+          today, the DHCP client accepts in this host's own ruleset, which is the rule that was
+          missing when a firewall repo could not see this fact.
+        '';
+      };
+      v6 = lib.mkOption {
+        type = lib.types.nullOr (lib.types.enum [ "static" "dhcp" "slaac" "none" "unmanaged" ]);
+        default = null;
+        example = "slaac";
+        description = ''
+          How this interface gets its IPv6 address. `dhcp` means DHCPv6 (a client bound on UDP 546)
+          and earns the matching accept; `slaac` needs no accept of its own, because it rides
+          ICMPv6 router advertisements, which the ruleset accepts unconditionally.
+        '';
+      };
+    };
+  };
+
+in
+{
+  # Extends core.nix's interface fact table rather than starting a second one: the module system
+  # merges submodule declarations at the same option path, so `nixnet.interfaces.<name>` ends up
+  # with core's `mac`/`addresses` AND this `addressing` in ONE table. Declared with a TYPE ONLY —
+  # no `description`, `default` or `example` — because a second declaration carrying any of those
+  # is a hard "already declared" error against core's own.
+  options.nixnet.interfaces = lib.mkOption {
+    type = lib.types.attrsOf (lib.types.submodule {
+      options.addressing = lib.mkOption {
+        type = addressingType;
+        default = { };
+        description = ''
+          How this interface is addressed, per family. THE fact the firewall could not see when it
+          lived in its own repo. Declared, never discovered from the running system: nixnet reports
+          a disagreement between this and the kernel, it does not correct one.
+        '';
+      };
+    });
+  };
+
+  options.nixnet.firewall = {
+    enable = lib.mkEnableOption ''
+      the nixnet host firewall (nftables, default-deny input).
+
+      OFF does not mean ABSENT: `nixnet-firewall.service` exists either way, and with this off its
+      job is to assert nixnet's table is gone. A host that turns the firewall off in one generation
+      would otherwise keep the previous generation's rules in the kernel until the next reboot,
+      with nothing declarative left that even mentions them.
+
+      Requires `networking.firewall.enable = false` on NixOS (asserted): two default-drop input
+      chains at one hook intersect rather than combine
+    '';
+
+    table = lib.mkOption {
+      type = lib.types.str;
+      default = "nixnet";
+      description = ''
+        Name of the inet table this module owns. It touches ONLY this table and never issues
+        `flush ruleset`.
+
+        That is not tidiness, it is a hard requirement: k3s, docker, podman and libvirt all write
+        their own chains via iptables-nft, into tables this module does not own — and so does
+        nixnet's own overlay module. A `flush ruleset` on re-apply would silently delete every one
+        of them, container networking and overlay confinement included, and the failure would look
+        like an application outage rather than a firewall change.
+      '';
+    };
+
+    management = {
+      interfaces = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "wt0" ];
+        description = ''
+          Interfaces that ALWAYS keep the management port open, no matter what else is declared.
+
+          This exists because of a specific, real near-miss: a hand-written ruleset accepted ssh
+          from a LAN range only, and named the overlay interface for exactly one unrelated port.
+          Loading it would have cut ssh over the overlay — the only way in to some hosts. Nobody
+          forgets to allow ssh; what happens is that the overlay is not in the range you allowed,
+          and you do not notice because you tested from the LAN.
+
+          Rules generated from this list are emitted before the host's own and cannot be overridden
+          by them. Every entry must exist in `nixnet.interfaces` with its addressing declared.
+        '';
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 22;
+        description = "The management (ssh) port held open on every `management.interfaces` entry.";
+      };
+
+      rateLimitNew = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "6/minute";
+        description = ''
+          Rate-limit NEW connections to the management port instead of accepting them
+          unconditionally — a brute-force throttle for a host that faces the open internet directly.
+          Value is an nftables `limit rate` expression (e.g. `"6/minute"`).
+
+          Only touches new connections: the preamble's `ct state established,related accept` runs
+          before any management rule, so it is never reached for a connection this rule already let
+          through. Traffic beyond the rate hits an explicit drop, so it does not fall through into
+          the rest of the ruleset and get evaluated against every other rule for nothing.
+
+          `null` (the default) keeps the unconditional accept — the right choice for an overlay-only
+          management interface reachable only by trusted mesh peers, where a rate limit adds nothing
+          but a way to lock yourself out under a burst of legitimate retries.
+        '';
+      };
+    };
+
+    trustedInterfaces = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Interfaces where ALL inbound traffic is accepted. Use sparingly — this is a much bigger grant than `management.interfaces`, which opens exactly one port.";
+    };
+
+    allow = lib.mkOption {
+      type = lib.types.listOf ruleType;
+      default = [ ];
+      description = "Accept rules, in declaration order, after the derived and management rules.";
+    };
+
+    silentDrops = lib.mkOption {
+      type = lib.types.listOf (lib.types.submodule {
+        options = {
+          match = lib.mkOption { type = lib.types.str; description = "Raw nftables matcher, e.g. `udp dport 5355`."; };
+          comment = lib.mkOption { type = lib.types.str; default = ""; description = "Why this is dropped without logging."; };
+        };
+      });
+      default = [ ];
+      description = ''
+        Traffic dropped WITHOUT logging. These packets are dropped either way; the point is to stop
+        them drowning the kernel log. That is a security measure, not a cosmetic one — on the host
+        this generalises, 66% of kernel log lines were the firewall logging ordinary LAN broadcast
+        housekeeping, and that noise is exactly what hid a genuine WireGuard drop.
+      '';
+    };
+
+    forward = {
+      enable = lib.mkEnableOption ''
+        a forward chain. OFF by default, and that default is deliberate.
+
+        nftables does not work the way iptables did here: every base chain at a hook sees the
+        packet, and ANY chain's drop is final. A drop-policy forward chain in this table would
+        therefore override the ACCEPTs libvirt/docker/k3s insert in THEIR tables, and break guest
+        and container networking — a regression the iptables setup never had. Enable this only on a
+        host that genuinely routes and knows it. On a routing peer the overlay path is accepted
+        automatically (derived from `nixnet.overlay.advertiseRoutes`), because the same
+        any-drop-is-final rule would otherwise silently kill the traffic the overlay module NATs
+      '';
+      rules = lib.mkOption {
+        type = lib.types.listOf ruleType;
+        default = [ ];
+        description = "Forward-chain accepts. Only meaningful with `forward.enable`.";
+      };
+    };
+
+    overlayConfinement = {
+      network = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "198.51.100.0/24"; # TEST-NET-2 placeholder overlay CIDR
+        description = ''
+          The overlay's own address space, as a /24. Set this to DERIVE
+          `nixnet.overlay.confineExternalRanges` from the least-trust octet band the operator
+          already declares in `nixnet.netbirdGroupReconcile`, instead of hand-writing a CIDR that
+          restates the same boundary and can quietly stop matching it.
+
+          A /24 specifically, and asserted: the band scheme keys off the LAST octet, so anything
+          else means the two declarations are not describing the same address space.
+
+          `null` (the default) leaves `confineExternalRanges` entirely to the operator and disables
+          both the derivation and its agreement check.
+        '';
+      };
+
+      band = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "external";
+        description = ''
+          Which declared band is the confined one, by group name. Defaults to
+          `nixnet.netbirdGroupReconcile.excludeFromCatchAll.forBand` — the band whose members join
+          only their own group and never the catch-all, i.e. the one the account already treats as
+          least-trust. Set this only when the confined band is NOT that one.
+        '';
+      };
+
+      ranges = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        readOnly = true;
+        description = ''
+          The CIDRs derived from the confined band. Read-only: declare the band, not this.
+
+          Exposed because a derivation you cannot read is a derivation you are trusting blind —
+          `nix eval` this to see exactly which addresses the confinement covers before a host loads
+          it.
+        '';
+      };
+    };
+
+    autoRevert = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Dead-man switch. Snapshots the live ruleset before applying a CHANGED one, then restores
+          it unless the new one is confirmed within `seconds` by running `nixnet-firewall-confirm`.
+
+          Defaults ON. A firewall you cannot recover from remotely is the failure this module is
+          most likely to cause, and the cost of the safety net is one timer.
+        '';
+      };
+      seconds = lib.mkOption {
+        type = lib.types.int;
+        default = 120;
+        description = "Seconds to wait for confirmation before restoring the snapshot.";
+      };
+    };
+
+    ruleset = lib.mkOption {
+      type = lib.types.lines;
+      readOnly = true;
+      description = ''
+        The generated nftables ruleset. Read-only: hosts describe intent through the options above
+        and this is the single rendering of it, so the NixOS and system-manager planes cannot drift.
+
+        Written to the store and loaded from there by `nixnet-firewall.service` — the same unit
+        name on both planes — and copied to /etc/nftables/nixnet.nft for reading. Rendered even
+        when `enable` is false, so a host can `nix eval` exactly what enabling this would load
+        before committing to it.
+      '';
+    };
+  };
+
+  config = lib.mkMerge [
+    # Rendered unconditionally, outside the enable gate — same reasoning as
+    # `nixnet.overlay.ruleset`: a ruleset you cannot read before it is applied is one you trust
+    # blind.
+    {
+      nixnet.firewall.ruleset = rulesetText;
+      nixnet.firewall.overlayConfinement.ranges = derivedConfinementRanges;
+    }
+
+    # The derivation, published into the module that owns the confinement rules. mkDefault, so an
+    # operator can still override — and the assertion below then reports the disagreement instead
+    # of letting the two quietly differ. Gated on the overlay actually advertising routes: setting
+    # `confineExternalRanges` on a non-routing peer trips that module's own assertion, which is
+    # correct there and would be this module's fault here.
+    (lib.optionalAttrs (options.nixnet ? overlay) {
+      nixnet.overlay.confineExternalRanges =
+        lib.mkIf (confinementActive && (overlayCfg.advertiseRoutes or [ ]) != [ ])
+          (lib.mkDefault derivedConfinementRanges);
+    })
+
+    # OUTSIDE the enable gate on purpose — see `applyUnit` and `teardownScript`: `enable = false`
+    # has to mean the table is GONE, which takes a unit present in the generation that disables it.
+    # A host that never enables the firewall runs one oneshot per boot that creates and immediately
+    # deletes an empty table, and can then never be carrying a previous generation's rules.
+    {
+      systemd.services.nixnet-firewall = applyUnit;
+
+      # ── TWO TABLES, ONE HOST — and this assertion is OUTSIDE the enable gate ──────────────
+      #
+      # On a routing peer, nixnet writes two nftables tables: this one (host policy) and
+      # `nixnet.overlay`'s (the overlay mechanism's own confinement and source-NAT). Two writers,
+      # two units, two apply orders — so the ways they can contradict each other are worth naming,
+      # because none of them produce an error at runtime.
+      #
+      # SAME NAME, FIREWALL ENABLED: both units render `add table; delete table; define` for the
+      # SAME table, so whichever applies last deletes the other's chains outright. Concretely: a
+      # switch that runs the overlay's apply after this one leaves the host with the confinement
+      # and NO input policy — a default-drop chain silently gone, every port open, `systemctl
+      # status` green on both units.
+      #
+      # SAME NAME, FIREWALL DISABLED — the reason this assertion does not live under
+      # `mkIf cfg.enable`, where it used to. `applyUnit` above is unconditional by design: with
+      # `enable = false` its ExecStart is `teardownScript`, which runs
+      # `nft "add table inet <table>; delete table inet <table>"` on EVERY boot. Point `table` at
+      # the overlay's name and turn the firewall off, and that teardown deletes the overlay's
+      # confinement and source-NAT wholesale, once per boot, with no assertion, no error and both
+      # units green. The collision is exactly as fatal with the firewall off as with it on — more
+      # so, because nothing is left that even mentions the table.
+      #
+      # The name is PARSED from the text `nixnet.overlay` will actually load (`overlayTableNames`),
+      # not hardcoded here, so renaming it there cannot silently stop this check from matching.
+      assertions = [
+        {
+          assertion = !(lib.elem cfg.table overlayTableNames);
+          message = ''
+            nixnet.firewall.table is "${cfg.table}", which is also the table nixnet.overlay
+            renders into.
+
+            With nixnet.firewall.enable = true, both modules replace their table with
+            `add; delete; define`, so the one that applies second deletes the other's chains —
+            leaving the host with either no input policy or no overlay confinement, with both
+            units reporting success.
+
+            With nixnet.firewall.enable = false it is worse: `nixnet-firewall.service` still runs,
+            and its job in that generation is to assert this table is ABSENT. It would delete the
+            overlay's confinement and source-NAT on every boot.
+
+            Give this module a table name of its own.
+          '';
+        }
+      ];
+    }
+
+    (lib.mkIf cfg.enable (lib.mkMerge [
+      {
+        assertions = [
+          {
+            # THE assertion. Everything else in this module is convenience; this is the one that
+            # stops a machine being lost. A default-drop input policy with no management interface
+            # is a config that builds, activates, reports success, and strands the host — and it
+            # fails HERE, on the build host, not at activation time on the far end of the ssh
+            # session that is about to close.
+            assertion = cfg.management.interfaces != [ ] || cfg.trustedInterfaces != [ ];
+            message = ''
+              nixnet.firewall: refusing to build a default-drop firewall with no way back in.
+
+              `nixnet.firewall.management.interfaces` is empty and so is
+              `nixnet.firewall.trustedInterfaces`, so nothing would keep the management port
+              reachable. On a remote host this activates cleanly and then strands the machine.
+
+              Set `nixnet.firewall.management.interfaces` to the interface you administer this host
+              over — the overlay interface, not the LAN, if the LAN is not how you actually reach it.
+            '';
+          }
+          {
+            # The typo class, and the DHCP class, closed by the same check: an interface named in a
+            # rule must be one this host has declared, with its addressing stated. A misspelled
+            # interface matches nothing and fails OPEN with no error anywhere; an interface whose
+            # addressing nobody stated is one whose DHCP accepts nothing can derive.
+            assertion = undeclaredInterfaces == [ ];
+            message = ''
+              nixnet.firewall names an interface that is not declared in `nixnet.interfaces`:
+              ${lib.concatStringsSep ", " undeclaredInterfaces}
+
+              A rule naming an interface this host does not have matches nothing and fails OPEN —
+              silently, with the rule still sitting there looking correct. Declare the interface
+              (with its `addressing`), or fix the name.
+            '';
+          }
+          {
+            assertion = addressinglessInterfaces == [ ];
+            message = ''
+              nixnet.firewall names an interface whose addressing nobody stated:
+              ${lib.concatStringsSep ", " addressinglessInterfaces}
+
+              Set both `addressing.v4` and `addressing.v6` (`static`/`dhcp`/`slaac`/`none`/
+              `unmanaged`). This is the fact the DHCP client accepts derive from: unset means
+              nobody said, and a DHCP-addressed host that nobody said was DHCP-addressed gets a
+              default-drop input chain that eats its own lease renewal — a host that stays up for
+              most of a day and then goes dark. `unmanaged` is a real answer, and a different one
+              from silence.
+            '';
+          }
+          {
+            assertion = !cfg.forward.enable -> cfg.forward.rules == [ ];
+            message = ''
+              nixnet.firewall: `forward.rules` are declared but `forward.enable` is false, so none
+              of them apply. Declaring rules into a chain that is never created reads as done and
+              does nothing — the same class of silent no-op this module exists to prevent elsewhere.
+            '';
+          }
+          {
+            assertion = lib.all (r: r.ports != [ ] || r.portRanges != [ ]) (cfg.allow ++ cfg.forward.rules);
+            message = ''
+              nixnet.firewall: a rule in `allow` or `forward.rules` has neither `ports` nor
+              `portRanges` set, so it matches nothing — almost certainly a missing value rather than
+              an intentional rule.
+            '';
+          }
+
+          # The SAME-NAME half of "two tables, one host" is asserted unconditionally, above,
+          # outside the enable gate — see the comment there for why `enable = false` is the more
+          # dangerous case rather than the safe one.
+          #
+          # DISAGREEING CONTENT: the confinement lives in the overlay's table, this module derives
+          # what it should contain. If the effective value drops a derived range, the peers in that
+          # part of the band are unconfined — every rule still present, `nft list ruleset` still
+          # looking correct, and the hole exactly where the operator believes the fence is.
+          {
+            assertion =
+              !(confinementActive && (overlayCfg.advertiseRoutes or [ ]) != [ ])
+              || lib.all (r: lib.elem r (overlayCfg.confineExternalRanges or [ ])) derivedConfinementRanges;
+            message = ''
+              nixnet.firewall.overlayConfinement derives, from the "${toString confinedBandName}" band:
+                ${lib.concatStringsSep ", " derivedConfinementRanges}
+              nixnet.overlay.confineExternalRanges does not contain every one of them:
+                ${lib.concatStringsSep ", " (overlayCfg.confineExternalRanges or [ ])}
+
+              The confinement is rendered from the overlay's value, so any derived range missing
+              above is NOT confined: those peers keep full reach into the advertised LAN while the
+              band they belong to is the one the account treats as least-trust. Nothing fails at
+              runtime — the rules that exist are correct, the ones that are missing are the point.
+
+              This is a check on the LIST, not on address coverage: each derived CIDR must appear
+              verbatim in `confineExternalRanges`. A single wider prefix that happens to contain
+              them all trips this too, deliberately — proving containment would mean this module
+              re-deriving the boundary a second way, which is the duplicated statement of one fact
+              the whole derivation exists to remove.
+
+              So: drop the override and let the band decide, widen the band, or — if the override
+              really must stand — include the derived CIDRs above in it verbatim.
+            '';
+          }
+          {
+            assertion = !confinementActive || networkMatch != null;
+            message = ''
+              nixnet.firewall.overlayConfinement.network ("${toString confinement.network}") is not
+              a /24. The band scheme it derives from keys off the last octet, so a different prefix
+              length means the two declarations are not describing the same address space.
+            '';
+          }
+          {
+            assertion = !confinementActive || confinedBandName != null;
+            message = ''
+              nixnet.firewall.overlayConfinement.network is set but there is no band to derive from:
+              `nixnet.netbirdGroupReconcile.excludeFromCatchAll.forBand` is unset and
+              `overlayConfinement.band` names nothing. The derivation would produce an empty
+              confinement — a fence that evaluates clean and does not exist.
+            '';
+          }
+          {
+            assertion = !confinementActive || confinedBands != [ ];
+            message = ''
+              nixnet.firewall.overlayConfinement derives from band "${toString confinedBandName}",
+              which is not among the declared `nixnet.netbirdGroupReconcile.bands`. The derivation
+              produces nothing, so the confinement would silently not exist.
+            '';
+          }
+        ];
+
+        warnings =
+          lib.optional (cfg.trustedInterfaces != [ ] && cfg.management.interfaces == [ ])
+            ''
+              nixnet.firewall: relying on `trustedInterfaces` alone for management access. That
+              works, but it accepts ALL traffic on those interfaces rather than just the management
+              port. Prefer `management.interfaces` unless the blanket trust is intended.
+            ''
+          ++ lib.optional (cfg.forward.enable && isRoutingPeer && overlayInterface == null)
+            ''
+              nixnet.firewall: this host advertises overlay routes and enables a drop-policy forward
+              chain, but nixnet.overlay.overlayInterface is null, so the routed overlay accepts
+              could not be derived. Routed traffic will be dropped by this chain.
+            '';
+
+        environment.systemPackages = lib.optionals cfg.autoRevert.enable [ confirm ];
+
+        systemd.services.nixnet-firewall-revert = lib.mkIf cfg.autoRevert.enable {
+          description = "nixnet: restore the previous ruleset (confirmation window expired)";
+          serviceConfig = { Type = "oneshot"; ExecStart = "${revertScript}"; };
+        };
+
+        # Deliberately NOT `wantedBy = [ "timers.target" ]`. That is what armed the countdown on
+        # every boot regardless of whether anything had changed; the apply path starts this timer
+        # explicitly, and only when the ruleset differs from the last one applied.
+        systemd.timers.nixnet-firewall-revert = lib.mkIf cfg.autoRevert.enable {
+          description = "nixnet: auto-revert countdown";
+          timerConfig = {
+            OnActiveSec = cfg.autoRevert.seconds;
+            AccuracySec = "1s";
+            RemainAfterElapse = false;
+          };
+        };
+      }
+
+      # The ruleset on disk, for a human with an `nft` and a question. The unit does NOT load it
+      # from here (it names the store path, see `rulesetFile`); this copy is documentation that
+      # happens to be executable.
+      #
+      # `replaceExisting` is system-manager-only, and there it is not tidiness: on a foreign distro
+      # the distro's own package may already own this path, and without the flag system-manager
+      # SILENTLY SKIPS the file — the module would appear to apply, change nothing, and leave
+      # whatever was there in force. It does not exist as an option under real NixOS at all, hence
+      # `optionalAttrs` rather than `mkIf`: the module system checks a definition's structural KEYS
+      # against declared options independent of any mkIf condition, the same trap core.nix
+      # documents for `system.activationScripts`.
+      {
+        environment.etc."nftables/nixnet.nft" = {
+          source = rulesetFile;
+          mode = "0444";
+        } // lib.optionalAttrs isSystemManager {
+          replaceExisting = true;
+        };
+      }
+
+      (lib.optionalAttrs (!isSystemManager) {
+        assertions = [
+          {
+            # Two default-drop input chains at the same hook is not "belt and braces": every base
+            # chain sees the packet and ANY chain's drop is final, so the effective policy is the
+            # INTERSECTION of the two accept sets. A port this module opens that nixpkgs' firewall
+            # does not is closed anyway, with both configurations looking correct in isolation.
+            assertion = !(config.networking.firewall.enable or false)
+              && !(config.networking.nftables.enable or false);
+            message = ''
+              nixnet.firewall is enabled alongside networking.firewall or networking.nftables.
+
+              Set `networking.firewall.enable = false;` (it defaults to true) and leave
+              `networking.nftables.enable` off.
+
+              Two default-drop input chains at one hook intersect rather than combine: a rule this
+              module accepts is still dropped if the other chain does not, and neither
+              configuration looks wrong on its own. nixpkgs' nftables module additionally defaults
+              to `flush ruleset` whenever it is handed a raw ruleset, which would take every other
+              table on this host with it.
+            '';
+          }
+        ];
+      })
+    ]))
+  ];
+}

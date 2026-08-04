@@ -1,22 +1,27 @@
 # checks/default.nix
 #
-# EVAL-TIME tests for nixnet's core module (modules/core.nix). Real NixOS
-# evaluation via nixpkgs' own eval-config.nix, not a bare `lib.evalModules`
-# stub -- core.nix's fix here touches `users.users`/`users.groups` and
-# `systemd.services.*.serviceConfig`, real option surface a hand-rolled
-# stub would have to reimplement anyway. These check the module's
-# rendered OUTPUT VALUES, never runtime behavior on a booted machine --
-# whether a rename() actually succeeds under a given owner/sticky-bit
-# combination is a fact about a live kernel, not about what Nix evaluates
-# to, and is deliberately out of scope here. That fact was instead
-# verified live, in both directions, against a real production host:
-# pre-fix, nixnetd logged "publish hosts: Operation not permitted" on
-# every winner-change (DynamicUser's per-boot UID owned neither the
-# boot-seeded hostsFile nor its directory); post-fix, the same box
-# published real winners into /etc/hosts successfully. See the fix
-# commit for that reproduction.
+# The checks output: EVAL-TIME assertions on rendered module values (this
+# file) plus the VM tests in ./vm, which boot machines and assert on what
+# the kernel actually did.
+#
+# The split is not arbitrary. Eval-time checks answer "what does this
+# module render", and that is all they can answer -- a rendered-ruleset
+# string comparison passes for a rule that loads and matches nothing, and
+# a rendered unit passes for a daemon that cannot write the file it
+# exists to write. Everything whose failure mode is "the machine is
+# unreachable" belongs in ./vm, on a booted machine, asserted from a
+# second one.
+#
+# The eval-time half below is real NixOS evaluation via nixpkgs' own
+# eval-config.nix, not a bare `lib.evalModules` stub -- these checks touch
+# `users.users`/`users.groups` and `systemd.services.*.serviceConfig`,
+# real option surface a hand-rolled stub would have to reimplement anyway.
 
-{ pkgs, nixpkgs, nixnetModule, meshGatewayModule, overlayModule }:
+# `moduleDir` rather than one path per module: ./vm probes for modules that do
+# not exist yet (the firewall fold-in) and must be able to say "modules/
+# firewall.nix does not exist" instead of aborting evaluation of every other
+# check on a missing import.
+{ pkgs, nixpkgs, nixnetModule, meshGatewayModule, overlayModule, moduleDir }:
 
 let
   lib = pkgs.lib;
@@ -364,26 +369,82 @@ let
       "did not find the surviving assertion's text in modules/core.nix")
   ];
 
-  allResults = results ++ meshGatewayResults ++ overlayResults ++ overlayV4OnlyResults ++ sourceResults;
+  # ---------------------------------------------------------------------
+  # firewall: the whole eval-time suite for modules/firewall.nix, which
+  # lives in experiments/render-check.nix and until now ran nowhere.
+  #
+  # That file is the ONLY test of the firewall's derivations and refusals
+  # -- the DHCP accepts appearing when a host declares `addressing.v4 =
+  # "dhcp"` AND being absent when it does not, the confinement CIDRs, the
+  # anti-lockout refusal, the typo refusal, the two-tables collision -- and
+  # it was reachable only by hand, from a command line in the README. CI
+  # ran `nix flake check`, `nix flake check` never imported it, so every
+  # one of those assertions was decoration. The three firewall behaviours
+  # that DO have VM tests (FW-2, FW-3, OWN-1) cover none of the refusals,
+  # because a refusal's whole point is that it happens on the build host
+  # and no machine ever boots.
+  #
+  # Imported here rather than moved, to keep this the smallest change that
+  # closes the gap; experiments/ describes itself as disposable, so the
+  # file's real home is checks/, and moving it is a follow-up that must not
+  # be the thing blocking these assertions from running.
+  #
+  # Every attribute it exposes is a boolean; `ok` is their conjunction and
+  # is skipped here so a failure reports the individual claim by NAME
+  # rather than as one opaque false.
+  renderCheck = import ../experiments/render-check.nix {
+    inherit nixpkgs;
+    system = pkgs.stdenv.hostPlatform.system;
+  };
+
+  firewallResults = map
+    (n: check "firewall/${n}" renderCheck.${n} "experiments/render-check.nix: ${n} is false")
+    (builtins.filter (n: n != "ok") (builtins.attrNames renderCheck));
+
+  allResults = results ++ meshGatewayResults ++ overlayResults ++ overlayV4OnlyResults
+    ++ sourceResults ++ firewallResults;
 
   failed = builtins.filter (r: !r.ok) allResults;
 
   report = lib.concatMapStringsSep "\n" (r: "  - ${r.name}: ${r.detail}") failed;
-in
-if failed != [ ]
-then throw ''
-  nixnet eval-checks FAILED (${toString (builtins.length failed)}/${toString (builtins.length allResults)}):
-  ${report}
-''
-else {
+
   # Constructing this derivation depends on `passedCount`, which forces
   # `results` (and therefore every `check` assertion above) even if
   # nothing else ever reads the attribute -- so the checks really do run,
   # not just get defined.
-  eval-checks = pkgs.runCommand "nixnet-eval-checks"
-    { passedCount = toString (builtins.length allResults); }
-    ''
-      echo "all $passedCount nixnet eval checks passed"
-      touch $out
-    '';
+  #
+  # The throw is scoped to THIS attribute, deliberately. It used to sit at
+  # the file's top level, where one failing eval assertion aborted
+  # evaluation of the whole checks output -- including the VM tests, which
+  # then reported nothing at all about a machine that may well have been
+  # fine. A failing check should cost you that check.
+  evalChecks =
+    if failed != [ ]
+    then
+      throw ''
+        nixnet eval-checks FAILED (${toString (builtins.length failed)}/${toString (builtins.length allResults)}):
+        ${report}
+      ''
+    else
+      pkgs.runCommand "nixnet-eval-checks"
+        { passedCount = toString (builtins.length allResults); }
+        ''
+          echo "all $passedCount nixnet eval checks passed"
+          touch $out
+        '';
+
+  vm = import ./vm { inherit pkgs nixpkgs moduleDir; };
+in
+{
+  eval-checks = evalChecks;
+
+  # TEST-1: the id sets on both sides of the contract, compared. Fed the
+  # behaviour ids the VM tests actually claim, so a test that is deleted or
+  # renamed shows up here as an unwaived behaviour rather than as silence.
+  behaviour-coverage = import ./coverage.nix {
+    inherit pkgs;
+    behaviorsFile = ../BEHAVIORS.md;
+    inherit (vm) covered;
+  };
 }
+// vm.checks

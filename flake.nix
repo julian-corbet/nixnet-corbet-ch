@@ -71,11 +71,19 @@
       # the full contract.
       lib.svcProxyConfig = import ./lib/svc-proxy-config.nix;
 
-      # The eval-time regression net in ./checks (a real, if minimal, NixOS
-      # evaluation of modules/core.nix and modules/mesh-gateway.nix -- see
-      # that file's own header for why not a bare evalModules stub, and
-      # for what's deliberately out of scope: runtime facts, verified live
-      # instead).
+      # Two kinds of check, both in ./checks: eval-time assertions on
+      # rendered module values, and VM tests (./checks/vm) that boot
+      # machines and assert on kernel state -- `ip addr`, `nft list
+      # table`, /proc counters, the published file, unit state, and
+      # reachability from a SECOND node. The second kind exists because
+      # every sharp bug in this repo's history reached production on a
+      # layer where a bug means the machine is unreachable and therefore
+      # unfixable remotely, and none of them were expressible as a
+      # rendered-value comparison.
+      #
+      # VM tests need /dev/kvm to run in reasonable time; without it qemu
+      # falls back to emulation rather than failing, so a CI runner
+      # without nested virtualisation makes this output slow, not wrong.
       checks = forAllSystems (system:
         import ./checks {
           pkgs = pkgsFor system;
@@ -83,6 +91,13 @@
           nixnetModule = ./modules/core.nix;
           meshGatewayModule = ./modules/mesh-gateway.nix;
           overlayModule = ./modules/overlay.nix;
+          # The directory, not one path per module: the VM tests declare
+          # which modules they need by FILE NAME and probe for them, so a
+          # test written against the firewall fold-in (rebuild decision 5)
+          # fails by name -- "modules/firewall.nix does not exist" -- rather
+          # than aborting evaluation of every other check on a missing
+          # import.
+          moduleDir = ./modules;
         });
 
       formatter = forAllSystems (system: (pkgsFor system).nixpkgs-fmt);
