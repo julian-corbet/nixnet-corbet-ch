@@ -141,7 +141,18 @@ A container CNI, an overlay client's reset path or a hand-run command removes th
 error, and nothing restores them until the next deploy. Presence of a table is checkable; checking beats
 enumerating everyone who might flush it.
 
-Not: nixnet does not detect that another table changed. It asserts its own table's presence and content hash.
+Also: a green unit is not evidence. The apply unit is a `Type=oneshot` with `RemainAfterExit`, so it reports
+`active (exited)` for the rest of the boot regardless of what happens to the table afterwards — measured on a
+public production host that had no packet filter at all while every systemd answer said success. The reconcile
+loop is what makes the claim present-tense, and `nixnet_firewall_enforced` is where it is readable.
+
+Not: nixnet does not detect that another table changed. It asserts its own table's presence and generation,
+via an empty unhooked chain named for the ruleset hash — which distinguishes a deleted table, an emptied one
+and a FOREIGN one (a rollback that reloaded older rules) without text-comparing against `nft list`'s rendering.
+
+Not: it does not repair a ruleset the dead-man switch deliberately replaced. That is the one case where the
+correct action is to leave the host as it is and go red — repairing would reload the rules that just locked an
+operator out, once per interval, forever. `nixnet-firewall-confirm` is the way back.
 
 ### FW-5 — the dead-man switch arms on a change, not on a boot
 **GIVEN** a reboot with a ruleset byte-identical to the last one applied, **THEN** the auto-revert timer does
@@ -392,9 +403,10 @@ Open, not deferred. Each blocks a default, not a behaviour.
    re-enrolled address on the same tick it reports unhealthy. Trusting it converges one tick sooner; distrusting
    it keeps a failing prober's output out of the hosts file. No evidence either way.
 
-4. **Foreign-flush detection mechanism and cadence.** `FW-4` specifies an outcome, not a mechanism. Polling for
-   the table is trivial; whether nftables' own change notification is reliable enough to replace polling — and
-   how fast a flush must be repaired before the gap matters — is unmeasured.
+4. **Foreign-flush cadence.** The mechanism is settled — poll every `reconcile.intervalSec` (60s) for a
+   generation-marker chain. What is not settled: whether `nft monitor`'s change notification is reliable enough
+   to replace polling, and how fast a flush must be repaired before the gap matters. 60 seconds is a guess with
+   no measurement behind it, chosen because it is cheap, not because anything said it was enough.
 
 5. **Who owns overlay self-heal where an independent lifeline watchdog also exists.** One such watchdog exists
    precisely because nixnet's reprovisioning has a dependency that host cannot satisfy. Two mechanisms with

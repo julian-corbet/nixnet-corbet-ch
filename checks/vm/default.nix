@@ -20,6 +20,7 @@ let
     ./dhcp-addressing.nix
     ./firewall-apply-failure.nix
     ./firewall-foreign-table.nix
+    ./firewall-reconcile.nix
     ./hosts-single-writer.nix
     ./lastknowngood-staleness.nix
   ];

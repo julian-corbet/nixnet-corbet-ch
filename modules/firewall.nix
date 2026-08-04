@@ -189,10 +189,69 @@ let
 
   rulesetHash = builtins.hashString "sha256" cfg.ruleset;
 
+  # ── The generation marker ───────────────────────────────────────────────────────────────────
+  #
+  # One rule, in a regular chain with no hook that nothing jumps to — never traversed, zero datapath
+  # cost — whose COMMENT carries this ruleset's hash. It answers the question the kernel otherwise
+  # cannot be asked cheaply: "is the table currently loaded the one THIS generation renders?"
+  #
+  # Comparing text does not work. `nft list table` renders handles, expanded syntax and its own
+  # formatting, so a byte-comparison against the source reports drift on every host every time; a
+  # normalised comparison means re-implementing nft's printer and getting it wrong on the version
+  # that adds a field. One rule with a known comment is checkable with one command.
+  #
+  # A RULE, not a chain name — and that distinction is load-bearing, found by the VM test rather
+  # than by reasoning. `nft flush table` empties every chain's RULES and leaves the CHAINS in place,
+  # so a marker encoded as a chain name survives the flush and reports a table that has been emptied
+  # as healthy. The host would then be sitting behind an input chain with `policy drop` and no
+  # accepts — every packet dropped — with the reconcile loop calling it fine.
+  #
+  # So it answers three failures with one check:
+  #   * table deleted outright (`nft flush ruleset`, a CNI reset, a hand-run command)
+  #   * table present but emptied (`nft flush table inet nixnet`)
+  #   * table present from a DIFFERENT generation (an older ruleset reloaded, e.g. by a rollback)
+  #
+  # What it does NOT catch, stated rather than implied: the surgical removal of one rule from the
+  # input chain leaves the marker intact. Detecting that needs a full content comparison, which is
+  # the fragile thing above. Flush, delete and rollback are the shapes that actually happen.
+  #
+  # Hashed over `cfg.ruleset`, which does NOT contain the marker — the marker is appended when the
+  # file is written. Hashing the file including its own hash would not converge.
+  generationChain = "nixnet-generation";
+  generationMark = "nixnet-generation=${rulesetHash}";
+
+  markerText = ''
+
+    # The generation marker — see modules/firewall.nix. Unhooked, unreachable from any base chain:
+    # it is a fact about WHICH ruleset is loaded, not a rule about packets.
+    table inet ${cfg.table} {
+      chain ${generationChain} {
+        counter comment "${generationMark}"
+      }
+    }
+  '';
+
+  # The one question every path here asks. `grep` rather than nft's exit status, because a chain
+  # that exists and is empty exits 0 — which is exactly the emptied-table case.
+  inForceFunc = ''
+    nixnet_in_force() {
+      ${pkgs.nftables}/bin/nft list chain inet ${cfg.table} ${generationChain} 2>/dev/null \
+        | grep -q '${generationMark}'
+    }
+  '';
+
   # ── Dead-man switch ─────────────────────────────────────────────────────────────────────────
   stateDir = "/var/lib/nixnet-firewall";
   pendingFile = "${stateDir}/pending.nft";
   appliedHashFile = "${stateDir}/applied-hash";
+
+  # Which ruleset the dead-man switch REPLACED, if it ever fired. This is the one thing that must
+  # stop the reconcile loop from repairing: after a revert, the table deliberately does not match
+  # this generation, and reloading it would put back the ruleset that just locked someone out —
+  # every 60 seconds, forever. Two mechanisms with authority over the same table is exactly what
+  # ISO-1 warns about; this file is where they agree on who wins.
+  revertedHashFile = "${stateDir}/reverted-hash";
+  repairCountFile = "${stateDir}/repairs";
 
   confirm = pkgs.writeShellApplication {
     name = "nixnet-firewall-confirm";
@@ -203,6 +262,10 @@ let
       # had open, since an established connection survives rules that would refuse a new one.
       systemctl stop nixnet-firewall-revert.timer 2>/dev/null || true
       rm -f ${pendingFile}
+      # Also clears a revert that already fired. Confirming AFTER the window closed is a real
+      # operator action meaning "put it back and stop reverting" — the ruleset is fine, the human
+      # was just slow. It re-enables the reconcile loop, which restores the ruleset on its next run.
+      rm -f ${revertedHashFile}
       echo "nixnet: ruleset confirmed; auto-revert disarmed."
     '';
   };
@@ -212,6 +275,10 @@ let
       echo "nixnet: confirmation window expired — restoring the previous ruleset."
       ${pkgs.nftables}/bin/nft -f ${pendingFile}
       rm -f ${pendingFile}
+      # Tell the reconcile loop to stand down for THIS ruleset. Without this it would find the
+      # generation marker missing one interval later, conclude the firewall had been flushed by a
+      # foreigner, and reload the very ruleset this revert just undid.
+      printf %s "${rulesetHash}" > ${revertedHashFile}
     fi
   '';
 
@@ -270,23 +337,136 @@ let
   # system-manager restarts a unit when the unit's store path changes and has no "a file this unit
   # reads changed" notion at all, and NixOS' switch compares unit files the same way. A unit
   # pointing at a fixed /etc path would sit inert with a changed ruleset until the next reboot.
-  rulesetFile = pkgs.writeText "nixnet-firewall.nft" cfg.ruleset;
+  #
+  # The marker chain is appended HERE rather than rendered into `cfg.ruleset`, for two reasons: the
+  # hash it is named after is taken over `cfg.ruleset` (a ruleset containing its own hash cannot
+  # converge), and `cfg.ruleset` is the readable statement of host policy — a bookkeeping chain in
+  # it would read as a rule someone forgot to finish.
+  rulesetFile = pkgs.writeText "nixnet-firewall.nft" (cfg.ruleset + markerText);
+
+  # ── Observability ───────────────────────────────────────────────────────────────────────────
+  #
+  # Two numbers, written by every path that establishes the truth of them: whether the ruleset this
+  # generation renders is the one actually loaded, and how many times something had to put it back.
+  # A repair count that is not zero is not an error — it is the host saying something else on it
+  # removes the firewall, which is a fact no green unit ever conveys.
+  #
+  # Written atomically (tmp + rename) because a Prometheus textfile collector reads this file on its
+  # own schedule and a half-written one parses as a scrape error.
+  metricsFunc =
+    if cfg.metricsFile == null
+    then "nixnet_write_metrics() { :; }\n"
+    else ''
+      nixnet_write_metrics() {
+        _enforced="$1"
+        _repairs=0
+        if [ -f ${repairCountFile} ]; then _repairs="$(cat ${repairCountFile})"; fi
+        mkdir -p "$(dirname ${cfg.metricsFile})"
+        _tmp="${cfg.metricsFile}.$$.tmp"
+        {
+          echo "# HELP nixnet_firewall_enforced 1 when the loaded nftables table is the one this generation renders."
+          echo "# TYPE nixnet_firewall_enforced gauge"
+          echo "nixnet_firewall_enforced $_enforced"
+          echo "# HELP nixnet_firewall_repairs_total Reloads by the reconcile loop after finding the ruleset absent or foreign."
+          echo "# TYPE nixnet_firewall_repairs_total counter"
+          echo "nixnet_firewall_repairs_total $_repairs"
+          echo "# HELP nixnet_firewall_last_check_seconds Unix time of the last completed firewall check."
+          echo "# TYPE nixnet_firewall_last_check_seconds gauge"
+          echo "nixnet_firewall_last_check_seconds $(date +%s)"
+        } > "$_tmp"
+        chmod 0644 "$_tmp"
+        mv -f "$_tmp" ${cfg.metricsFile}
+      }
+    '';
+
+  # ── FW-4: the reconcile loop ────────────────────────────────────────────────────────────────
+  #
+  # Ordering this module's unit against the two other units this repo happens to know about covers
+  # only hosts running exactly those two. A container CNI's reset path, an overlay client, a
+  # rollback to a generation that had a different firewall, or a hand-run `nft flush ruleset`
+  # removes the table with no error and nothing restores it until the next deploy. `RemainAfterExit`
+  # then keeps `nixnet-firewall.service` reporting active/success over an empty kernel — measured in
+  # production on a public host: the unit was green, the box had no packet filter at all, and the
+  # only reason it was noticed was that someone went looking for something else.
+  #
+  # Deliberately NOT a re-run of `applyScript`: a repair is not an operator change, so it must not
+  # arm the dead-man switch. Arming here would start a countdown nobody is waiting to confirm, and
+  # its snapshot would be of the broken state.
+  reconcileScript = pkgs.writeShellScript "nixnet-firewall-reconcile" ''
+    set -eu
+    ${metricsFunc}
+    ${inForceFunc}
+
+    mkdir -p ${stateDir}
+    chmod 0700 ${stateDir}
+
+    if nixnet_in_force; then
+      nixnet_write_metrics 1
+      exit 0
+    fi
+
+    # Name the KIND of drift before acting on it. "The table is gone" and "the table is someone
+    # else's generation" are different incidents, and the journal line is where that gets read.
+    if ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
+      reason="table inet ${cfg.table} is loaded but is NOT this generation (${generationMark} absent)"
+    else
+      reason="table inet ${cfg.table} is absent"
+    fi
+
+    # The one case where the right move is to leave it broken and say so. The dead-man switch fired,
+    # which means an operator applied a ruleset and never confirmed they could still get in.
+    # Repairing would reload exactly that ruleset, once per interval, forever.
+    if [ -f ${revertedHashFile} ] && [ "$(cat ${revertedHashFile})" = "${rulesetHash}" ]; then
+      echo "nixnet: $reason — NOT repairing." >&2
+      echo "nixnet: auto-revert replaced this ruleset deliberately; the host is running rules nixnet did not choose." >&2
+      echo "nixnet: fix the ruleset and redeploy, or run nixnet-firewall-confirm to put it back." >&2
+      nixnet_write_metrics 0
+      exit 1
+    fi
+
+    echo "nixnet: $reason — repairing." >&2
+    ${pkgs.nftables}/bin/nft -f ${rulesetFile}
+
+    # Same discipline as the apply path: the loader's exit status is not proof. Check the kernel.
+    if ! nixnet_in_force; then
+      echo "nixnet: repair loaded without error and the ruleset is STILL not in force." >&2
+      nixnet_write_metrics 0
+      exit 1
+    fi
+
+    _count=0
+    if [ -f ${repairCountFile} ]; then _count="$(cat ${repairCountFile})"; fi
+    _count=$((_count + 1))
+    printf %s "$_count" > ${repairCountFile}
+    nixnet_write_metrics 1
+    echo "nixnet: firewall repaired (repair #$_count). Not routine — something on this host removes it." >&2
+  '';
 
   # `set -eu`, and no `|| true` anywhere: FW-3. The loader's exit status IS the signal, and a
   # swallowed one is how a production host came to be running with no packet filter at all,
   # discovered from a serial console rather than from anything the host said.
   applyScript = pkgs.writeShellScript "nixnet-firewall-apply" ''
     set -eu
+    ${metricsFunc}
+    ${inForceFunc}
     ${lib.optionalString cfg.autoRevert.enable "${snapshotScript}"}
     ${pkgs.nftables}/bin/nft -f ${rulesetFile}
 
     # The other half a loader cannot report: a unit that FINISHED while nixnet's table is not
     # present. Presence is checkable, so check it — a green apply unit over an absent firewall is
-    # exactly the state that went unnoticed.
-    if ! ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
-      echo "nixnet: table inet ${cfg.table} is NOT present after a successful load — refusing to report success." >&2
+    # exactly the state that went unnoticed. Checked via the generation marker rather than the
+    # table, so "a table is there" cannot pass for "MY table is there".
+    if ! nixnet_in_force; then
+      echo "nixnet: table inet ${cfg.table} is NOT in force after a successful load — refusing to report success." >&2
+      nixnet_write_metrics 0
       exit 1
     fi
+
+    # An apply supersedes a revert: this is the operator putting a ruleset on the host, which is
+    # the authority the reconcile loop stood down for. Leaving the file would have reconcile refuse
+    # to repair a future flush of a ruleset that is currently loaded and fine.
+    rm -f ${revertedHashFile}
+    nixnet_write_metrics 1
   '';
 
   # What the unit does when the firewall is DISABLED — it still runs. `enable = false` has to mean
@@ -644,6 +824,58 @@ in
       };
     };
 
+    reconcile = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Re-check, on a timer, that the ruleset this generation renders is the one the kernel is
+          actually enforcing — and reload it if it is not.
+
+          Defaults ON, because the alternative is not "no safety net", it is a WRONG net. The apply
+          unit is a `Type=oneshot` with `RemainAfterExit`, so once it has succeeded it reports
+          `active (exited)` for the rest of the boot no matter what happens to the table afterwards.
+          Found in production on a public host: unit green, packet filter entirely absent.
+
+          What removes a table is never nixnet: a container runtime's reset path, an overlay client,
+          a rollback to a generation with a different firewall, a hand-run `nft flush ruleset`. None
+          of them report anything. Presence is checkable, so this checks it.
+
+          A repair does NOT arm the auto-revert dead-man switch — a repair is not an operator
+          changing the rules, and there would be nobody waiting to confirm it.
+        '';
+      };
+      intervalSec = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 60;
+        description = ''
+          Seconds between checks, and therefore the worst-case window in which a host runs without
+          the firewall it declares. One `nft list chain` per interval; the cost is not the reason to
+          raise this.
+        '';
+      };
+    };
+
+    metricsFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "${stateDir}/metrics.prom";
+      description = ''
+        Where to write Prometheus textfile-collector metrics, or `null` to write none.
+
+        Three series: `nixnet_firewall_enforced` (1 when the loaded table is this generation's),
+        `nixnet_firewall_repairs_total`, and `nixnet_firewall_last_check_seconds`. Written by every
+        path that establishes the truth of them, atomically, so a collector reading mid-write sees
+        the old file rather than half of a new one.
+
+        The default keeps the data next to the rest of this module's state. Point it INTO a
+        collector's directory to have it scraped: `nixnet.firewall.metricsFile =
+        "/var/lib/node-exporter/textfile/nixnet-firewall.prom"`.
+
+        `enforced 0` is the series that matters. It means the host is not filtering the way it says
+        it is, and — unlike the unit's status — it is true in the present tense.
+      '';
+    };
+
     tooling = lib.mkOption {
       type = lib.types.listOf (lib.types.enum (lib.attrNames tl.tools));
       default = [ "nft" ];
@@ -929,6 +1161,31 @@ in
             OnActiveSec = cfg.autoRevert.seconds;
             AccuracySec = "1s";
             RemainAfterElapse = false;
+          };
+        };
+
+        # FW-4. This one IS `wantedBy = timers.target` — the opposite of the revert timer above, and
+        # for the opposite reason: the revert must fire only when an operator changed something,
+        # this must fire always, because the events it watches for are precisely the ones nobody
+        # announces.
+        systemd.services.nixnet-firewall-reconcile = lib.mkIf cfg.reconcile.enable {
+          description = "nixnet: verify the packet filter is in force, and reload it if not";
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = "${reconcileScript}";
+          };
+        };
+
+        systemd.timers.nixnet-firewall-reconcile = lib.mkIf cfg.reconcile.enable {
+          description = "nixnet: firewall reconcile interval";
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            # OnBootSec, not OnStartupSec: the first check is a real check, after the apply unit has
+            # had its turn. A check that races the apply reports a drift that is one second old.
+            OnBootSec = "${toString cfg.reconcile.intervalSec}s";
+            OnUnitActiveSec = "${toString cfg.reconcile.intervalSec}s";
+            AccuracySec = "5s";
+            Unit = "nixnet-firewall-reconcile.service";
           };
         };
       }
