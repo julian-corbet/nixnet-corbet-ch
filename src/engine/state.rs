@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use super::{EngineState, Group, TransportState};
+use super::{EngineState, Group, GroupKind, TransportState};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -30,6 +30,14 @@ struct PersistedGroup {
     winner: i64, // -1 == none
     #[serde(with = "rfc3339_opt", skip_serializing_if = "Option::is_none")]
     winner_since: Option<OffsetDateTime>,
+    /// STALE-2: when a successful probe last confirmed
+    /// `last_published_address`. Persisted because the whole point of the
+    /// bound is that it survives a restart -- an age that resets to zero
+    /// whenever the process does is not a bound, it is a restart counter.
+    /// Also read by the boot-time hosts seed in `modules/core.nix`, which
+    /// publishes from this same file before the daemon exists.
+    #[serde(with = "rfc3339_opt", skip_serializing_if = "Option::is_none")]
+    confirmed_at: Option<OffsetDateTime>,
     degraded: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     last_published_address: String,
@@ -41,6 +49,7 @@ impl Default for PersistedGroup {
         Self {
             winner: -1,
             winner_since: None,
+            confirmed_at: None,
             degraded: false,
             last_published_address: String::new(),
             transports: Vec::new(),
@@ -87,18 +96,38 @@ mod rfc3339_opt {
 }
 
 impl super::Engine {
-    /// Best-effort by design: a missing or corrupt state.json (first boot
-    /// ever, or a manually-cleared state dir) just means every group
-    /// starts fresh at Unknown/no-winner -- never a fatal error.
+    /// Best-effort by design: a missing, unreadable or corrupt state.json
+    /// is a logged COLD START, never an error and never a crash loop. This
+    /// is the layer that makes the host reachable at all -- a daemon that
+    /// refuses to run because a cache file is malformed takes the machine
+    /// off the network to protect the accuracy of an optimisation, and
+    /// under `Restart=always` it does so once a second until
+    /// `start-limit-hit`. Every group simply starts fresh at
+    /// Unknown/no-winner, which costs one probe interval and cannot be
+    /// wrong.
     pub(super) fn load_state(path: &Path, state: &mut EngineState) {
         let data = match std::fs::read(path) {
             Ok(d) => d,
-            Err(_) => return,
+            // A first-ever boot is silent: NotFound is the expected state
+            // of a host that has never run this daemon, not an incident.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                crate::logf!(
+                    "state: COLD START -- cannot read {}: {} (every group starts at unknown)",
+                    path.display(),
+                    e
+                );
+                return;
+            }
         };
         let ps: PersistedState = match serde_json::from_slice(&data) {
             Ok(p) => p,
             Err(e) => {
-                crate::logf!("state: ignoring unreadable {}: {}", path.display(), e);
+                crate::logf!(
+                    "state: COLD START -- {} is unparseable: {} (every group starts at unknown)",
+                    path.display(),
+                    e
+                );
                 return;
             }
         };
@@ -132,6 +161,7 @@ impl super::Engine {
 }
 
 fn restore(groups: &mut HashMap<String, Group>, saved: &HashMap<String, PersistedGroup>) {
+    let now = OffsetDateTime::now_utc();
     for (name, g) in groups.iter_mut() {
         let pg = match saved.get(name) {
             Some(pg) => pg,
@@ -143,8 +173,10 @@ fn restore(groups: &mut HashMap<String, Group>, saved: &HashMap<String, Persiste
             None // transports list shrank across a config change, or there was never a winner
         };
         g.winner_since = pg.winner_since;
+        g.last_confirmed_at = pg.confirmed_at;
         g.degraded = pg.degraded;
         g.last_published_addr = pg.last_published_address.clone();
+        expire_restored_last_known_good(name, g, now);
         for (i, pt) in pg.transports.iter().enumerate() {
             if i >= g.transports.len() {
                 break;
@@ -162,12 +194,49 @@ fn restore(groups: &mut HashMap<String, Group>, saved: &HashMap<String, Persiste
     }
 }
 
+/// STALE-2, the half everyone forgets: the age bound applies to state
+/// RESTORED FROM DISK, not only to time that elapsed while this process
+/// was running. Without this, `run()`'s startup re-assert reads the last
+/// winner straight back out of state.json and republishes it, so every
+/// restart launders a stale entry into a fresh-looking one and the live
+/// bound is decorative -- which is precisely how one address stayed
+/// published for eleven days across every restart that might have cleared
+/// it.
+///
+/// Deliberately independent of the persisted `degraded` flag: an entry
+/// confirmed a month ago is too old whether or not the daemon had noticed
+/// it was failing before it stopped. The machine being powered off is not
+/// evidence that the peer was fine.
+fn expire_restored_last_known_good(name: &str, g: &mut Group, now: OffsetDateTime) {
+    if g.kind != GroupKind::Peer
+        || g.on_all_down != crate::config::ON_ALL_DOWN_LAST_KNOWN_GOOD
+        || g.last_published_addr.is_empty()
+    {
+        return;
+    }
+    let verdict = super::staleness(g.max_age_sec, g.last_confirmed_at, now);
+    if verdict == super::Staleness::Fresh {
+        return;
+    }
+    crate::logf!(
+        "group=peer={} lastKnownGood WITHDRAWN on restore addr={} age={} bound={}s: \
+         restarting does not make an unconfirmed address current",
+        name,
+        g.last_published_addr,
+        super::staleness_age_label(verdict),
+        g.max_age_sec.unwrap_or_default()
+    );
+    g.last_published_addr.clear();
+    g.winner = None;
+}
+
 fn dump(groups: &HashMap<String, Group>) -> HashMap<String, PersistedGroup> {
     let mut out = HashMap::new();
     for (name, g) in groups {
         let mut pg = PersistedGroup {
             winner: g.winner.map(|w| w as i64).unwrap_or(-1),
             winner_since: g.winner_since,
+            confirmed_at: g.last_confirmed_at,
             degraded: g.degraded,
             last_published_address: g.last_published_addr.clone(),
             transports: Vec::with_capacity(g.transports.len()),
@@ -183,4 +252,340 @@ fn dump(groups: &HashMap<String, Group>) -> HashMap<String, PersistedGroup> {
         out.insert(name.clone(), pg);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! STALE-2's restore-from-disk half, tested beside the code that
+    //! implements it. This is the path the production defect lived in: the
+    //! running daemon's bound can be perfect and still be decorative if a
+    //! restart reads the entry straight back out of this file, which is
+    //! how one address stayed published for eleven days across every
+    //! restart that might have cleared it. A green live-path test while
+    //! this path is broken is the exact shape of that bug.
+
+    use std::collections::HashMap;
+
+    use time::format_description::well_known::Rfc3339;
+
+    use super::super::tests::{add_transport, ago, new_peer_group, new_test_engine};
+    use super::super::{Engine, EngineState, Group, GroupKind};
+    use crate::config;
+    use crate::publish::{HostsPublisher, RoutePublisher};
+
+    /// Writes a state.json BY HAND rather than round-tripping through
+    /// `save_state_locked`: this pins the ON-DISK format, so renaming
+    /// `confirmedAt` shows up here as a failing restore instead of as a
+    /// silently unbounded entry in production. `consecutiveFailure` is the
+    /// real incident's count, not decoration -- it is what a peer that has
+    /// been unreachable for eleven days actually looks like on disk.
+    fn write_state_json(
+        path: &std::path::Path,
+        addr: &str,
+        confirmed_at: Option<&str>,
+        degraded: bool,
+    ) {
+        let confirmed = match confirmed_at {
+            Some(ts) => format!(",\n        \"confirmedAt\": \"{ts}\""),
+            None => String::new(),
+        };
+        std::fs::write(
+            path,
+            format!(
+                r#"{{
+  "peers": {{
+    "host-b": {{
+      "winner": 0,
+      "degraded": {degraded},
+      "lastPublishedAddress": "{addr}"{confirmed},
+      "transports": [ {{ "state": "down", "consecutiveSuccess": 0, "consecutiveFailure": 48000 }} ]
+    }}
+  }},
+  "uplinks": {{}}
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn rfc3339_ago(secs: i64) -> String {
+        ago(secs).format(&Rfc3339).unwrap()
+    }
+
+    /// Startup, as `Engine::new` performs it: build the configured groups,
+    /// then load whatever the last run left behind. Returns the restored
+    /// peer group AND a live Engine over it, because "was it dropped from
+    /// state" and "did it reach the hosts file" are different claims and
+    /// only the second is what a consumer experiences.
+    fn restart_with_state(
+        max_age_sec: Option<i64>,
+        confirmed_at: Option<&str>,
+        degraded: bool,
+    ) -> (Engine, tempfile::TempDir) {
+        let (eng, dir) = new_test_engine();
+        write_state_json(&eng.state_path, "192.0.2.10", confirmed_at, degraded);
+
+        let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        g.max_age_sec = max_age_sec;
+        add_transport(&mut g, 10, "192.0.2.10");
+        let mut state = EngineState {
+            peers: HashMap::from([("host-b".to_string(), g)]),
+            uplinks: HashMap::new(),
+        };
+        Engine::load_state(&eng.state_path, &mut state);
+        *eng.state.lock().unwrap() = state;
+        (eng, dir)
+    }
+
+    fn restored_peer(eng: &Engine) -> Group {
+        let mut state = eng.state.lock().unwrap();
+        state.peers.remove("host-b").expect("peer group exists")
+    }
+
+    /// Runs the startup re-assert and returns what actually landed in the
+    /// hosts file.
+    fn published_after_startup(eng: &Engine, dir: &tempfile::TempDir) -> String {
+        eng.publish_restored_peers();
+        std::fs::read_to_string(dir.path().join("hosts")).unwrap_or_default()
+    }
+
+    /// THE part everyone forgets, and the reason this behaviour exists.
+    /// Without an age check on this path the startup re-assert reads the
+    /// last winner back out of state.json and republishes it, so every
+    /// restart launders a stale entry into a fresh-looking one and the
+    /// live bound expires nothing that a reboot cannot undo.
+    #[test]
+    fn restore_drops_a_last_known_good_older_than_the_bound() {
+        let (eng, dir) = restart_with_state(Some(60), Some(&rfc3339_ago(11 * 24 * 3600)), true);
+
+        let published = published_after_startup(&eng, &dir);
+        assert!(
+            !published.contains("192.0.2.10"),
+            "a restart re-published an eleven-day-old address:\n{published}"
+        );
+
+        let g = restored_peer(&eng);
+        assert_eq!(
+            g.last_published_addr, "",
+            "a restart resurrected an eleven-day-old address"
+        );
+        assert_eq!(g.winner, None, "the winner pointer resurrects it too");
+    }
+
+    /// The direction that stops all of this from being satisfied by a
+    /// restore that simply drops everything. A restart during a brief
+    /// outage must not cost the last-known-good that the policy exists to
+    /// provide -- so the entry survives AND is published again.
+    #[test]
+    fn restore_keeps_a_last_known_good_inside_the_bound() {
+        let (eng, dir) = restart_with_state(Some(3600), Some(&rfc3339_ago(30)), true);
+
+        let published = published_after_startup(&eng, &dir);
+        assert!(
+            published.contains("192.0.2.10"),
+            "a restart inside the bound lost the last-known-good it exists \
+             to preserve:\n{published}"
+        );
+
+        let g = restored_peer(&eng);
+        assert_eq!(g.last_published_addr, "192.0.2.10");
+        assert_eq!(g.winner, Some(0));
+        assert!(
+            g.last_confirmed_at.is_some(),
+            "the confirmation time itself must survive the restart, or the \
+             next tick's age is computed from nothing and the entry expires \
+             for the wrong reason"
+        );
+    }
+
+    /// Expiry on restore does not consult the persisted `degraded` flag,
+    /// and this is the pair of tests that pins it. `degraded = true` is
+    /// the daemon having noticed the peer was failing before it stopped.
+    #[test]
+    fn restore_expires_an_old_entry_that_was_persisted_degraded() {
+        let (eng, _dir) = restart_with_state(Some(60), Some(&rfc3339_ago(11 * 24 * 3600)), true);
+        assert_eq!(restored_peer(&eng).last_published_addr, "");
+    }
+
+    /// ...and `degraded = false` is a daemon that was killed, or a machine
+    /// powered off, while the peer still looked healthy. Being switched
+    /// off for a month is not evidence that the peer was fine for that
+    /// month, so the same age applies: an entry nothing has confirmed
+    /// since is expired whichever way the flag was left.
+    #[test]
+    fn restore_expires_an_old_entry_that_was_persisted_healthy() {
+        let (eng, dir) = restart_with_state(Some(60), Some(&rfc3339_ago(30 * 24 * 3600)), false);
+
+        let published = published_after_startup(&eng, &dir);
+        assert!(
+            !published.contains("192.0.2.10"),
+            "a month-old address was re-published because the last run \
+             happened not to have marked it degraded yet:\n{published}"
+        );
+        assert_eq!(restored_peer(&eng).last_published_addr, "");
+    }
+
+    /// The genuinely ambiguous case, DECIDED: a bound is declared, but the
+    /// state file records no confirmation time at all (written by a nixnet
+    /// that predates the field). It is dropped rather than trusted --
+    /// an entry that cannot be shown to be inside its bound is not inside
+    /// it, and the cost of being wrong here is one probe interval of a
+    /// name not resolving, versus eleven days of a wrong address resolving
+    /// for the other reading. Only peers that declared a bound are
+    /// affected, which is what keeps an upgrade from flushing a fleet.
+    #[test]
+    fn restore_drops_a_bounded_entry_with_no_confirmation_rather_than_trusting_it() {
+        let (eng, _dir) = restart_with_state(Some(60), None, true);
+        assert_eq!(restored_peer(&eng).last_published_addr, "");
+    }
+
+    /// The default is unbounded, and it must stay that way on this path
+    /// too: taking a bound by default would change every existing
+    /// deployment's behaviour at once, on the layer that decides whether a
+    /// host can be reached at all.
+    #[test]
+    fn restore_keeps_an_unbounded_entry_however_old() {
+        let (eng, dir) = restart_with_state(None, Some(&rfc3339_ago(11 * 24 * 3600)), true);
+
+        let published = published_after_startup(&eng, &dir);
+        assert!(
+            published.contains("192.0.2.10"),
+            "an entry with no declared bound was dropped on restore:\n{published}"
+        );
+        assert_eq!(restored_peer(&eng).last_published_addr, "192.0.2.10");
+    }
+
+    /// The confirmation time has to round-trip, or the bound restarts its
+    /// clock on every save -- an entry that is always "just confirmed" is
+    /// an entry with no bound at all. Asserts the FIELD NAME on disk too,
+    /// because the boot-time hosts seed in `modules/core.nix` reads this
+    /// same file with jq and cannot be type-checked against it.
+    #[test]
+    fn save_records_the_confirmation_time_and_load_reads_it_back() {
+        let (eng, dir) = new_test_engine();
+        let confirmed = ago(120);
+        let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        g.last_published_addr = "192.0.2.10".into();
+        g.last_confirmed_at = Some(confirmed);
+        add_transport(&mut g, 10, "192.0.2.10");
+        eng.state.lock().unwrap().peers.insert("host-b".into(), g);
+
+        {
+            let state = eng.state.lock().unwrap();
+            eng.save_state_locked(&state);
+        }
+        let on_disk = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
+        assert!(
+            on_disk.contains("confirmedAt"),
+            "state.json carries no confirmation time; the boot seed in \
+             modules/core.nix reads this exact field name:\n{on_disk}"
+        );
+
+        let mut fresh = EngineState {
+            peers: HashMap::from([(
+                "host-b".to_string(),
+                new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD),
+            )]),
+            uplinks: HashMap::new(),
+        };
+        Engine::load_state(&dir.path().join("state.json"), &mut fresh);
+        assert_eq!(
+            fresh.peers["host-b"]
+                .last_confirmed_at
+                .unwrap()
+                .unix_timestamp(),
+            confirmed.unix_timestamp(),
+            "confirmation time did not survive a save/load round trip"
+        );
+    }
+
+    /// A corrupt state file is a logged COLD START, never an error and
+    /// never a crash loop: this is the layer that makes the host reachable
+    /// at all, and under `Restart=always` a refusal to start is a machine
+    /// that never comes back.
+    #[test]
+    fn a_corrupt_state_file_is_a_cold_start_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "{ this is not json at all ][").unwrap();
+
+        let mut state = EngineState {
+            peers: HashMap::from([(
+                "host-b".to_string(),
+                new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD),
+            )]),
+            uplinks: HashMap::new(),
+        };
+        Engine::load_state(&path, &mut state);
+
+        let g = &state.peers["host-b"];
+        assert_eq!(g.winner, None);
+        assert_eq!(g.last_published_addr, "");
+        assert_eq!(g.last_confirmed_at, None);
+    }
+
+    /// An uplink group has no retained name to expire, and must never
+    /// acquire one by accident: `expire_restored_last_known_good` keys on
+    /// `GroupKind::Peer`, and this is what would catch that key being
+    /// dropped in a refactor.
+    #[test]
+    fn restore_leaves_uplink_groups_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"peers":{},"uplinks":{"internet":{"winner":0,"degraded":true,
+               "lastPublishedAddress":"192.0.2.10",
+               "confirmedAt":"2000-01-01T00:00:00Z",
+               "transports":[{"state":"down"}]}}}"#,
+        )
+        .unwrap();
+
+        let mut g = new_peer_group("internet", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        g.kind = GroupKind::Uplink;
+        g.max_age_sec = Some(60);
+        add_transport(&mut g, 10, "192.0.2.10");
+        let mut state = EngineState {
+            peers: HashMap::new(),
+            uplinks: HashMap::from([("internet".to_string(), g)]),
+        };
+        Engine::load_state(&path, &mut state);
+
+        assert_eq!(
+            state.uplinks["internet"].last_published_addr, "192.0.2.10",
+            "the peer-only staleness bound reached into an uplink group"
+        );
+    }
+
+    /// Guards the one construction the tests above all rely on: the engine
+    /// used by `restart_with_state` really does publish through a real
+    /// `HostsPublisher` and a `RoutePublisher` that touches nothing. If
+    /// this ever stops being true, every "not published" assertion above
+    /// becomes vacuous.
+    #[test]
+    fn the_test_engine_publishes_through_a_real_hosts_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        let eng = Engine {
+            hosts: HostsPublisher::new(&hosts_path).unwrap(),
+            routes: RoutePublisher {
+                ip_path: "/bin/true".to_string(),
+            },
+            status_path: dir.path().join("status.json"),
+            state_path: dir.path().join("state.json"),
+            state: std::sync::Mutex::new(EngineState {
+                peers: HashMap::new(),
+                uplinks: HashMap::new(),
+            }),
+        };
+        let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        g.last_published_addr = "192.0.2.10".into();
+        eng.state.lock().unwrap().peers.insert("host-b".into(), g);
+
+        eng.publish_restored_peers();
+        assert!(std::fs::read_to_string(&hosts_path)
+            .unwrap()
+            .contains("192.0.2.10"));
+    }
 }

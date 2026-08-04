@@ -29,9 +29,9 @@ let
   #
   # Read the circularity honestly: TEST-1 says "every behaviour id has a VM
   # test", and the check that claims to prove it is this one -- which passes
-  # with 20 of 27 ids waived. So TEST-1 proves the LINK exists and is
+  # with 21 of 28 ids waived. So TEST-1 proves the LINK exists and is
   # maintained, not that the obligation is met. The `waived` list below is the
-  # actual answer to TEST-1, and it is 20 entries long.
+  # actual answer to TEST-1, and it is 21 entries long.
   selfCovered = [ "TEST-1" ];
 
   # A behaviour whose check exercises only PART of the entry. Not a waiver --
@@ -61,7 +61,7 @@ let
     "TF-6" = "state restore by transport identity is unit-testable and untested here; a VM test would restart the daemon across a config edit and assert counters did not transplant";
     "ISO-1" = "per-layer isolation classification does not exist; the VM shape is a node with a reachable gateway and a dead resolver, asserting l3 green and dns red";
     "PUB-2" = "the first-ever activation, before the daemon has ever run, is not reachable from a VM that boots an already-activated system; testing it needs a node that installs itself, not one that starts installed";
-    "STALE-1" = "deliberately not asserted while the rebuild is still choosing the shape of status.json and the health document; pinning `publishedAt`/`lastProbeOkAt` field names from a VM test would freeze a format nobody has settled";
+    "STALE-1" = "the data is published -- status.json carries `lastConfirmedAt` per group alongside the snapshot's `generatedAt`, and the hosts block carries `# nixnet written=<ts>` plus a `# nixnet <address> confirmed=<ts>` line above each entry -- but nothing ASSERTS either shape. Deliberate while the rebuild is still choosing the health document's format: a VM test that greps for those exact field names freezes them, and STALE-1's claim is about what a consumer can compute, not about a spelling. The half that is genuinely untested is the health document, which does not exist (see HEALTH-1)";
     "HEALTH-1" = "no health document exists to assert one subject per domain against";
     "HEALTH-2" = "validUntil semantics need a document first; the test is trivial once it exists (stop the daemon, assert the document expires)";
     "HEALTH-3" = "needs the health document and a way to fail one subject while the others stay green";
@@ -118,9 +118,9 @@ else
       total = toString (builtins.length ids);
       # "claimed", not "proven". A check named after a behaviour may still be
       # the `unrunnable` stub checks/vm/lib.nix emits for a test whose options
-      # do not exist yet (STALE-2 is one today): it FAILS rather than passing,
-      # so CI is honest, but this report would have called it proof. The
-      # evidence is the check's exit status, never this line.
+      # do not exist yet: it FAILS rather than passing, so CI is honest, but
+      # this report would have called it proof. The evidence is the check's
+      # exit status, never this line. No claimed id is a stub as it stands.
       claimedIds = lib.concatStringsSep " " (lib.naturalSort claimed);
       partialIds = lib.concatStringsSep " " (lib.naturalSort partialIds);
       unproven = lib.concatStringsSep " " (lib.naturalSort waivedIds);

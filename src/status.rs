@@ -23,11 +23,21 @@ pub struct StatusTransport {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Group {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub winner: String,
+    /// When this winner was SELECTED.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub since: String,
+    /// STALE-1: when a successful probe last CONFIRMED the published
+    /// value. Distinct from `since` (selection) and from the snapshot's
+    /// `generatedAt` (the write): a reader needs the confirmation time to
+    /// compute an age, and a value with no age is indistinguishable from a
+    /// current one -- which is how an address dead for eleven days kept
+    /// being served as if it were fine.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_confirmed_at: String,
     pub degraded: bool,
     pub transports: HashMap<String, StatusTransport>,
 }

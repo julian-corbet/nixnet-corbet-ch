@@ -132,6 +132,19 @@ impl Hysteresis {
     }
 }
 
+/// STALE-2's bound, per peer. Absent/`null` means unbounded -- the
+/// eleven-day leak this option exists to close, kept as the DEFAULT only
+/// because no measurement justifies a number and inventing one would be
+/// worse than making the operator choose. `modules/core.nix` warns at eval
+/// time when it is left unset, so nobody arrives here by accident.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LastKnownGood {
+    /// How long a last-known-good address may keep being published after
+    /// the last successful probe that confirmed it. `None` == forever.
+    pub max_age_sec: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Peer {
@@ -139,6 +152,7 @@ pub struct Peer {
     pub transports: Vec<Transport>,
     pub hysteresis: Hysteresis,
     pub on_all_down: String,
+    pub last_known_good: LastKnownGood,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -312,6 +326,21 @@ impl Config {
                     "peer \"{}\": onAllDown must be \"{}\" or \"{}\", got \"{}\"",
                     name, ON_ALL_DOWN_LAST_KNOWN_GOOD, ON_ALL_DOWN_UNPUBLISH, p.on_all_down
                 ));
+            }
+            // A zero or negative bound is not "expire immediately" -- that
+            // is what `onAllDown = "unpublish"` is for, and reading it as
+            // such here would silently turn a typo into a policy change on
+            // the one path whose whole job is to keep a name resolving.
+            // The Nix type (`ints.positive`) already rejects it; this is
+            // the same check for the hand-written-config.json path.
+            if let Some(v) = p.last_known_good.max_age_sec {
+                if v <= 0 {
+                    return Err(format!(
+                        "peer \"{}\": lastKnownGood.maxAgeSec must be positive (got {}); \
+                         use onAllDown = \"{}\" to withdraw immediately",
+                        name, v, ON_ALL_DOWN_UNPUBLISH
+                    ));
+                }
             }
         }
 

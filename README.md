@@ -65,6 +65,9 @@ nixnet.peers."host-b" = {
   ];
   hysteresis.minHoldMs = 10000;
   onAllDown = "lastKnownGood";
+  lastKnownGood.maxAgeSec = 900;  # stop publishing an address no probe has
+                                  # confirmed for 15 min; null warns and
+                                  # keeps publishing it forever
 };
 
 # ── Local dual-uplink: wired-preferred, wireless/cellular fallback ──
@@ -503,6 +506,20 @@ nix-instantiate --eval --strict experiments/render-check.nix -A ok
 - `peers.<name>.onAllDown` — `"lastKnownGood"` (default; keep the last
   address published, mark degraded) or `"unpublish"` (remove the entry,
   let NSS fall through to DNS).
+- `peers.<name>.lastKnownGood.maxAgeSec` (default `null` = unbounded, and
+  it **warns at eval time**) — how long `"lastKnownGood"` may keep
+  publishing an address after the last successful probe that confirmed it.
+  Past that age the entry is *removed* from the hosts file and the peer
+  stays degraded; the moment a transport comes back it is published again.
+  The bound applies to state restored from disk at startup and to the
+  boot-time hosts seed, not only to time elapsed while the daemon ran — a
+  restart must not launder an old entry into a fresh-looking one. Unbounded
+  is not a trade-off but a leak: measured on a real estate, one peer stayed
+  published for eleven days across ~48,000 consecutive probe failures,
+  degraded in `status.json` and resolving perfectly for everyone who simply
+  asked the resolver. The default stays `null` because nothing measured
+  justifies a number — the tolerance belongs to whatever consumes the name
+  (see `BEHAVIORS.md` `STALE-2` and open question #2).
 - `uplinks.<name>.transports` — list of the shared transport type; every
   entry **must** set `interface`.
 - `uplinks.<name>.hysteresis.minHoldMs` (default `15000` — ◐, same open

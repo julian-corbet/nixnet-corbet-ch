@@ -201,6 +201,49 @@ let
     };
   };
 
+  # STALE-2. `onAllDown = "lastKnownGood"` keeps publishing an address no
+  # probe can confirm any more; without a bound it keeps publishing it
+  # forever. Measured on a real estate: one peer published continuously for
+  # eleven days across roughly 48,000 consecutive probe failures -- degraded
+  # in status.json the whole time, and resolving perfectly for anyone who
+  # just asked the resolver, which is everyone. That is not a trade-off
+  # between a stale answer and no answer; it is an address that is simply
+  # wrong being asserted as fact indefinitely.
+  lastKnownGoodType = types.submodule {
+    options.maxAgeSec = mkOption {
+      type = types.nullOr types.ints.positive;
+      default = null;
+      example = 900;
+      description = ''
+        How long a last-known-good address may keep being published after
+        the last successful probe that confirmed it. Past this age the
+        entry is REMOVED from the published hosts file (a hosts file
+        cannot express "probably wrong", so the only honest alternative to
+        a correct answer is no answer) and the peer stays degraded. The
+        moment a transport comes back the address is published again --
+        this bound expires an entry, it does not blacklist it.
+
+        `null` (the default) means unbounded, which is the defect above.
+        It is the default only because no measurement on this estate
+        justifies any particular number, and inventing one would be worse
+        than making the operator choose: the tolerance belongs to whatever
+        consumes the name (a soft-mounted filesystem retries for minutes,
+        a discovery path wants the failure immediately). Leaving it null
+        warns at eval time, so the unbounded case is at least chosen out
+        loud rather than inherited by accident.
+
+        Applies to state restored from disk too, not only to time that
+        elapsed while the daemon was running -- see nixnetd's own
+        `engine::staleness`. A restart that laundered an old entry into a
+        fresh-looking one is how the eleven days above survived every
+        restart that might have cleared them.
+
+        Has no effect when `onAllDown = "unpublish"`: nothing is retained
+        there, so there is nothing to expire.
+      '';
+    };
+  };
+
   peerType = types.submodule {
     options = {
       hostnames = mkOption {
@@ -221,10 +264,16 @@ let
         description = ''
           lastKnownGood: keep publishing the last address that was ever up
           (good for retry-tolerant protocols like a soft-mounted NFS
-          share); the group is marked degraded in status.json + the
-          journal. unpublish: remove the managed entry entirely so NSS
-          falls through to the next source (typically DNS).
+          share), bounded by `lastKnownGood.maxAgeSec`; the group is
+          marked degraded in status.json + the journal. unpublish: remove
+          the managed entry entirely so NSS falls through to the next
+          source (typically DNS).
         '';
+      };
+      lastKnownGood = mkOption {
+        type = lastKnownGoodType;
+        default = { };
+        description = "Bounds on how long the `onAllDown = \"lastKnownGood\"` policy may keep publishing an unconfirmable address.";
       };
     };
   };
@@ -411,6 +460,22 @@ let
   needsNetRaw = any (t: t.probe.method == "icmp" || t.probe.bindToInterface) allTransports;
 
   # ---------------------------------------------------------------------
+  # STALE-2, eval half. `unpublish` peers are excluded on purpose: they
+  # retain nothing, so there is nothing for a bound to expire and a warning
+  # there would be pure noise -- and noise is how a warning that matters
+  # stops being read.
+  # ---------------------------------------------------------------------
+  retainingPeers = filterAttrs (_: p: p.onAllDown == "lastKnownGood") cfg.peers;
+  unboundedPeers = attrNames (filterAttrs (_: p: p.lastKnownGood.maxAgeSec == null) retainingPeers);
+
+  # The same bounds, as data the boot seed's own age filter can read (see
+  # seedHostsScript below). Only peers that both retain and declared a
+  # bound appear; an absent key there means "unbounded", matching the
+  # daemon's own reading of a null maxAgeSec.
+  seedMaxAgeBounds = mapAttrs (_: p: p.lastKnownGood.maxAgeSec)
+    (filterAttrs (_: p: p.lastKnownGood.maxAgeSec != null) retainingPeers);
+
+  # ---------------------------------------------------------------------
   # config.json rendering — the *only* interface between
   # Nix and nixnetd. nixnetd never reads anything else Nix-shaped.
   # ---------------------------------------------------------------------
@@ -423,7 +488,7 @@ let
     };
     peers = mapAttrs
       (_: p: {
-        inherit (p) hostnames transports onAllDown;
+        inherit (p) hostnames transports onAllDown lastKnownGood;
         hysteresis = p.hysteresis;
       })
       cfg.peers;
@@ -510,11 +575,37 @@ let
       # unreadable, or jq isn't happy with it — the daemon's first probe
       # tick (within one intervalMs of startup) will correct/populate
       # this regardless.
+      #
+      # STALE-2 applies HERE too, and this is the copy of the rule that is
+      # easiest to forget: this script publishes straight into the hosts
+      # file, before nixnetd starts and independent of it. A bound that the
+      # daemon honours and the boot seed does not is not a bound — every
+      # boot would re-assert the very entry the daemon expired, and the
+      # daemon would then leave it alone, because it publishes on CHANGE
+      # and an expired entry it never restored is not a change it makes.
+      # So the same age judgement runs here, from the same recorded
+      # confirmedAt, against the same per-peer bound. A peer with no bound
+      # (absent from $bounds) is unbounded, exactly as in the daemon; a
+      # bounded peer whose state records no confirmedAt at all cannot be
+      # shown to be inside its bound and is therefore dropped.
+      #
+      # The `|| true` swallows a jq failure on a corrupt state file, which
+      # degrades to seeding NOTHING — the safe direction for a file whose
+      # only other option is asserting an address nobody can vouch for.
       if [ -r "${cfg.daemon.stateDir}/state.json" ]; then
-        ${pkgs.jq}/bin/jq -r '
-          .peers // {} | to_entries[] |
-          select(.value.lastPublishedAddress != null and .value.lastPublishedAddress != "") |
-          .value.lastPublishedAddress as $addr | .key as $name | "\($addr)\t\($name)"
+        ${pkgs.jq}/bin/jq -r --argjson bounds '${builtins.toJSON seedMaxAgeBounds}' '
+          .peers // {} | to_entries[]
+          | select(.value.lastPublishedAddress != null and .value.lastPublishedAddress != "")
+          | select(
+              ($bounds[.key] // null) as $bound
+              | if $bound == null then true
+                else
+                  ((.value.confirmedAt // "")
+                   | if . == "" then null else (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) end) as $c
+                  | $c != null and (now - $c) <= $bound
+                end
+            )
+          | "\(.value.lastPublishedAddress)\t\(.key)"
         ' "${cfg.daemon.stateDir}/state.json" 2>/dev/null || true
       fi
       echo "# END nixnet"
@@ -666,7 +757,8 @@ in
           but not actually point at the location you configured.
         '';
       }
-    ] ++ (flatten (mapAttrsToList
+    ]
+    ++ (flatten (mapAttrsToList
       (name: u: imap0
         (i: t: {
           assertion = t.interface != null;
@@ -690,6 +782,24 @@ in
         })
         g.transports)
       (cfg.peers // cfg.uplinks)));
+
+    # STALE-2: a WARNING and not an assertion, deliberately. Refusing to
+    # evaluate would make a bound mandatory, and no number is defensible
+    # from here -- the tolerance belongs to whatever consumes the name. But
+    # an unbounded last-known-good is a defect with a measured cost (eleven
+    # days of a dead address resolving as fact, see lastKnownGoodType
+    # above), so it has to be chosen out loud rather than inherited from a
+    # default that reads as harmless.
+    warnings = optional (unboundedPeers != [ ]) ''
+      nixnet: ${concatStringsSep ", " (map (n: "nixnet.peers.${n}") unboundedPeers)}
+      will keep publishing their last-known-good address forever once every
+      transport is down -- lastKnownGood.maxAgeSec is null, so nothing ever
+      expires the entry. A dead address that keeps resolving is worse than a
+      name that stops resolving: the first is a falsehood consumers cannot
+      detect, the second is a failure they can. Set
+      lastKnownGood.maxAgeSec to however long that name's consumers can
+      usefully retry, or onAllDown = "unpublish" to withdraw immediately.
+    '';
 
     environment.etc."nixnet/config.json".source = configJsonFile;
 

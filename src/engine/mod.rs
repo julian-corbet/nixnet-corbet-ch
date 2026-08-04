@@ -83,6 +83,10 @@ struct Group {
     // Peers only.
     hostnames: Vec<String>,
     on_all_down: String,
+    /// Peers only, STALE-2: how long `on_all_down == "lastKnownGood"` may
+    /// keep publishing an address no probe can confirm any more. `None` ==
+    /// unbounded, which is the defect the bound exists to close.
+    max_age_sec: Option<i64>,
     // Uplinks only.
     route_metric: bool,
     metric_base: i64,
@@ -97,6 +101,12 @@ struct Group {
     /// Peers only: what's currently actually in the managed hosts block
     /// for this peer ("" == not published).
     last_published_addr: String,
+    /// STALE-1/STALE-2: when the published value was last CONFIRMED by a
+    /// successful probe -- not when it was last written. Survives restarts
+    /// (state.json), because the age of an entry does not reset just
+    /// because the process holding it did. `None` == never confirmed by
+    /// this daemon.
+    last_confirmed_at: Option<OffsetDateTime>,
 }
 
 struct EngineState {
@@ -139,6 +149,76 @@ struct Candidate {
     priority: i64,
 }
 
+/// STALE-2's verdict on one retained last-known-good entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staleness {
+    /// Keep publishing: inside the bound, or no bound was declared.
+    Fresh,
+    /// Withdraw. Carries the age, for the ONE log line the withdrawal
+    /// emits -- an operator reading it needs to know how long the address
+    /// had been unconfirmable, not merely that it was.
+    Expired(time::Duration),
+    /// Withdraw, age unknown: a bound is declared, but nothing recorded
+    /// when this entry was last confirmed (state.json written by a nixnet
+    /// that predates the timestamp). An entry that cannot be shown to be
+    /// inside its bound is not inside it -- and the recovery from being
+    /// wrong here costs one probe interval, while the recovery from the
+    /// other reading cost eleven days.
+    ExpiredUnknownAge,
+}
+
+/// The single age judgement behind STALE-2, deliberately a free function
+/// over three values rather than a method on `Group`: the live path
+/// (`reconcile_locked`) and the restore-from-disk path (`state::restore`)
+/// must reach the SAME verdict from the same inputs, and two copies of
+/// this arithmetic is exactly how the production defect survived. The
+/// running daemon had no bound at all, restore-at-start had no age check
+/// either, so every restart laundered an eleven-day-old address into a
+/// fresh-looking one and nothing anywhere ever said "too old".
+fn staleness(
+    max_age_sec: Option<i64>,
+    confirmed_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> Staleness {
+    let bound = match max_age_sec {
+        Some(v) if v > 0 => time::Duration::seconds(v),
+        // No bound (or a nonsensical one that config validation already
+        // rejects on both the Nix and the JSON path): unbounded, the
+        // behaviour this option exists to let an operator opt out of.
+        _ => return Staleness::Fresh,
+    };
+    let confirmed_at = match confirmed_at {
+        Some(t) => t,
+        None => return Staleness::ExpiredUnknownAge,
+    };
+    let age = now - confirmed_at;
+    // A negative age is a clock that moved backwards (NTP step, a VM
+    // restored from a snapshot), never evidence of staleness -- so it
+    // reads as fresh and the next successful probe re-stamps it. Treating
+    // it as expired would let one clock correction withdraw every name on
+    // the host at once, which is the outage this daemon exists to avoid.
+    if age > bound {
+        Staleness::Expired(age)
+    } else {
+        Staleness::Fresh
+    }
+}
+
+/// Renders a `Staleness` age for the withdrawal log line. Kept beside
+/// `staleness` so the "unknown" wording is chosen once, not per call site.
+///
+/// Sub-second precision, because whole seconds print the boundary case as
+/// `age=20s bound=20s` -- a line that reads as though the daemon withdrew
+/// an entry it had just declared fresh, and that is the ONE line an
+/// operator ever sees about this event.
+fn staleness_age_label(s: Staleness) -> String {
+    match s {
+        Staleness::Expired(age) => format!("{:.1}s", age.as_seconds_f64()),
+        Staleness::ExpiredUnknownAge => "unknown (state predates confirmedAt)".to_string(),
+        Staleness::Fresh => String::new(),
+    }
+}
+
 impl Engine {
     /// Builds an Engine from `cfg`. Transport threads are not started
     /// until [`Engine::run`].
@@ -170,6 +250,7 @@ impl Engine {
                     kind: GroupKind::Peer,
                     hostnames: p.hostnames,
                     on_all_down: p.on_all_down,
+                    max_age_sec: p.last_known_good.max_age_sec,
                     route_metric: false,
                     metric_base: 0,
                     metric_step: 0,
@@ -179,6 +260,7 @@ impl Engine {
                     winner_since: None,
                     degraded: false,
                     last_published_addr: String::new(),
+                    last_confirmed_at: None,
                 },
             );
         }
@@ -204,6 +286,9 @@ impl Engine {
                     kind: GroupKind::Uplink,
                     hostnames: Vec::new(),
                     on_all_down: String::new(),
+                    // Uplinks publish a route metric, not a name. There is
+                    // no retained value for a bound to expire.
+                    max_age_sec: None,
                     route_metric: u.publish.route_metric,
                     metric_base: u.publish.metric_base,
                     metric_step: u.publish.metric_step,
@@ -213,6 +298,7 @@ impl Engine {
                     winner_since: None,
                     degraded: false,
                     last_published_addr: String::new(),
+                    last_confirmed_at: None,
                 },
             );
         }
@@ -455,13 +541,62 @@ impl Engine {
                     g.winner = None;
                     g.last_published_addr.clear();
                     Action::PublishPeers
+                } else if kind == GroupKind::Peer
+                    && g.on_all_down == config::ON_ALL_DOWN_LAST_KNOWN_GOOD
+                    && !g.last_published_addr.is_empty()
+                {
+                    // STALE-2. A lastKnownGood peer with something still
+                    // published: keep publishing it only while it is
+                    // inside its declared bound. The policy is named
+                    // explicitly rather than reached by elimination, so
+                    // this stays symmetric with the restore-from-disk
+                    // check in `state::expire_restored_last_known_good`
+                    // -- the two must agree about WHICH peers they apply
+                    // to as much as about the age.
+                    match staleness(g.max_age_sec, g.last_confirmed_at, now) {
+                        Staleness::Fresh => Action::None,
+                        expired => {
+                            // Withdrawn, not marked: a hosts file cannot
+                            // express "probably wrong", so an address that
+                            // has failed every probe for longer than the
+                            // operator declared tolerable is removed
+                            // rather than annotated. The subject stays
+                            // degraded -- this is not a recovery.
+                            //
+                            // Logged exactly ONCE, which the emptied
+                            // `last_published_addr` guarantees structurally
+                            // (this branch needs a non-empty one): at a
+                            // 3-second tick, a line per tick would be
+                            // ~29,000 lines a day describing a single
+                            // event, which is its own outage.
+                            logf!(
+                                "group={} lastKnownGood WITHDRAWN addr={} age={} bound={}s: \
+                                 no probe has confirmed this address since",
+                                group_label,
+                                g.last_published_addr,
+                                staleness_age_label(expired),
+                                g.max_age_sec.unwrap_or_default()
+                            );
+                            g.winner = None;
+                            g.last_published_addr.clear();
+                            Action::PublishPeers
+                        }
+                    }
                 } else {
-                    // uplinks, and lastKnownGood peers: leave the last
-                    // winner/route exactly as it was -- deliberately no
-                    // publish at all.
+                    // uplinks, and lastKnownGood peers with nothing
+                    // published to expire: leave the last winner/route
+                    // exactly as it was -- deliberately no publish at all.
                     Action::None
                 }
             } else {
+                // Everything published for this group from here on is
+                // backed by a transport that just probed successfully:
+                // whichever candidate wins below is Up by construction.
+                // This stamp is what STALE-1 publishes and what STALE-2
+                // measures the age against, so it is set on the tick the
+                // confirmation happened, not on the tick something changed.
+                g.last_confirmed_at = Some(now);
+
                 if g.degraded {
                     g.degraded = false;
                     logf!(
@@ -608,6 +743,14 @@ impl Engine {
             entries.push(publish::Entry {
                 address: g.last_published_addr.clone(),
                 hostnames: g.hostnames.clone(),
+                // STALE-1: the published artifact carries when it was last
+                // confirmed, so a consumer can compute its age without
+                // knowing this daemon's probe cadence -- and without
+                // reading status.json, which most consumers of /etc/hosts
+                // will never do.
+                confirmed_at: g
+                    .last_confirmed_at
+                    .and_then(|t| t.format(&Rfc3339).ok()),
             });
         }
         if let Err(e) = self.hosts.publish(&entries) {
@@ -645,6 +788,14 @@ fn render_group(g: &Group) -> status::Group {
     let mut sg = status::Group {
         winner: String::new(),
         since: String::new(),
+        // STALE-1: `since` is when this winner was SELECTED, which is not
+        // when it was last confirmed -- a winner selected an hour ago and
+        // failing for the last ten minutes has both, and only the second
+        // one tells a reader whether the value can still be trusted.
+        last_confirmed_at: g
+            .last_confirmed_at
+            .and_then(|t| t.format(&Rfc3339).ok())
+            .unwrap_or_default(),
         degraded: g.degraded,
         transports: HashMap::new(),
     };
@@ -705,7 +856,7 @@ mod tests {
     use super::*;
     use crate::publish::{HostsPublisher, RoutePublisher};
 
-    fn new_test_engine() -> (Engine, tempfile::TempDir) {
+    pub(super) fn new_test_engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let hosts = HostsPublisher::new(dir.path().join("hosts")).unwrap();
         // Never actually mutate routing in a test.
@@ -725,11 +876,15 @@ mod tests {
         (eng, dir)
     }
 
-    fn new_peer_group(name: &str, min_hold_ms: i64, on_all_down: &str) -> Group {
+    /// `max_age_sec` is None here -- the unbounded default -- so every
+    /// pre-STALE-2 test keeps exercising exactly what it did before.
+    /// Tests about the bound set `g.max_age_sec` themselves.
+    pub(super) fn new_peer_group(name: &str, min_hold_ms: i64, on_all_down: &str) -> Group {
         Group {
             kind: GroupKind::Peer,
             hostnames: vec![name.to_string()],
             on_all_down: on_all_down.to_string(),
+            max_age_sec: None,
             route_metric: false,
             metric_base: 0,
             metric_step: 0,
@@ -739,6 +894,7 @@ mod tests {
             winner_since: None,
             degraded: false,
             last_published_addr: String::new(),
+            last_confirmed_at: None,
         }
     }
 
@@ -749,7 +905,7 @@ mod tests {
     /// Returns the transport's index within `g.transports` -- tests that
     /// specifically exercise a *changing* dynamic address mutate
     /// `transports[idx].current_address` directly afterward.
-    fn add_transport(g: &mut Group, priority: i64, address: &str) -> usize {
+    pub(super) fn add_transport(g: &mut Group, priority: i64, address: &str) -> usize {
         g.transports.push(TransportRuntime {
             spec: config::Transport {
                 priority,
@@ -1142,6 +1298,251 @@ mod tests {
         let g = state.group(GroupKind::Peer, "host-b");
         assert_eq!(g.last_published_addr, "", "unpublish must clear it");
         assert_eq!(g.winner, None, "unpublish clears the winner too");
+    }
+
+    // ------------------------------------------------------------------
+    // STALE-2, the arithmetic and the LIVE path. The restore-from-disk
+    // path -- the half the production defect actually lived in -- is
+    // tested beside the code that implements it, in `state.rs`. It reuses
+    // the `pub(super)` helpers below rather than owning a second copy of
+    // them, so a group built for a live-path test and one built for a
+    // restore test cannot drift into being different things.
+    // ------------------------------------------------------------------
+
+    pub(super) fn ago(secs: i64) -> OffsetDateTime {
+        OffsetDateTime::now_utc() - time::Duration::seconds(secs)
+    }
+
+    /// The unbounded case is the DEFAULT, so this is the arm most
+    /// configurations take: no bound declared, nothing ever expires. It is
+    /// tested not because it is good but because changing it silently
+    /// would change every existing deployment's behaviour at once.
+    #[test]
+    fn staleness_without_a_bound_never_expires() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            staleness(None, Some(now - time::Duration::days(11)), now),
+            Staleness::Fresh
+        );
+        assert_eq!(staleness(None, None, now), Staleness::Fresh);
+    }
+
+    #[test]
+    fn staleness_inside_the_bound_is_fresh() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            staleness(Some(60), Some(now - time::Duration::seconds(59)), now),
+            Staleness::Fresh
+        );
+    }
+
+    /// The boundary itself. `age == bound` is INSIDE: a bound of 60s means
+    /// "may be published for 60 seconds", and expiring at exactly 60 would
+    /// make the last second of every declared window a lie.
+    #[test]
+    fn staleness_exactly_at_the_bound_is_still_fresh() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            staleness(Some(60), Some(now - time::Duration::seconds(60)), now),
+            Staleness::Fresh
+        );
+        assert!(matches!(
+            staleness(Some(60), Some(now - time::Duration::seconds(61)), now),
+            Staleness::Expired(_)
+        ));
+    }
+
+    #[test]
+    fn staleness_past_the_bound_reports_the_age() {
+        let now = OffsetDateTime::now_utc();
+        match staleness(Some(60), Some(now - time::Duration::seconds(3600)), now) {
+            Staleness::Expired(age) => assert_eq!(age.whole_seconds(), 3600),
+            other => panic!("expected Expired with an age, got {other:?}"),
+        }
+    }
+
+    /// A bounded entry whose confirmation time was never recorded --
+    /// state.json written by a nixnet that predates the timestamp. It
+    /// cannot be shown to be inside its bound, so it is not.
+    #[test]
+    fn staleness_with_a_bound_but_no_confirmation_expires() {
+        assert_eq!(
+            staleness(Some(60), None, OffsetDateTime::now_utc()),
+            Staleness::ExpiredUnknownAge
+        );
+    }
+
+    /// A clock that moved backwards (NTP step, a VM restored from a
+    /// snapshot) makes every confirmation look like it happened in the
+    /// future. That is not evidence of staleness, and reading it as such
+    /// would withdraw every name on the host at once -- the exact outage
+    /// this daemon exists to prevent, caused by the fix for a different
+    /// one.
+    #[test]
+    fn staleness_survives_a_clock_that_moved_backwards() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            staleness(Some(60), Some(now + time::Duration::hours(2)), now),
+            Staleness::Fresh
+        );
+    }
+
+    /// THE behaviour, on the live path: a peer down continuously for
+    /// longer than its bound is REMOVED from the published block -- not
+    /// annotated, not marked, removed. A hosts file cannot express
+    /// "probably wrong".
+    #[test]
+    fn reconcile_withdraws_last_known_good_past_the_bound() {
+        let (eng, dir) = new_test_engine();
+        let hosts_path = dir.path().join("hosts");
+        let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        g.max_age_sec = Some(60);
+        let only = add_transport(&mut g, 10, "192.0.2.10");
+        eng.state.lock().unwrap().peers.insert("host-b".into(), g);
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            state.group_mut(GroupKind::Peer, "host-b").transports[only].state = TransportState::Up;
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+        assert!(
+            std::fs::read_to_string(&hosts_path)
+                .unwrap()
+                .contains("192.0.2.10"),
+            "a healthy peer was never published in the first place"
+        );
+
+        // Everything goes down, and stays down past the bound.
+        {
+            let mut state = eng.state.lock().unwrap();
+            let grp = state.group_mut(GroupKind::Peer, "host-b");
+            grp.transports[only].state = TransportState::Down;
+            grp.last_confirmed_at = Some(ago(3600));
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+
+        let published = std::fs::read_to_string(&hosts_path).unwrap();
+        assert!(
+            !published.contains("192.0.2.10"),
+            "an address unconfirmed for an hour, under a 60s bound, is still \
+             being published:\n{published}"
+        );
+
+        let state = eng.state.lock().unwrap();
+        let g = state.group(GroupKind::Peer, "host-b");
+        assert_eq!(g.last_published_addr, "", "withdrawal must clear the entry");
+        assert_eq!(g.winner, None);
+        assert!(
+            g.degraded,
+            "withdrawing is not recovering -- the subject stays red"
+        );
+    }
+
+    /// The direction that stops the fix from being `unpublish` wearing a
+    /// different name. Inside the bound, a failing peer STILL resolves --
+    /// that is what lastKnownGood is for, and an implementation that
+    /// withdrew immediately would satisfy every other assertion here.
+    #[test]
+    fn reconcile_keeps_last_known_good_inside_the_bound() {
+        let (eng, dir) = new_test_engine();
+        let hosts_path = dir.path().join("hosts");
+        let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        g.max_age_sec = Some(3600);
+        let only = add_transport(&mut g, 10, "192.0.2.10");
+        eng.state.lock().unwrap().peers.insert("host-b".into(), g);
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            state.group_mut(GroupKind::Peer, "host-b").transports[only].state = TransportState::Up;
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+        {
+            let mut state = eng.state.lock().unwrap();
+            let grp = state.group_mut(GroupKind::Peer, "host-b");
+            grp.transports[only].state = TransportState::Down;
+            grp.last_confirmed_at = Some(ago(30)); // well inside 3600
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+
+        assert!(
+            std::fs::read_to_string(&hosts_path)
+                .unwrap()
+                .contains("192.0.2.10"),
+            "a failing peer inside its bound stopped resolving -- that is \
+             `unpublish`, not a bounded lastKnownGood"
+        );
+        let state = eng.state.lock().unwrap();
+        assert!(
+            state.group(GroupKind::Peer, "host-b").degraded,
+            "still publishing is not still healthy"
+        );
+    }
+
+    /// A bound expires an entry; it does not blacklist an address. Trading
+    /// a stale answer for a permanently missing one is not an improvement.
+    #[test]
+    fn a_withdrawn_peer_is_published_again_when_it_comes_back() {
+        let (eng, dir) = new_test_engine();
+        let hosts_path = dir.path().join("hosts");
+        let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        g.max_age_sec = Some(60);
+        g.last_published_addr = "192.0.2.10".into();
+        g.last_confirmed_at = Some(ago(3600));
+        let only = add_transport(&mut g, 10, "192.0.2.10");
+        eng.state.lock().unwrap().peers.insert("host-b".into(), g);
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+        assert!(!std::fs::read_to_string(&hosts_path)
+            .unwrap()
+            .contains("192.0.2.10"));
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            state.group_mut(GroupKind::Peer, "host-b").transports[only].state = TransportState::Up;
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+
+        assert!(
+            std::fs::read_to_string(&hosts_path)
+                .unwrap()
+                .contains("192.0.2.10"),
+            "a recovered peer was not re-published: the bound blacklisted \
+             the address instead of expiring the entry"
+        );
+        let state = eng.state.lock().unwrap();
+        let g = state.group(GroupKind::Peer, "host-b");
+        assert!(!g.degraded);
+        assert!(
+            g.last_confirmed_at.unwrap() > ago(5),
+            "recovery did not re-stamp the confirmation time"
+        );
+    }
+
+    /// `unpublish` peers must not acquire a second, subtly different
+    /// withdrawal path: they already clear on the first all-down tick, and
+    /// the STALE-2 branch must never be the thing that does it for them.
+    #[test]
+    fn the_bound_does_not_apply_to_unpublish_peers() {
+        let (eng, _dir) = new_test_engine();
+        let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_UNPUBLISH);
+        g.max_age_sec = Some(60);
+        let only = add_transport(&mut g, 10, "192.0.2.10");
+        eng.state.lock().unwrap().peers.insert("host-b".into(), g);
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            let grp = state.group_mut(GroupKind::Peer, "host-b");
+            grp.transports[only].state = TransportState::Up;
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+            state.group_mut(GroupKind::Peer, "host-b").transports[only].state =
+                TransportState::Down;
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+        let state = eng.state.lock().unwrap();
+        assert_eq!(state.group(GroupKind::Peer, "host-b").last_published_addr, "");
     }
 
     /// Covers the documented extension beyond a literal winner-index-only
