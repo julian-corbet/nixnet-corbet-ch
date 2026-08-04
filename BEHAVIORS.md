@@ -5,11 +5,18 @@ not a description of what runs today** — several entries exist because the cur
 `TEST-1` is what turns an entry into evidence.
 
 **Why one repo.** nixnet owns a host's network reality: addressing, transports and failover, the overlay, peers,
-DNS, ingress — and now the packet filter, split into a separate repo and folding back in. The split cost a
-production edge host most of a day: the firewall repo could not know the host was DHCP-addressed, so its
-default-drop input chain dropped the RENEW leg; the lease expired ~21h later and the box went dark with symptoms
-naming DNS, the metadata service and the overlay — everything except the firewall. One owner, one evaluation,
-one place where "this host is DHCP-addressed" and "this host drops unmatched input" meet.
+DNS, ingress — and now the packet filter, split into a separate repo and folding back in. The split's cost is
+structural rather than anecdotal: a firewall repo cannot see how a host gets its address, so every rule that
+depends on that fact is something a human has to remember. One owner, one evaluation, one place where "this host
+is DHCP-addressed" and "this host drops unmatched input" meet.
+
+A caution about the example that motivated this, because it was wrong. The rebuild began believing a
+default-deny chain without DHCP accepts had cost an edge host its address at lease expiry. Measured in a VM
+(`TEST-2`), it does not: conntrack's established/related accept matches the unicast RENEW's reply, and on the
+broadcast leg both dhcpcd and systemd-networkd fall back to a raw AF_PACKET socket delivered before the input
+hook. The rules are parity with nixpkgs, not a rescue, and that host died of something else entirely. The
+derivation in `OWN-1` is still right — a rule that cannot see the fact it depends on is a rule waiting to be
+forgotten — but it is justified by the structure, not by that outage.
 
 Ids are machine-read (`### <ID> — <title>`, id is the first token) and stable. Do not renumber.
 
@@ -342,10 +349,13 @@ multi-machine VM network and asserts reachability from the OTHER node, over the 
 concerns, after the change is applied — including a DHCP-addressed node held past lease expiry on a deliberately
 short lease, which must keep its address.
 
-Why: the DHCP incident is the specification. It was invisible to every existing check because the initial
-handshake goes out over a raw socket that never traverses the filter, so the host comes up addressed and looks
-healthy; only the renew, hours later, is dropped. A test asserting at the moment of applying cannot see it; a
-test that waits out a lease can.
+Why: the DHCP case is the specification, and it is subtler than it first looks. The obvious test is vacuous —
+the initial handshake goes out over a raw socket that never traverses the filter, so a host comes up addressed
+whatever the ruleset says. The second-obvious test is ALSO vacuous: waiting out a lease proves nothing either,
+because conntrack admits the unicast renew's reply and both common clients fall back to AF_PACKET when pushed
+onto the broadcast leg. Measured: 13 of 13 replies hit the policy drop and the lease renewed anyway. So the test
+asserts the PACKET VERDICT — observer chains straddling nixnet's input chain — rather than an address the host
+would have kept regardless.
 
 Not: the code under test is never handed a stub for the kernel interface it is tested against. A route test
 whose route command is a no-op binary tests the test.
