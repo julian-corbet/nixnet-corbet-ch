@@ -107,11 +107,21 @@ struct Group {
     /// because the process holding it did. `None` == never confirmed by
     /// this daemon.
     last_confirmed_at: Option<OffsetDateTime>,
+    /// Uplinks only: the last route-publish failure already reported for
+    /// this group, so a persistent one is logged once instead of once per
+    /// tick. See `log_publish_error`.
+    last_publish_error: String,
 }
 
+#[derive(Default)]
 struct EngineState {
     peers: HashMap<String, Group>,
     uplinks: HashMap<String, Group>,
+    /// The last hosts-publish failure already reported. Per ENGINE, not
+    /// per group: the hosts file is one shared artifact that every peer
+    /// group renders into, so a failure to write it is one event no matter
+    /// which group's tick discovered it.
+    last_hosts_error: String,
 }
 
 impl EngineState {
@@ -261,6 +271,7 @@ impl Engine {
                     degraded: false,
                     last_published_addr: String::new(),
                     last_confirmed_at: None,
+                    last_publish_error: String::new(),
                 },
             );
         }
@@ -299,11 +310,16 @@ impl Engine {
                     degraded: false,
                     last_published_addr: String::new(),
                     last_confirmed_at: None,
+                    last_publish_error: String::new(),
                 },
             );
         }
 
-        let mut state = EngineState { peers, uplinks };
+        let mut state = EngineState {
+            peers,
+            uplinks,
+            ..Default::default()
+        };
         Self::load_state(&state_path, &mut state);
 
         Self {
@@ -351,8 +367,12 @@ impl Engine {
         // declared beyond its attribute name was simply absent. Observed
         // in production: `getent hosts <alias>` returned NXDOMAIN on a
         // host whose nixnetd had been up, healthy, and reporting correct
-        // winners for hours.
+        // winners for hours. The uplink half is the same claim about the
+        // routing table: a DHCP client that renewed while this process was
+        // down has already put the metric back where nixnet does not want
+        // it.
         self.publish_restored_peers();
+        self.publish_restored_uplinks();
 
         // A host with zero peer groups and zero uplink groups configured
         // (nixnet enabled ahead of any real config -- a legitimate,
@@ -503,15 +523,51 @@ impl Engine {
     /// address changes, even with no winner-index change at all (a
     /// provider re-enrolling with a new overlay IP, e.g.). Callers must
     /// hold the lock (pass the already-locked `state`).
+    ///
+    /// TF-2: EVERY tick ends in a publication attempt, whether or not
+    /// anything about this group changed. The publish backends compare
+    /// what they would write against what is live and write only on a
+    /// difference, so a settled group costs one file read or one route
+    /// read-back and nothing else. Publication used to be emitted inside
+    /// the winner-change branch alone, which made it fiction on any host
+    /// whose winner never changes: a single-uplink host declared metric
+    /// 600, ran on DHCP's metric 100, and logged not one publish line in
+    /// the deployment's entire history. Publication is reconciliation
+    /// against observed reality, and a transition-driven publisher is
+    /// correct exactly until something else changes the world behind its
+    /// back -- which is always.
     fn reconcile_locked(&self, state: &mut EngineState, kind: GroupKind, name: &str) {
         let now = OffsetDateTime::now_utc();
         let group_label = format!("{}={}", kind.label(), name);
 
         enum Action {
             None,
-            PublishPeers,
-            PublishUplink(Vec<publish::RankedInterface>, bool, i64, i64),
+            /// Re-render the managed hosts block. `passive` marks a tick
+            /// that changed nothing in nixnet's own state, where an EMPTY
+            /// block must never be rendered over the activation seed --
+            /// the same rule, and the same reason, as
+            /// `publish_restored_peers`.
+            PublishPeers {
+                passive: bool,
+            },
+            PublishUplink(Vec<publish::RankedInterface>, i64, i64),
         }
+
+        // The uplink half of TF-2, in one place: the ranking a group
+        // publishes does not depend on whether anything changed this tick,
+        // only on who the winner is -- so the "nothing changed" and "winner
+        // changed" arms below hand back the identical action.
+        let uplink_action = |g: &Group| -> Action {
+            let ranked = uplink_ranking(g);
+            if ranked.is_empty() {
+                // No winner yet (nothing probed successfully since boot,
+                // and nothing restored), route publication turned off, or
+                // no interface named: nixnet has no opinion to assert.
+                Action::None
+            } else {
+                Action::PublishUplink(ranked, g.metric_base, g.metric_step)
+            }
+        };
 
         let action = {
             let g = state.group_mut(kind, name);
@@ -540,7 +596,9 @@ impl Engine {
                 {
                     g.winner = None;
                     g.last_published_addr.clear();
-                    Action::PublishPeers
+                    // Not passive: withdrawing the last entry on the host
+                    // legitimately renders an empty block, and must.
+                    Action::PublishPeers { passive: false }
                 } else if kind == GroupKind::Peer
                     && g.on_all_down == config::ON_ALL_DOWN_LAST_KNOWN_GOOD
                     && !g.last_published_addr.is_empty()
@@ -554,7 +612,12 @@ impl Engine {
                     // -- the two must agree about WHICH peers they apply
                     // to as much as about the age.
                     match staleness(g.max_age_sec, g.last_confirmed_at, now) {
-                        Staleness::Fresh => Action::None,
+                        // Still inside the bound: keep publishing it, and
+                        // keep asserting it (TF-2) -- a retained
+                        // last-known-good is exactly the entry most likely
+                        // to be quietly dropped by something else, since
+                        // nothing about it changes to trigger a rewrite.
+                        Staleness::Fresh => Action::PublishPeers { passive: true },
                         expired => {
                             // Withdrawn, not marked: a hosts file cannot
                             // express "probably wrong", so an address that
@@ -579,14 +642,21 @@ impl Engine {
                             );
                             g.winner = None;
                             g.last_published_addr.clear();
-                            Action::PublishPeers
+                            Action::PublishPeers { passive: false }
                         }
                     }
+                } else if kind == GroupKind::Uplink {
+                    // Every uplink transport is down. The winner pointer is
+                    // deliberately left where it was -- nixnet has no
+                    // better candidate to name, and withdrawing the
+                    // ranking would hand the choice back to whatever
+                    // metrics DHCP happens to have installed. It is still
+                    // re-asserted (TF-2): the published intent has not
+                    // changed just because every probe is failing.
+                    uplink_action(g)
                 } else {
-                    // uplinks, and lastKnownGood peers with nothing
-                    // published to expire: leave the last winner/route
-                    // exactly as it was -- deliberately no publish at all.
-                    Action::None
+                    // lastKnownGood peers with nothing published to expire.
+                    Action::PublishPeers { passive: true }
                 }
             } else {
                 // Everything published for this group from here on is
@@ -648,7 +718,14 @@ impl Engine {
                 }
 
                 if !winner_changed && !address_drift {
-                    Action::None
+                    // The settled case, and the one the old code treated as
+                    // "nothing to do" -- which is how a host published
+                    // nothing for its entire uptime. Nothing about the
+                    // GROUP changed; the world outside it may have.
+                    match kind {
+                        GroupKind::Peer => Action::PublishPeers { passive: true },
+                        GroupKind::Uplink => uplink_action(g),
+                    }
                 } else {
                     if winner_changed {
                         g.winner = Some(new_winner);
@@ -664,29 +741,9 @@ impl Engine {
                         GroupKind::Peer => {
                             g.last_published_addr =
                                 g.transports[new_winner].current_address.clone();
-                            Action::PublishPeers
+                            Action::PublishPeers { passive: false }
                         }
-                        GroupKind::Uplink => {
-                            let w = g.winner.expect("winner just set above");
-                            let mut ranked = Vec::with_capacity(candidates.len());
-                            ranked.push(publish::RankedInterface {
-                                interface: g.transports[w].spec.interface.clone(),
-                            });
-                            for c in &candidates {
-                                if c.idx == w {
-                                    continue;
-                                }
-                                ranked.push(publish::RankedInterface {
-                                    interface: g.transports[c.idx].spec.interface.clone(),
-                                });
-                            }
-                            Action::PublishUplink(
-                                ranked,
-                                g.route_metric,
-                                g.metric_base,
-                                g.metric_step,
-                            )
-                        }
+                        GroupKind::Uplink => uplink_action(g),
                     }
                 }
             }
@@ -694,14 +751,42 @@ impl Engine {
 
         match action {
             Action::None => {}
-            Action::PublishPeers => self.publish_peers_locked(state),
-            Action::PublishUplink(ranked, route_metric, metric_base, metric_step) => {
-                if !route_metric {
+            Action::PublishPeers { passive } => {
+                // A passive tick must never render an EMPTY managed block:
+                // before the first winner is established, the activation
+                // script's boot seed is the only last-known-good content
+                // that exists, and overwriting it with emptiness is
+                // strictly worse than leaving it alone. A withdrawal
+                // (`passive == false`) does exactly that on purpose.
+                if passive && nothing_to_publish(state) {
                     return;
                 }
-                if let Err(e) = self.routes.apply(&ranked, metric_base, metric_step) {
-                    logf!("publish routes for group={}: {}", group_label, e);
+                self.publish_peers_locked(state);
+            }
+            Action::PublishUplink(ranked, metric_base, metric_step) => {
+                let out = self.routes.apply(&ranked, metric_base, metric_step);
+                // One line per route actually moved -- and, because the
+                // publisher writes only on a difference, no line at all
+                // when the live table already agreed. This is TF-2's
+                // "logging the re-assert": on a settled host it is silent
+                // for months and then says exactly what changed the table
+                // back.
+                for c in &out.changes {
+                    logf!(
+                        "group={} route re-assert dev={} metric={}->{}",
+                        group_label,
+                        c.interface,
+                        c.from_metric,
+                        c.to_metric
+                    );
                 }
+                let what = format!("publish routes for group={}", group_label);
+                let g = state.group_mut(kind, name);
+                log_publish_error(
+                    &mut g.last_publish_error,
+                    &what,
+                    out.error.map(|e| e.to_string()),
+                );
             }
         }
     }
@@ -718,15 +803,53 @@ impl Engine {
     /// is the only last-known-good content that exists at that point. The
     /// first real probe tick publishes as it always did.
     fn publish_restored_peers(&self) {
-        let state = self.state.lock().unwrap();
-        if state
-            .peers
-            .values()
-            .all(|g| g.last_published_addr.is_empty())
-        {
+        let mut state = self.state.lock().unwrap();
+        if nothing_to_publish(&state) {
             return;
         }
-        self.publish_peers_locked(&state);
+        self.publish_peers_locked(&mut state);
+    }
+
+    /// The uplink counterpart, for the same reason: the winner restored
+    /// from `state.json` is what this host had already decided, and the
+    /// routing table it is decided about belongs to the kernel, not to
+    /// this process -- a DHCP client that renewed while the daemon was
+    /// down has already rewritten the metric back. Doing it here rather
+    /// than waiting for the first probe tick closes a window of one probe
+    /// interval on every restart.
+    ///
+    /// Deliberately a no-op when nothing was restored: `uplink_ranking`
+    /// yields nothing without a winner, and nixnet never invents a
+    /// ranking it has not measured.
+    fn publish_restored_uplinks(&self) {
+        let mut state = self.state.lock().unwrap();
+        let names: Vec<String> = state.uplinks.keys().cloned().collect();
+        for name in names {
+            let (ranked, metric_base, metric_step) = {
+                let g = &state.uplinks[&name];
+                (uplink_ranking(g), g.metric_base, g.metric_step)
+            };
+            if ranked.is_empty() {
+                continue;
+            }
+            let out = self.routes.apply(&ranked, metric_base, metric_step);
+            for c in &out.changes {
+                logf!(
+                    "group=uplink={} route re-assert dev={} metric={}->{} (restart)",
+                    name,
+                    c.interface,
+                    c.from_metric,
+                    c.to_metric
+                );
+            }
+            let what = format!("publish routes for group=uplink={}", name);
+            let g = state.uplinks.get_mut(&name).expect("uplink group exists");
+            log_publish_error(
+                &mut g.last_publish_error,
+                &what,
+                out.error.map(|e| e.to_string()),
+            );
+        }
     }
 
     /// Rewrites the whole managed hosts block from every peer group's
@@ -734,7 +857,11 @@ impl Engine {
     /// changed) -- the publish backend is a single shared file, so any
     /// change requires re-rendering the entire block. Callers must hold
     /// the lock.
-    fn publish_peers_locked(&self, state: &EngineState) {
+    ///
+    /// TF-2: called on every peer tick, and the backend writes only when
+    /// the rendered block differs from the live file, so the ordinary
+    /// outcome is one read and nothing else.
+    fn publish_peers_locked(&self, state: &mut EngineState) {
         let mut entries = Vec::new();
         for g in state.peers.values() {
             if g.last_published_addr.is_empty() {
@@ -748,14 +875,22 @@ impl Engine {
                 // knowing this daemon's probe cadence -- and without
                 // reading status.json, which most consumers of /etc/hosts
                 // will never do.
-                confirmed_at: g
-                    .last_confirmed_at
-                    .and_then(|t| t.format(&Rfc3339).ok()),
+                confirmed_at: g.last_confirmed_at.and_then(|t| t.format(&Rfc3339).ok()),
             });
         }
-        if let Err(e) = self.hosts.publish(&entries) {
-            logf!("publish hosts: {}", e);
+        let result = self.hosts.publish(&entries);
+        if let Ok(true) = result {
+            logf!(
+                "hosts re-assert: wrote {} entries -- the live file did not \
+                 match what this daemon publishes",
+                entries.len()
+            );
         }
+        log_publish_error(
+            &mut state.last_hosts_error,
+            "publish hosts",
+            result.err().map(|e| e.to_string()),
+        );
     }
 
     /// Renders `/run/nixnet/status.json` -- every tick, regardless of
@@ -780,6 +915,94 @@ impl Engine {
 
         if let Err(e) = status::write(&self.status_path, snap) {
             logf!("write status: {}", e);
+        }
+    }
+}
+
+/// True when no peer group has anything to publish -- a first-ever start,
+/// or a wiped stateDir. Rendering the managed block then would write an
+/// EMPTY one over the activation script's boot seed, which is the only
+/// last-known-good content in the file at that point.
+fn nothing_to_publish(state: &EngineState) -> bool {
+    state
+        .peers
+        .values()
+        .all(|g| g.last_published_addr.is_empty())
+}
+
+/// The full published ranking for an uplink group: the winner first, then
+/// every OTHER transport of the same subject -- healthy ones in priority
+/// order, then the rest. `apply` turns the position into a metric, so the
+/// position IS the published preference.
+///
+/// TF-3: the losers are in this list, and that is the whole point. A
+/// ranking of healthy candidates only leaves the transport that just
+/// FAILED sitting on the metric it won with, so the ex-winner and the new
+/// winner both end up at `metricBase` -- two equal-cost defaults, between
+/// which the kernel picks whichever it likes, possibly the dead one.
+/// Demoting the loser is not a detail of metric failover; it is the
+/// entirety of it.
+///
+/// Health outranks priority for the non-winners on purpose: the metric
+/// order is the order the kernel falls back through if nixnet's own winner
+/// stops working before the next probe notices, so a DOWN transport must
+/// never sit ahead of a healthy one, however preferred it is on paper.
+fn uplink_ranking(g: &Group) -> Vec<publish::RankedInterface> {
+    let winner = match g.winner {
+        Some(w) if g.route_metric && w < g.transports.len() => w,
+        _ => return Vec::new(),
+    };
+
+    let mut order: Vec<usize> = (0..g.transports.len()).filter(|&i| i != winner).collect();
+    order.sort_by_key(|&i| {
+        let tr = &g.transports[i];
+        (tr.state != TransportState::Up, tr.spec.priority, i)
+    });
+    order.insert(0, winner);
+
+    let mut ranked = Vec::with_capacity(order.len());
+    let mut seen: Vec<&str> = Vec::with_capacity(order.len());
+    for i in order {
+        let tr = &g.transports[i];
+        // An uplink transport with no interface cannot have a route
+        // reprioritized (config validation rejects one, so this is the
+        // hand-written-JSON path), and two transports sharing ONE
+        // interface -- two probe targets over the same link -- would
+        // otherwise be handed two different metrics for the same route and
+        // fight over it, every tick, forever. The better-ranked one wins.
+        if tr.spec.interface.is_empty() || seen.contains(&tr.spec.interface.as_str()) {
+            continue;
+        }
+        seen.push(&tr.spec.interface);
+        ranked.push(publish::RankedInterface {
+            interface: tr.spec.interface.clone(),
+            healthy: tr.state == TransportState::Up,
+        });
+    }
+    ranked
+}
+
+/// Logs a publish failure only when it is not the one already reported,
+/// and logs the recovery when it clears.
+///
+/// TF-2 made publication a per-tick operation, so a failure that persists
+/// -- a read-only `/etc`, an interface that stays gone -- would otherwise
+/// emit one identical line every tick: ~29,000 lines a day describing a
+/// single event, which is its own outage, and the same arithmetic that
+/// makes the STALE-2 withdrawal log exactly once.
+fn log_publish_error(reported: &mut String, what: &str, err: Option<String>) {
+    match err {
+        Some(e) => {
+            if *reported != e {
+                logf!("{}: {}", what, e);
+                *reported = e;
+            }
+        }
+        None => {
+            if !reported.is_empty() {
+                logf!("{}: recovered", what);
+                reported.clear();
+            }
         }
     }
 }
@@ -855,6 +1078,10 @@ fn transport_id(kind: GroupKind, group_name: &str, idx: usize, t: &config::Trans
 mod tests {
     use super::*;
     use crate::publish::{HostsPublisher, RoutePublisher};
+    // The recording stand-in `ip`, shared with the publisher's own tests so
+    // "the engine called it" and "it emitted the right thing" stay claims
+    // about one program.
+    use crate::publish::route::tests as route_fakes;
 
     pub(super) fn new_test_engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -868,12 +1095,41 @@ mod tests {
             routes,
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
-            state: Mutex::new(EngineState {
-                peers: HashMap::new(),
-                uplinks: HashMap::new(),
-            }),
+            state: Mutex::new(EngineState::default()),
         };
         (eng, dir)
+    }
+
+    /// The same engine, but pointed at the recording stand-in `ip` instead
+    /// of `/bin/true`: every route command the engine issues (and, more to
+    /// the point of TF-2, every one it does NOT issue) is readable from
+    /// `dir/argv.log` afterwards.
+    fn new_routing_engine() -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = Engine {
+            hosts: HostsPublisher::new(dir.path().join("hosts")).unwrap(),
+            routes: RoutePublisher {
+                ip_path: route_fakes::fake_ip(dir.path()),
+            },
+            status_path: dir.path().join("status.json"),
+            state_path: dir.path().join("state.json"),
+            state: Mutex::new(EngineState::default()),
+        };
+        (eng, dir)
+    }
+
+    /// An uplink group as a settled host has it: a winner already selected
+    /// (restored from state.json across the last restart, or chosen hours
+    /// ago), every transport healthy, nothing about to change.
+    fn settled_uplink(eng: &Engine, name: &str, ifaces: &[(&str, i64)], winner: usize) {
+        let mut g = new_uplink_group(10_000, 100, 50);
+        for (iface, priority) in ifaces {
+            let idx = add_uplink_transport(&mut g, *priority, iface);
+            g.transports[idx].state = TransportState::Up;
+        }
+        g.winner = Some(winner);
+        g.winner_since = Some(OffsetDateTime::now_utc());
+        eng.state.lock().unwrap().uplinks.insert(name.into(), g);
     }
 
     /// `max_age_sec` is None here -- the unbounded default -- so every
@@ -895,7 +1151,51 @@ mod tests {
             degraded: false,
             last_published_addr: String::new(),
             last_confirmed_at: None,
+            last_publish_error: String::new(),
         }
+    }
+
+    /// An uplink group the way `Engine::new` builds one, with route-metric
+    /// publication on -- the configuration the whole of TF-2/TF-3 is
+    /// about.
+    pub(super) fn new_uplink_group(min_hold_ms: i64, metric_base: i64, metric_step: i64) -> Group {
+        Group {
+            kind: GroupKind::Uplink,
+            hostnames: Vec::new(),
+            on_all_down: String::new(),
+            max_age_sec: None,
+            route_metric: true,
+            metric_base,
+            metric_step,
+            min_hold_ms,
+            transports: Vec::new(),
+            winner: None,
+            winner_since: None,
+            degraded: false,
+            last_published_addr: String::new(),
+            last_confirmed_at: None,
+            last_publish_error: String::new(),
+        }
+    }
+
+    /// Adds an uplink transport, which is addressed by INTERFACE rather
+    /// than by address -- that is the whole difference between a group
+    /// that publishes a name and one that publishes a route metric.
+    pub(super) fn add_uplink_transport(g: &mut Group, priority: i64, interface: &str) -> usize {
+        g.transports.push(TransportRuntime {
+            spec: config::Transport {
+                priority,
+                interface: interface.to_string(),
+                ..Default::default()
+            },
+            id: interface.to_string(),
+            state: TransportState::Unknown,
+            consecutive_success: 0,
+            consecutive_failure: 0,
+            current_address: String::new(),
+            detail: String::new(),
+        });
+        g.transports.len() - 1
     }
 
     /// Mirrors the real invariant `probe_once` maintains: every
@@ -1030,10 +1330,7 @@ mod tests {
             },
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
-            state: Mutex::new(EngineState {
-                peers: HashMap::new(),
-                uplinks: HashMap::new(),
-            }),
+            state: Mutex::new(EngineState::default()),
         };
         // A configured peer whose winner was never established, i.e. no
         // state.json existed to restore a `last_published_addr` from.
@@ -1301,6 +1598,376 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // TF-2: publication happens on reconcile, not only on winner change.
+    //
+    // The defect these cover is not hypothetical and not partial: the route
+    // publisher had never run, on any host, in the entire life of the
+    // deployment. It was emitted from inside the winner-change branch
+    // alone, and a single-uplink host has no winner change after the first
+    // one -- which, restored from state.json, never happens again either.
+    // So the host declared metricBase 600, ran on DHCP's metric 100, and
+    // logged not one publish line, while every test in this file passed.
+    // A test that merely EXERCISES the publisher proves nothing about
+    // that; these assert on which ticks it is reached.
+    // ------------------------------------------------------------------
+
+    /// THE production case. One uplink, winner already established, no
+    /// winner change now or ever again -- and the live route is still on
+    /// the metric DHCP gave it. Against the old code this asserts nothing
+    /// happening at all: no `ip` invocation of any kind.
+    #[test]
+    fn a_settled_single_uplink_host_still_publishes_its_metric() {
+        let (eng, dir) = new_routing_engine();
+        // The live route is the one DHCP installed, at DHCP's metric --
+        // which is what every host in the deployment was actually running
+        // on while its config declared something else entirely.
+        route_fakes::canned_route(
+            dir.path(),
+            "wan0",
+            r#"[{"dst":"default","gateway":"192.0.2.1","dev":"wan0","protocol":"dhcp","metric":600,"flags":[]}]"#,
+        );
+        settled_uplink(&eng, "internet", &[("wan0", 10)], 0);
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            eng.reconcile_locked(&mut state, GroupKind::Uplink, "internet");
+        }
+
+        assert_eq!(
+            route_fakes::published_metrics(dir.path()),
+            vec![("wan0".to_string(), 100)],
+            "a host whose winner never changes published nothing -- which is \
+             the entire defect: the declared metric is fiction and the live \
+             route keeps whatever DHCP set"
+        );
+    }
+
+    /// ...and the reason the metric above is 100 rather than the canned
+    /// 600: TF-2's "Not:" clause. A reconcile that finds the live table
+    /// already saying what nixnet publishes must issue NO route command --
+    /// otherwise the fix trades a silent no-op for two route-table
+    /// transactions per interface per tick, forever.
+    #[test]
+    fn an_uplink_reconcile_against_an_agreeing_table_writes_nothing() {
+        let (eng, dir) = new_routing_engine();
+        route_fakes::canned_route(
+            dir.path(),
+            "wan0",
+            r#"[{"dst":"default","gateway":"192.0.2.1","dev":"wan0","metric":100,"flags":[]}]"#,
+        );
+        settled_uplink(&eng, "internet", &[("wan0", 10)], 0);
+
+        for _ in 0..3 {
+            let mut state = eng.state.lock().unwrap();
+            eng.reconcile_locked(&mut state, GroupKind::Uplink, "internet");
+        }
+
+        assert!(
+            !route_fakes::invocations(dir.path()).is_empty(),
+            "the live table was never even read, so nothing was reconciled"
+        );
+        assert_eq!(
+            route_fakes::writes(dir.path()),
+            Vec::<Vec<String>>::new(),
+            "an unchanged uplink rewrote the routing table anyway"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TF-3: the loser is demoted in the same operation that promotes the
+    // winner.
+    // ------------------------------------------------------------------
+
+    /// A real failover between two uplinks. The old publisher re-metricked
+    /// only the candidates it could verify as Up, so the interface that had
+    /// just FAILED kept the metric it won with: both defaults ended at
+    /// metricBase, tied, and the kernel picked between two equal-cost
+    /// routes -- possibly the dead one.
+    #[test]
+    fn a_winner_change_leaves_no_two_transports_sharing_a_metric() {
+        let (eng, dir) = new_routing_engine();
+        // The table as the previous publication left it: wired0 won at
+        // 100, wireless0 sat one step behind at 150.
+        route_fakes::canned_route(
+            dir.path(),
+            "wired0",
+            r#"[{"dst":"default","gateway":"192.0.2.1","dev":"wired0","metric":100,"flags":[]}]"#,
+        );
+        route_fakes::canned_route(
+            dir.path(),
+            "wireless0",
+            r#"[{"dst":"default","gateway":"192.0.2.129","dev":"wireless0","metric":150,"flags":[]}]"#,
+        );
+        settled_uplink(&eng, "internet", &[("wired0", 10), ("wireless0", 50)], 0);
+
+        // The wire is cut.
+        {
+            let mut state = eng.state.lock().unwrap();
+            state.group_mut(GroupKind::Uplink, "internet").transports[0].state =
+                TransportState::Down;
+            eng.reconcile_locked(&mut state, GroupKind::Uplink, "internet");
+        }
+
+        assert_eq!(
+            eng.state
+                .lock()
+                .unwrap()
+                .group(GroupKind::Uplink, "internet")
+                .winner,
+            Some(1),
+            "the dead transport is still the winner"
+        );
+
+        let metrics = route_fakes::published_metrics(dir.path());
+        let winner = metrics
+            .iter()
+            .find(|(dev, _)| dev == "wireless0")
+            .unwrap_or_else(|| panic!("the new winner was never published: {metrics:?}"))
+            .1;
+        let loser = metrics
+            .iter()
+            .find(|(dev, _)| dev == "wired0")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the transport that just failed was never demoted, so it \
+                     still holds the metric it won with: {metrics:?}"
+                )
+            })
+            .1;
+        assert!(
+            winner < loser,
+            "the new winner is not strictly cheaper than the ex-winner \
+             ({winner} vs {loser}) -- the kernel is choosing between two \
+             defaults on its own"
+        );
+
+        let mut seen: Vec<i64> = metrics.iter().map(|(_, m)| *m).collect();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            before,
+            "two transports share a metric: {metrics:?}"
+        );
+    }
+
+    /// TF-3's boundary, which is as load-bearing as the demotion itself:
+    /// nixnet does NOT delete the loser's route. Deleting a default that a
+    /// foreign DHCP client installed puts the host one lease renewal away
+    /// from a fight nixnet loses -- and, in the meantime, with no route at
+    /// all over an interface that may be the only one that comes back.
+    #[test]
+    fn the_demoted_loser_keeps_a_default_route() {
+        let (eng, dir) = new_routing_engine();
+        route_fakes::canned_route(
+            dir.path(),
+            "wired0",
+            r#"[{"dst":"default","gateway":"192.0.2.1","dev":"wired0","metric":100,"flags":[]}]"#,
+        );
+        route_fakes::canned_route(
+            dir.path(),
+            "wireless0",
+            r#"[{"dst":"default","gateway":"192.0.2.129","dev":"wireless0","metric":150,"flags":[]}]"#,
+        );
+        settled_uplink(&eng, "internet", &[("wired0", 10), ("wireless0", 50)], 0);
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            state.group_mut(GroupKind::Uplink, "internet").transports[0].state =
+                TransportState::Down;
+            eng.reconcile_locked(&mut state, GroupKind::Uplink, "internet");
+        }
+
+        // Replay the recorded commands against the interface's route set:
+        // `replace` installs at a metric, `del` removes the one at that
+        // metric. What survives is what the kernel would be left holding.
+        let mut wired0: Vec<i64> = vec![100];
+        for a in route_fakes::writes(dir.path()) {
+            if a.iter().any(|x| x == "wired0") {
+                let metric: i64 = a.last().unwrap().parse().unwrap();
+                match a[1].as_str() {
+                    "replace" => {
+                        if !wired0.contains(&metric) {
+                            wired0.push(metric)
+                        }
+                    }
+                    "del" => wired0.retain(|m| *m != metric),
+                    other => panic!("unexpected route verb {other}: {a:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            wired0,
+            vec![150],
+            "the loser's default route did not end up demoted-and-intact -- \
+             an empty set here means nixnet deleted a route a DHCP client \
+             owns"
+        );
+    }
+
+    /// Health outranks declared priority for the non-winners. The metric
+    /// order IS the order the kernel falls back through when nixnet's
+    /// winner stops working before the next probe notices, so a DOWN
+    /// transport must never sit ahead of a healthy one, however preferred
+    /// it is on paper.
+    #[test]
+    fn a_down_transport_ranks_behind_every_healthy_one() {
+        let mut g = new_uplink_group(0, 100, 50);
+        let dead_but_preferred = add_uplink_transport(&mut g, 10, "wired0");
+        let healthy_fallback = add_uplink_transport(&mut g, 50, "wireless0");
+        let healthy_winner = add_uplink_transport(&mut g, 20, "wwan0");
+        g.transports[dead_but_preferred].state = TransportState::Down;
+        g.transports[healthy_fallback].state = TransportState::Up;
+        g.transports[healthy_winner].state = TransportState::Up;
+        g.winner = Some(healthy_winner);
+
+        let ranked: Vec<String> = uplink_ranking(&g)
+            .iter()
+            .map(|r| r.interface.clone())
+            .collect();
+        assert_eq!(ranked, vec!["wwan0", "wireless0", "wired0"]);
+    }
+
+    /// Two transports over ONE interface -- two probe targets across the
+    /// same link -- share one default route. Handing each its own metric
+    /// would have them rewrite that single route twice per tick, forever.
+    #[test]
+    fn two_transports_on_one_interface_are_published_once() {
+        let mut g = new_uplink_group(0, 100, 50);
+        for _ in 0..2 {
+            let i = add_uplink_transport(&mut g, 10, "wan0");
+            g.transports[i].state = TransportState::Up;
+        }
+        g.winner = Some(0);
+
+        assert_eq!(uplink_ranking(&g).len(), 1);
+    }
+
+    /// Route publication is opt-out per uplink, and staying out means
+    /// staying out: nothing is read, nothing is written.
+    #[test]
+    fn an_uplink_with_route_metric_off_publishes_nothing() {
+        let (eng, dir) = new_routing_engine();
+        settled_uplink(&eng, "internet", &[("wan0", 10)], 0);
+        {
+            let mut state = eng.state.lock().unwrap();
+            state.group_mut(GroupKind::Uplink, "internet").route_metric = false;
+            eng.reconcile_locked(&mut state, GroupKind::Uplink, "internet");
+        }
+        assert_eq!(
+            route_fakes::invocations(dir.path()),
+            Vec::<Vec<String>>::new()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // TF-2, the peer half: the same rule about the hosts file.
+    // ------------------------------------------------------------------
+
+    /// Something else emptied the managed block -- an activation, an
+    /// editor, a package's post-install script. With publication driven by
+    /// winner changes alone, a settled host never noticed: the names stayed
+    /// NXDOMAIN until something unrelated changed a winner.
+    #[test]
+    fn a_hosts_block_emptied_behind_the_daemon_is_restored_on_the_next_tick() {
+        let (eng, dir) = new_test_engine();
+        let hosts_path = dir.path().join("hosts");
+        let mut g = new_peer_group("host-b", 10_000, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let only = add_transport(&mut g, 10, "192.0.2.10");
+        g.winner = Some(only);
+        g.winner_since = Some(OffsetDateTime::now_utc());
+        g.last_published_addr = "192.0.2.10".to_string();
+        g.transports[only].state = TransportState::Up;
+        eng.state.lock().unwrap().peers.insert("host-b".into(), g);
+
+        std::fs::write(&hosts_path, "# BEGIN nixnet\n# END nixnet\n").unwrap();
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+
+        let published = std::fs::read_to_string(&hosts_path).unwrap();
+        assert!(
+            published.contains("192.0.2.10\thost-b"),
+            "the daemon's own published entry stayed missing through a \
+             reconcile, because no winner happened to change:\n{published}"
+        );
+    }
+
+    /// The other half of the same rule. A tick that changes nothing must
+    /// not touch the file -- asserted on the INODE, because publication is
+    /// tmpfile-plus-rename and it is the rename, not the content, that
+    /// wakes every watcher of `/etc/hosts`. The per-entry freshness
+    /// comment moves on every tick, so a naive byte comparison would
+    /// rewrite the file forever.
+    #[test]
+    fn a_peer_reconcile_that_changes_nothing_does_not_rewrite_the_file() {
+        use std::os::unix::fs::MetadataExt;
+        let (eng, dir) = new_test_engine();
+        let hosts_path = dir.path().join("hosts");
+        let mut g = new_peer_group("host-b", 10_000, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let only = add_transport(&mut g, 10, "192.0.2.10");
+        eng.state.lock().unwrap().peers.insert("host-b".into(), g);
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            state.group_mut(GroupKind::Peer, "host-b").transports[only].state = TransportState::Up;
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+        let after_first = std::fs::metadata(&hosts_path).unwrap().ino();
+
+        for _ in 0..3 {
+            let mut state = eng.state.lock().unwrap();
+            state.group_mut(GroupKind::Peer, "host-b").last_confirmed_at = Some(ago(1));
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+
+        assert_eq!(
+            std::fs::metadata(&hosts_path).unwrap().ino(),
+            after_first,
+            "a settled peer rewrote /etc/hosts on every tick"
+        );
+    }
+
+    /// The guard that stops per-tick publication from destroying the boot
+    /// seed: before any winner exists, the activation script's seed is the
+    /// only last-known-good content in the file, and a passive tick must
+    /// never render an EMPTY managed block over it.
+    #[test]
+    fn a_passive_tick_never_writes_an_empty_block_over_the_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        let seed = "# BEGIN nixnet\n192.0.2.10\thost-b\n# END nixnet\n";
+        std::fs::write(&hosts_path, seed).unwrap();
+        let eng = Engine {
+            hosts: HostsPublisher::new(&hosts_path).unwrap(),
+            routes: RoutePublisher {
+                ip_path: "/bin/true".to_string(),
+            },
+            status_path: dir.path().join("status.json"),
+            state_path: dir.path().join("state.json"),
+            state: Mutex::new(EngineState::default()),
+        };
+        let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        add_transport(&mut g, 10, "192.0.2.10"); // still Unknown: nothing has probed yet
+        eng.state.lock().unwrap().peers.insert("host-b".into(), g);
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&hosts_path).unwrap(),
+            seed,
+            "a tick before the first winner overwrote the boot seed with an \
+             empty block"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // STALE-2, the arithmetic and the LIVE path. The restore-from-disk
     // path -- the half the production defect actually lived in -- is
     // tested beside the code that implements it, in `state.rs`. It reuses
@@ -1542,7 +2209,10 @@ mod tests {
             eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
         }
         let state = eng.state.lock().unwrap();
-        assert_eq!(state.group(GroupKind::Peer, "host-b").last_published_addr, "");
+        assert_eq!(
+            state.group(GroupKind::Peer, "host-b").last_published_addr,
+            ""
+        );
     }
 
     /// Covers the documented extension beyond a literal winner-index-only

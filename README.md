@@ -123,7 +123,9 @@ nixnet.peers / uplinks
       |  nixnetd   |   one probe thread + ticker per transport
       +-----+------+
             |
-      winner changes?
+   every tick: does what is
+   live differ from what is
+   published? (TF-2)
        /            \
       v              v
 +-----------+  +---------------------------+
@@ -793,12 +795,15 @@ mesh gateway and real public ingress day to day.
 That deployment is also where the sharpest bugs have come from — the ones
 no amount of eval-time checking finds, because they are facts about a
 running kernel and a running systemd rather than about what Nix evaluates
-to. Three, so far: the daemon's own process identity versus the hosts
+to. Four, so far: the daemon's own process identity versus the hosts
 file it must rename over; a secret-unseal that raced the mount holding
-its key and hard-failed the mesh gateway until a human intervened; and a
+its key and hard-failed the mesh gateway until a human intervened; a
 restart publishing nothing at all, because publishing was wired only to
-*winner changes* and a settled fleet has none. Each landed with a
-regression check — a unit test or an eval-time assertion — next to the
+*winner changes* and a settled fleet has none; and the uplink half of
+that same defect, where the route publisher had never once run on any
+host — a single-uplink host has no winner change, so a declared metric
+sat next to a live route the daemon had never touched. Each landed with
+a regression check — a unit test or an eval-time assertion — next to the
 fix.
 
 Calibrate accordingly before adopting:

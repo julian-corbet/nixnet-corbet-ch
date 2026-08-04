@@ -30,17 +30,27 @@ pub struct Entry {
 /// Owns atomic rewrites of the managed hosts file.
 pub struct HostsPublisher {
     path: PathBuf,
+    /// The static prefix as it looked when the daemon started, used ONLY
+    /// when the file has since vanished. Every ordinary publication reads
+    /// the prefix back off disk instead: TF-2 turned publication into a
+    /// per-tick operation, and a snapshot replayed every few seconds
+    /// deletes anything a human or another tool appended within one tick
+    /// of them writing it.
     static_prefix: String,
 }
 
 impl HostsPublisher {
-    /// Loads the current static prefix from whatever already exists at
-    /// `path` (normally written moments earlier by the activation script).
-    /// If `path` doesn't exist yet, or has no marker block, its entire
+    /// Loads the static prefix from whatever already exists at `path`
+    /// (normally written moments earlier by the activation script). If
+    /// `path` doesn't exist yet, or has no marker block, its entire
     /// existing content -- or nothing at all -- becomes the static prefix;
     /// this is what makes running `nixnetd` directly against a
     /// hand-written hosts file (no Nix activation script involved) a safe,
     /// supported thing to do.
+    ///
+    /// The value read here is a FALLBACK for a file that later disappears:
+    /// `publish` re-reads the prefix off the live file every time, so
+    /// nothing written outside the markers after this point is lost.
     pub fn new(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let prefix = match std::fs::read_to_string(&path) {
@@ -57,6 +67,14 @@ impl HostsPublisher {
     /// Rewrites the whole hosts file: static prefix, unchanged, plus a
     /// freshly rendered marker block for `entries`. Entries are sorted by
     /// address for deterministic, diff-friendly output across ticks.
+    /// Returns whether the file was actually written.
+    ///
+    /// TF-2: called on every reconcile tick, not only when a winner
+    /// changes, and therefore a NO-OP whenever the live file already says
+    /// this. `/etc/hosts` is watched -- systemd-resolved reloads it,
+    /// nss caches invalidate on it -- so rewriting it every few seconds to
+    /// restate the same three lines is not free, and "the file changed" has
+    /// to keep meaning something.
     ///
     /// STALE-1: each entry is preceded by a comment line carrying when it
     /// was last confirmed, and the block by one carrying when it was
@@ -65,7 +83,21 @@ impl HostsPublisher {
     /// systemd-resolved's does not consistently, and a trailing comment
     /// there would register as a bogus extra hostname on every reload.
     /// A leading `#` is unambiguous to every reader of this format.
-    pub fn publish(&self, entries: &[Entry]) -> io::Result<()> {
+    pub fn publish(&self, entries: &[Entry]) -> io::Result<bool> {
+        let current = match std::fs::read_to_string(&self.path) {
+            Ok(c) => Some(c),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+
+        // The prefix comes off the LIVE file, so an entry a human or
+        // another tool put outside the markers survives (PUB-1) instead of
+        // being deleted by the next tick's replay of a start-time snapshot.
+        let prefix = match &current {
+            Some(c) => split_static(c).0,
+            None => self.static_prefix.clone(),
+        };
+
         let mut sorted: Vec<&Entry> = entries.iter().collect();
         sorted.sort_by(|a, b| a.address.cmp(&b.address));
 
@@ -74,16 +106,13 @@ impl HostsPublisher {
             .unwrap_or_default();
 
         let mut out = String::new();
-        out.push_str(&self.static_prefix);
+        out.push_str(&prefix);
         out.push_str(BEGIN_MARKER);
         out.push('\n');
         out.push_str(&format!("# nixnet written={}\n", written_at));
         for e in sorted {
             if let Some(confirmed) = &e.confirmed_at {
-                out.push_str(&format!(
-                    "# nixnet {} confirmed={}\n",
-                    e.address, confirmed
-                ));
+                out.push_str(&format!("# nixnet {} confirmed={}\n", e.address, confirmed));
             }
             out.push_str(&e.address);
             out.push('\t');
@@ -93,9 +122,39 @@ impl HostsPublisher {
         out.push_str(END_MARKER);
         out.push('\n');
 
+        if let Some(c) = &current {
+            if same_but_for_freshness(c, &out) {
+                return Ok(false);
+            }
+        }
+
         let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
-        crate::atomic::write_with_chmod(dir, &self.path, out.as_bytes(), ".hosts.tmp-", 0o644)
+        crate::atomic::write_with_chmod(dir, &self.path, out.as_bytes(), ".hosts.tmp-", 0o644)?;
+        Ok(true)
     }
+}
+
+/// Compares two renderings of the file while ignoring nixnet's own
+/// freshness comments -- the `# nixnet written=` header and the
+/// `# nixnet <address> confirmed=` lines.
+///
+/// They are ignored because they change on EVERY tick a probe succeeds, so
+/// comparing them would make "has anything changed?" answer yes forever
+/// and rewrite `/etc/hosts` every few seconds -- exactly the churn TF-2
+/// refuses. STATE THE COST HONESTLY: the timestamps in the file are
+/// therefore those of the last write, not of the last probe, so a consumer
+/// reading only `/etc/hosts` under-reads the freshness of an entry that has
+/// been confirmed steadily since. The exact per-tick answer STALE-1 asks
+/// for is published in `status.json`, which is rewritten every tick on a
+/// tmpfs where churn costs nothing.
+fn same_but_for_freshness(a: &str, b: &str) -> bool {
+    let significant = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("# nixnet "))
+            .map(str::to_string)
+            .collect()
+    };
+    significant(a) == significant(b)
 }
 
 /// Returns the content strictly before the BEGIN marker line (trailing
@@ -104,9 +163,21 @@ impl HostsPublisher {
 /// original's `hadMarkers` (unused by callers here, kept for parity with
 /// `splitStatic`'s documented signature).
 fn split_static(content: &str) -> (String, bool) {
-    match content.find(BEGIN_MARKER) {
-        Some(idx) => (format!("{}\n", content[..idx].trim_end_matches('\n')), true),
-        None => (format!("{}\n", content.trim_end_matches('\n')), false),
+    let (raw, had_markers) = match content.find(BEGIN_MARKER) {
+        Some(idx) => (&content[..idx], true),
+        None => (content, false),
+    };
+    let trimmed = raw.trim_end_matches('\n');
+    // An EMPTY prefix renders as nothing, not as a blank line. It matters
+    // because TF-2 decides whether to write by comparing this rendering
+    // against the live file: a prefix that gains a newline when it is read
+    // back off a file it just wrote is a difference that never converges,
+    // so the daemon would rewrite the hosts file on every single tick while
+    // reporting that it had reconciled.
+    if trimmed.is_empty() {
+        (String::new(), had_markers)
+    } else {
+        (format!("{}\n", trimmed), had_markers)
     }
 }
 
@@ -280,6 +351,103 @@ mod tests {
         // than no age at all.
         assert_eq!(entries[1].address, "10.0.0.2");
         assert_eq!(entries[1].confirmed_at, None);
+    }
+
+    /// TF-2, at the file layer: publication moved onto every reconcile
+    /// tick, so a publication of unchanged entries must not touch the
+    /// file. Asserted on the INODE, not on the bytes: the write is
+    /// tmpfile-plus-rename, so a rewrite always lands on a new inode even
+    /// when the content happens to match -- and it is the rename, not the
+    /// content, that wakes every watcher of `/etc/hosts`.
+    #[test]
+    fn republishing_identical_entries_does_not_touch_the_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "# static\n").unwrap();
+        let hp = HostsPublisher::new(&path).unwrap();
+
+        let entries = |confirmed: &str| {
+            vec![Entry {
+                address: "10.0.0.1".into(),
+                hostnames: vec!["a".into()],
+                confirmed_at: Some(confirmed.into()),
+            }]
+        };
+
+        assert!(
+            hp.publish(&entries("2026-08-04T10:00:00Z")).unwrap(),
+            "the first publication wrote nothing"
+        );
+        let first = std::fs::metadata(&path).unwrap().ino();
+
+        // A later tick: same winner, same address -- only the freshness
+        // stamp has moved on, which is what happens on every single tick a
+        // probe succeeds.
+        assert!(
+            !hp.publish(&entries("2026-08-04T10:00:03Z")).unwrap(),
+            "an unchanged block was rewritten"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            first,
+            "the file was replaced despite publishing the same entries -- at \
+             a 3-second tick that is a rename of /etc/hosts ~29,000 times a day"
+        );
+
+        // ...and the other direction, so "never writes" cannot pass this.
+        assert!(
+            hp.publish(&[Entry {
+                address: "10.0.0.9".into(),
+                hostnames: vec!["a".into()],
+                confirmed_at: None,
+            }])
+            .unwrap(),
+            "a changed address did not reach the file"
+        );
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), first);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("10.0.0.9"));
+    }
+
+    /// PUB-1's foreign-entry half, which per-tick publication would
+    /// otherwise turn from a slow leak into an immediate one: a line added
+    /// outside the markers after the daemon started must survive -- and,
+    /// because it is not a change to anything nixnet publishes, must not
+    /// even cause a rewrite.
+    #[test]
+    fn a_line_added_outside_the_markers_survives_the_next_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "# static\n").unwrap();
+        let hp = HostsPublisher::new(&path).unwrap();
+
+        let entries = [Entry {
+            address: "10.0.0.1".into(),
+            hostnames: vec!["a".into()],
+            confirmed_at: None,
+        }];
+        hp.publish(&entries).unwrap();
+
+        let published = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            published.replace("# static\n", "# static\n192.0.2.7\tforeign\n"),
+        )
+        .unwrap();
+
+        assert!(
+            !hp.publish(&entries).unwrap(),
+            "adding a foreign entry provoked a rewrite of the managed block"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("192.0.2.7\tforeign"),
+            "an entry written outside nixnet's markers was deleted:\n{after}"
+        );
+        assert!(
+            after.contains("10.0.0.1\ta"),
+            "the managed block was lost:\n{after}"
+        );
     }
 
     #[test]

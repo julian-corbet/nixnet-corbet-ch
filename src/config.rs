@@ -348,6 +348,24 @@ impl Config {
         uplink_names.sort();
         for name in uplink_names {
             let u = &self.uplinks[name];
+            // TF-3 requires that no two transports of a subject share a
+            // metric, and that the winner's is the lowest. Both are
+            // delivered by spacing the ranking `metricStep` apart, which
+            // only orders anything if the step is positive: at zero every
+            // transport lands on `metricBase` -- N equal-cost defaults the
+            // kernel chooses between on its own -- and a negative step
+            // inverts the ranking, publishing the least preferred transport
+            // as the cheapest route. `apply_defaults` has already turned an
+            // omitted (zero) step into the default by this point, so this
+            // rejects only a value someone wrote down.
+            if u.publish.route_metric && u.publish.metric_step <= 0 {
+                return Err(format!(
+                    "uplink \"{}\": publish.metricStep must be positive (got {}); \
+                     transports sharing a metric are equal-cost default routes, \
+                     and the kernel picks between them",
+                    name, u.publish.metric_step
+                ));
+            }
             for (i, t) in u.transports.iter().enumerate() {
                 if t.interface.is_empty() {
                     return Err(format!(
@@ -405,4 +423,53 @@ fn validate_probe(p: &Probe) -> Result<(), String> {
         return Err("probe.method=exec requires probe.exec".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_str(json: &str) -> Result<Config, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, json).unwrap();
+        load(&path)
+    }
+
+    const ONE_UPLINK: &str = r#"{
+      "uplinks": {
+        "internet": {
+          "publish": { "routeMetric": true, "metricBase": 100, "metricStep": %STEP% },
+          "transports": [
+            { "interface": "wan0", "priority": 10, "probe": { "target": "192.0.2.53" } }
+          ]
+        }
+      }
+    }"#;
+
+    /// TF-3 is unachievable with a non-positive step: every transport of
+    /// the subject lands on the same metric (step 0, had the default not
+    /// already replaced it) or the ranking is published upside down
+    /// (negative). Nix's type rejects it at eval time; a hand-written
+    /// config.json -- a supported adoption path -- reaches the daemon
+    /// unchecked, so the daemon checks it too.
+    #[test]
+    fn a_negative_metric_step_is_rejected() {
+        let err = load_str(&ONE_UPLINK.replace("%STEP%", "-10"))
+            .expect_err("a negative metricStep must not load");
+        assert!(
+            err.to_string().contains("metricStep"),
+            "error does not name the offending option: {err}"
+        );
+    }
+
+    /// The other direction, so "reject everything" cannot pass the test
+    /// above: an omitted step is not an error, it is the default. Zero is
+    /// how an absent JSON number arrives, and `apply_defaults` fills it in
+    /// before validation ever sees it.
+    #[test]
+    fn an_omitted_metric_step_takes_the_default() {
+        let cfg = load_str(&ONE_UPLINK.replace("%STEP%", "0")).expect("an omitted step must load");
+        assert_eq!(cfg.uplinks["internet"].publish.metric_step, 10);
+    }
 }

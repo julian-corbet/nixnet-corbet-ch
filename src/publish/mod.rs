@@ -7,9 +7,12 @@
 //! winner" abstraction.
 
 mod hosts;
-mod route;
+// `pub(crate)` only so the engine's tests can reach the recording stand-in
+// `ip` this module's tests already own -- TF-2 is a claim about which ticks
+// reach the publisher, and proving it needs the publisher's own harness.
+pub(crate) mod route;
 
 #[allow(unused_imports)]
 pub use hosts::parse_nix_hosts;
 pub use hosts::{Entry, HostsPublisher};
-pub use route::{RankedInterface, RoutePublisher};
+pub use route::{Publication, RankedInterface, RouteChange, RoutePublisher};

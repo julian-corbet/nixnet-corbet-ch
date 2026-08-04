@@ -332,6 +332,7 @@ mod tests {
         let mut state = EngineState {
             peers: HashMap::from([("host-b".to_string(), g)]),
             uplinks: HashMap::new(),
+            ..Default::default()
         };
         Engine::load_state(&eng.state_path, &mut state);
         *eng.state.lock().unwrap() = state;
@@ -488,6 +489,7 @@ mod tests {
                 new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD),
             )]),
             uplinks: HashMap::new(),
+            ..Default::default()
         };
         Engine::load_state(&dir.path().join("state.json"), &mut fresh);
         assert_eq!(
@@ -516,6 +518,7 @@ mod tests {
                 new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD),
             )]),
             uplinks: HashMap::new(),
+            ..Default::default()
         };
         Engine::load_state(&path, &mut state);
 
@@ -549,6 +552,7 @@ mod tests {
         let mut state = EngineState {
             peers: HashMap::new(),
             uplinks: HashMap::from([("internet".to_string(), g)]),
+            ..Default::default()
         };
         Engine::load_state(&path, &mut state);
 
@@ -574,10 +578,7 @@ mod tests {
             },
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
-            state: std::sync::Mutex::new(EngineState {
-                peers: HashMap::new(),
-                uplinks: HashMap::new(),
-            }),
+            state: std::sync::Mutex::new(EngineState::default()),
         };
         let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
         g.last_published_addr = "192.0.2.10".into();

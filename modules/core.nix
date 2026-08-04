@@ -434,14 +434,23 @@ let
       publish = {
         routeMetric = mkOption { type = types.bool; default = true; };
         metricBase = mkOption {
-          type = types.int;
+          type = types.ints.unsigned;
           default = 100;
           description = "Metric assigned to the current winner.";
         };
         metricStep = mkOption {
-          type = types.int;
+          type = types.ints.positive;
           default = 10;
-          description = "Metric spacing applied to non-winners, in priority order.";
+          description = ''
+            Metric spacing applied to non-winners, in rank order (healthy
+            candidates by priority, then the rest).
+
+            Positive, because the spacing is what makes the ranking a
+            ranking: at zero every transport of the subject lands on
+            `metricBase` -- N equal-cost default routes the kernel chooses
+            between on its own -- and a negative step publishes the least
+            preferred transport as the cheapest route.
+          '';
         };
       };
     };
