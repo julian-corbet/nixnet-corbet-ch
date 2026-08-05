@@ -51,6 +51,10 @@
       nixosModules.netbird-access-model = ./modules/netbird-access-model.nix;
       nixosModules.ingress = ./modules/ingress.nix;
 
+      # Authenticated private dual-stack transit. This transports both address
+      # families over WireGuard; it never performs address translation.
+      nixosModules.wireguard = ./modules/wireguard.nix;
+
       # ---------------------------------------------------------------
       # Same files, rendered onto system-manager's smaller option surface
       # instead of a real NixOS rebuild (see the README's "Non-NixOS hosts
@@ -65,6 +69,7 @@
       systemManagerModules.netbird-provider = ./modules/netbird-provider.nix;
       systemManagerModules.cloudflared-provider = ./modules/cloudflared-provider.nix;
       systemManagerModules.backend = ./modules/backend.nix;
+      systemManagerModules.wireguard = ./modules/wireguard.nix;
 
       packages = forAllSystems (system: {
         nixnet = (pkgsFor system).callPackage ./package.nix { };

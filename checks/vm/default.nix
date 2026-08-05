@@ -24,6 +24,7 @@ let
     ./firewall-reconcile.nix
     ./hosts-single-writer.nix
     ./lastknowngood-staleness.nix
+    ./wireguard-transit.nix
   ];
 
   built = map (s: s // { drv = harness.mkTest s; }) specs;

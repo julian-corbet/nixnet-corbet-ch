@@ -116,6 +116,10 @@ let
       (rs.forwardInterfaceLines overlayInterface
         "routed overlay path, derived from nixnet.overlay.advertiseRoutes");
 
+  trustedForwardLines = lib.optionals cfg.forward.enable (map
+    (pair: "iifname \"${pair.ingress}\" oifname \"${pair.egress}\" accept  # nixnet: authenticated transit")
+    cfg.forward.trustedInterfacePairs);
+
   # ── The other table ─────────────────────────────────────────────────────────────────────────
   #
   # nixnet.overlay writes an nftables table of its OWN (its confinement and source-NAT are the
@@ -134,6 +138,7 @@ let
     cfg.management.interfaces
     ++ cfg.trustedInterfaces
     ++ (lib.filter (i: i != null) (map (r: r.interface) (cfg.allow ++ cfg.forward.rules)))
+    ++ lib.concatMap (pair: [ pair.ingress pair.egress ]) cfg.forward.trustedInterfacePairs
     ++ (lib.optional (routedOverlayForwardLines != [ ]) overlayInterface)
   );
 
@@ -160,7 +165,7 @@ let
       chain forward {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept
-    ${indent 4 (routedOverlayForwardLines ++ lib.concatMap rs.ruleLines cfg.forward.rules)}
+    ${indent 4 (routedOverlayForwardLines ++ trustedForwardLines ++ lib.concatMap rs.ruleLines cfg.forward.rules)}
       }'';
 
   rulesetText = ''
@@ -797,6 +802,28 @@ in
         default = [ ];
         description = "Forward-chain accepts. Only meaningful with `forward.enable`.";
       };
+
+      trustedInterfacePairs = lib.mkOption {
+        type = lib.types.listOf (lib.types.submodule {
+          options = {
+            ingress = lib.mkOption {
+              type = lib.types.str;
+              description = "Authenticated ingress interface.";
+            };
+            egress = lib.mkOption {
+              type = lib.types.str;
+              description = "Permitted egress interface for packets from ingress.";
+            };
+          };
+        });
+        default = [ ];
+        description = ''
+          Exact interface pairs trusted to forward every protocol. This is for a
+          cryptographically authenticated transit, such as WireGuard, where
+          the tunnel's peer and AllowedIPs policy already restricts identities.
+          It never grants forwarding to or from any other interface.
+        '';
+      };
     };
 
     overlayConfinement = {
@@ -1161,6 +1188,14 @@ in
               nixnet.firewall: `forward.rules` are declared but `forward.enable` is false, so none
               of them apply. Declaring rules into a chain that is never created reads as done and
               does nothing — the same class of silent no-op this module exists to prevent elsewhere.
+            '';
+          }
+          {
+            assertion = !cfg.forward.enable -> cfg.forward.trustedInterfacePairs == [ ];
+            message = ''
+              nixnet.firewall: `forward.trustedInterfacePairs` are declared but `forward.enable`
+              is false, so none apply. Enable the forward chain explicitly before granting an
+              authenticated transit any forwarding privilege.
             '';
           }
           {

@@ -191,6 +191,26 @@ Not: not a diagnostic toolbox. One tool, the one that reads the thing this repo 
 removable with `tooling = [ ]` on a host whose distro already ships it. And never a substitute for the rendered
 `ruleset` option — that is readable from the build host, which is where you look when the host is unreachable.
 
+## Private dual-stack transit
+### WG-1 — only a declared WireGuard listener opens a public port
+**GIVEN** a WireGuard transit peer with no `listenPort`, **THEN** NixNet adds no firewall accept. **GIVEN** a peer
+with both `listenPort` and `openFirewall`, **THEN** only that UDP port is accepted by NixNet's host policy.
+
+Why: the encrypted peer network must not create an accidental public service. A client only needs an outbound
+packet; the hub is the one deliberate public listener.
+
+Not: this is not address translation, public port forwarding, or a second overlay control plane.
+
+### WG-2 — an authenticated private IPv4 and IPv6 transit routes both ways
+**GIVEN** two peers with private IPv4 and IPv6 addresses on a WireGuard hub, **THEN** each can reach the other in
+both families through the hub. The hub forwards only its declared tunnel interface pair, and each peer's
+`AllowedIPs` remains the source-address authority.
+
+Why: an IPv4-only origin can reach an IPv6-only public host over a private IPv4 tunnel address, without exposing
+the service publicly or introducing stateful address translation.
+
+Not: the hub never allocates public addresses, NATs the tunnel, or grants forwarding to another interface.
+
 ## Transport failover — winners, publication, demotion
 ### TF-1 — the winner is deterministic and damped
 **GIVEN** a subject with N priority-ordered transports in mixed health, **THEN** the winner is the lowest

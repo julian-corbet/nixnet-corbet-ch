@@ -258,6 +258,10 @@ of these contribute a peer/uplink transport and none require
   policy writer, not a baseline package: use it only on a host that owns its
   kernel and networking policy. Foreign system-manager hosts can select their
   native package through `nixnet.backend.bpftune` instead.
+- **`nixnet.wireguard`** (`modules/wireguard.nix`) — an authenticated,
+  private dual-stack transit. It transports private IPv4 and IPv6 addresses
+  over WireGuard; only a declared hub listener opens a public UDP port, and
+  forwarding is limited to the tunnel's own authenticated interface pair.
 - **`lib.svcProxyConfig`** (`lib/svc-proxy-config.nix`) — not a module, a
   pure function: turns a service registry into a split-horizon in-cluster
   nginx config + CoreDNS zone, so an in-cluster caller of `<svc>.<zone>`
