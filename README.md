@@ -253,6 +253,11 @@ of these contribute a peer/uplink transport and none require
   watchdog, above), not a replacement — point the watchdog's `tunnelUnit`
   at `"cloudflared-tunnel-${config.nixnet.ingress.tunnelId}"` to watch the
   tunnel this module provisions.
+- **`nixnet.bpftune`** (`modules/bpftune.nix`) — an explicit opt-in to
+  NixOS's upstream `services.bpftune` daemon. It is a runtime transport
+  policy writer, not a baseline package: use it only on a host that owns its
+  kernel and networking policy. Foreign system-manager hosts can select their
+  native package through `nixnet.backend.bpftune` instead.
 - **`lib.svcProxyConfig`** (`lib/svc-proxy-config.nix`) — not a module, a
   pure function: turns a service registry into a split-horizon in-cluster
   nginx config + CoreDNS zone, so an in-cluster caller of `<svc>.<zone>`
@@ -260,7 +265,7 @@ of these contribute a peer/uplink transport and none require
   Called from a consumer's own flake `outputs` or host config, same as
   `nixpkgs.lib` itself.
 
-These five modules are NixOS-only for now — each uses at least one
+These six modules are NixOS-only for now — each uses at least one
 primitive (`boot.kernel.sysctl`, `networking.firewall.extraCommands`, or
 upstream `services.cloudflared`) outside `system-manager`'s smaller option
 surface (see the `system-manager` section below for that boundary).

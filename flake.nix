@@ -23,6 +23,11 @@
       nixosModules.default = self.nixosModules.core;
       nixosModules.netbird-provider = ./modules/netbird-provider.nix;
 
+      # BPF-based runtime transport tuning. NixOS owns this upstream service;
+      # foreign system-manager hosts receive only package names through the
+      # separate backend catalogue below.
+      nixosModules.bpftune = ./modules/bpftune.nix;
+
       # cloudflared-provider: NOT a peer/uplink transport contributor (see
       # its own header comment) -- a standalone resident-daemon health
       # watchdog reusing netbird-provider's drift-check/reprovision
