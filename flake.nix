@@ -59,6 +59,7 @@
       systemManagerModules.default = self.systemManagerModules.core;
       systemManagerModules.netbird-provider = ./modules/netbird-provider.nix;
       systemManagerModules.cloudflared-provider = ./modules/cloudflared-provider.nix;
+      systemManagerModules.backend = ./modules/backend.nix;
 
       packages = forAllSystems (system: {
         nixnet = (pkgsFor system).callPackage ./package.nix { };

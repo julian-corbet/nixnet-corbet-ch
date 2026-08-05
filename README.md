@@ -744,6 +744,38 @@ reconciles `/etc` from scratch on activation instead), so a target whose
 `/etc/hosts` already exists as a real, hand-edited file is adopted
 correctly with no action needed from a consumer.
 
+### Native packages on system-manager hosts
+
+`systemManagerModules.backend` is a separate, opt-in package catalogue for
+hosts whose native distribution owns network services. It publishes the
+official-repository and AUR names as `nixnet.backend.archPackages` and
+`nixnet.backend.aurPackages`; it never installs packages or writes a second
+service unit. Wire those lists to the host's package reconciler, then select
+only mechanisms the host actually owns:
+
+```nix
+{ config, ... }:
+{
+  imports = [ inputs.nixnet.systemManagerModules.backend ];
+
+  nixnet.backend = {
+    enable = true;
+    netbird.enable = true;
+    networkManager.enable = true;
+    bluez.enable = true;
+  };
+
+  nixarch.packages.pacman = config.nixnet.backend.archPackages;
+  nixarch.packages.aur = config.nixnet.backend.aurPackages;
+}
+```
+
+The base `bluez` selection includes `bluez` and `bluez-utils`. `bluez.obex`
+and `bluez.hid2hci` are independent opt-ins for OBEX transfers and Bluetooth
+HID adapter conversion. The NixOS overlay and ingress modules already own
+their respective NixOS package/service paths; they do not use this native
+package output.
+
 ## Security
 
 `nixnetd` runs as a dedicated `nixnetd` system user — never `root`, and
