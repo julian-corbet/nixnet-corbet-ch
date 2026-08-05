@@ -31,20 +31,9 @@
 //! one.
 
 use std::fmt;
-use std::io::Read;
-use std::process::{Command, Output, Stdio};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use serde::Deserialize;
-
-/// Deadline for one `ip` invocation. Three orders of magnitude above what
-/// a netlink query actually costs (single-digit milliseconds), because the
-/// cost of firing early on a merely slow box is worse than the delay:
-/// `route replace` is a MUTATING command, and killing one between its
-/// netlink send and its reply reports a failure for a change that may have
-/// landed. TF-2 reconciles the difference on the next tick either way.
-const DEFAULT_IP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One transport of a subject, in published rank order: index 0 is the
 /// winner, and each later entry is one `metric_step` less preferred.

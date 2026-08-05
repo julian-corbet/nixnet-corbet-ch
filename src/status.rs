@@ -38,6 +38,11 @@ pub struct Group {
     /// being served as if it were fine.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_confirmed_at: String,
+    /// The last error while applying this group's published state. For
+    /// uplinks this is a route-metric publication failure; peer publication
+    /// errors are shared across the hosts file and live on the snapshot.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_publish_error: String,
     pub degraded: bool,
     pub transports: HashMap<String, StatusTransport>,
 }
@@ -46,6 +51,15 @@ pub struct Group {
 pub struct Snapshot {
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
+    /// The managed hosts file is one shared artifact for every peer group,
+    /// so a failure to write it is a snapshot-wide error rather than an
+    /// error attributable to whichever peer's tick discovered it.
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        rename = "lastHostsPublishError"
+    )]
+    pub last_hosts_publish_error: String,
     pub peers: HashMap<String, Group>,
     pub uplinks: HashMap<String, Group>,
 }

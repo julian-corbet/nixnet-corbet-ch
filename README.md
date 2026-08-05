@@ -144,6 +144,9 @@ every ordinary NSS files-then-dns lookup
 (`/var/lib/nixnet-hosts/hosts`, `/run/nixnet/status.json`,
 `/var/lib/nixnet/state.json`). The same binary works unmodified from a
 Nix-rendered config, a hand-written one, or a `system-manager` render.
+`status.json` reports the last hosts-file publication error globally and the
+last route-metric publication error for each uplink, so a healthy probe does
+not mask a publisher that failed to apply its decision.
 
 ## Beyond peer/uplink: resident-daemon watchdogs
 

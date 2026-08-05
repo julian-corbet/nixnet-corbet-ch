@@ -908,6 +908,7 @@ impl Engine {
             }
             status::Snapshot {
                 generated_at: String::new(),
+                last_hosts_publish_error: state.last_hosts_error.clone(),
                 peers,
                 uplinks,
             }
@@ -1019,6 +1020,7 @@ fn render_group(g: &Group) -> status::Group {
             .last_confirmed_at
             .and_then(|t| t.format(&Rfc3339).ok())
             .unwrap_or_default(),
+        last_publish_error: g.last_publish_error.clone(),
         degraded: g.degraded,
         transports: HashMap::new(),
     };
@@ -2262,6 +2264,34 @@ mod tests {
         assert_eq!(
             g.last_published_addr, "203.0.113.99",
             "address drift on the unchanged winner must still republish"
+        );
+    }
+
+    /// A transport can probe healthy while its publication backend is
+    /// broken. The status document must carry that distinction; otherwise
+    /// `nixnetctl` calls a route or hosts decision healthy even though the
+    /// kernel/file never received it.
+    #[test]
+    fn status_exposes_hosts_and_uplink_publication_failures() {
+        let (eng, dir) = new_test_engine();
+        let mut uplink = new_uplink_group(10_000, 100, 50);
+        uplink.last_publish_error = "ip route replace: permission denied".to_string();
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            state.last_hosts_error = "read-only file system".to_string();
+            state.uplinks.insert("internet".to_string(), uplink);
+        }
+
+        eng.write_status();
+        let snapshot = status::read(&dir.path().join("status.json")).unwrap();
+        assert_eq!(
+            snapshot.last_hosts_publish_error, "read-only file system",
+            "a shared hosts-file error disappeared from status.json"
+        );
+        assert_eq!(
+            snapshot.uplinks["internet"].last_publish_error, "ip route replace: permission denied",
+            "a route publication error disappeared from status.json"
         );
     }
 }

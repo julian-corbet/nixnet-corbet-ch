@@ -36,6 +36,9 @@ fn main() -> ExitCode {
     }
 
     println!("nixnet status as of {}", snap.generated_at);
+    if !snap.last_hosts_publish_error.is_empty() {
+        println!("hosts publication error: {}", snap.last_hosts_publish_error);
+    }
     print_groups("peers", &snap.peers);
     print_groups("uplinks", &snap.uplinks);
     ExitCode::SUCCESS
@@ -96,6 +99,9 @@ fn print_groups(label: &str, groups: &HashMap<String, status::Group>) {
             or_dash(&g.since),
             degraded
         );
+        if !g.last_publish_error.is_empty() {
+            println!("      publication error: {}", g.last_publish_error);
+        }
 
         let mut transport_names: Vec<&String> = g.transports.keys().collect();
         transport_names.sort();
