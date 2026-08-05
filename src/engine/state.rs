@@ -177,6 +177,7 @@ fn restore(groups: &mut HashMap<String, Group>, saved: &HashMap<String, Persiste
         g.degraded = pg.degraded;
         g.last_published_addr = pg.last_published_address.clone();
         expire_restored_last_known_good(name, g, now);
+        let mut winner_static_address_changed = false;
         for (i, pt) in pg.transports.iter().enumerate() {
             if i >= g.transports.len() {
                 break;
@@ -189,7 +190,41 @@ fn restore(groups: &mut HashMap<String, Group>, saved: &HashMap<String, Persiste
             };
             tr.consecutive_success = pt.consecutive_success;
             tr.consecutive_failure = pt.consecutive_failure;
-            tr.current_address = pt.address.clone();
+
+            // A configured address is the declaration, not a cache hint.
+            // Restoring an old effective address over it made an edited
+            // static peer keep publishing its previous address after a
+            // restart. Dynamic exec transports deliberately leave
+            // `spec.address` empty, so their last discovered address still
+            // restores from state while their provider is unavailable.
+            if tr.spec.address.is_empty() {
+                tr.current_address = pt.address.clone();
+            } else {
+                // Older state files did not persist `address`. An empty
+                // cache therefore says "unknown", not "different"; it
+                // cannot invalidate a valid last-known-good static peer.
+                let changed = !pt.address.is_empty() && tr.spec.address != pt.address;
+                tr.current_address = tr.spec.address.clone();
+                if changed {
+                    tr.state = TransportState::Unknown;
+                    tr.consecutive_success = 0;
+                    tr.consecutive_failure = 0;
+                    tr.detail.clear();
+                    winner_static_address_changed |= g.winner == Some(i);
+                }
+            }
+        }
+
+        if winner_static_address_changed {
+            // The persisted winner and confirmation were evidence about
+            // the OLD endpoint. Publish neither the old address nor a new
+            // one that has not yet passed a probe; the next probe chooses
+            // and publishes the declared address normally.
+            g.winner = None;
+            g.winner_since = None;
+            g.last_published_addr.clear();
+            g.last_confirmed_at = None;
+            g.degraded = true;
         }
     }
 }
@@ -560,6 +595,76 @@ mod tests {
             state.uplinks["internet"].last_published_addr, "192.0.2.10",
             "the peer-only staleness bound reached into an uplink group"
         );
+    }
+
+    /// A static Nix address is a declaration. A prior state file may carry
+    /// an old dynamic or static value, but it is never permitted to win
+    /// over an address the operator changed in the current configuration.
+    #[test]
+    fn restore_drops_health_for_a_changed_static_winner_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"peers":{"host-b":{"winner":0,"winnerSince":"2026-08-05T08:00:00Z",
+               "confirmedAt":"2026-08-05T08:00:00Z","degraded":false,
+               "lastPublishedAddress":"192.0.2.10",
+               "transports":[{"state":"up","consecutiveSuccess":7,"address":"192.0.2.10"}]}},"uplinks":{}}"#,
+        )
+        .unwrap();
+
+        let mut group = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let transport = add_transport(&mut group, 10, "192.0.2.99");
+        let mut state = EngineState {
+            peers: HashMap::from([("host-b".to_string(), group)]),
+            uplinks: HashMap::new(),
+            ..Default::default()
+        };
+        Engine::load_state(&path, &mut state);
+
+        let group = &state.peers["host-b"];
+        let restored = &group.transports[transport];
+        assert_eq!(restored.current_address, "192.0.2.99");
+        assert_eq!(restored.state, super::TransportState::Unknown);
+        assert_eq!(restored.consecutive_success, 0);
+        assert_eq!(restored.consecutive_failure, 0);
+        assert_eq!(group.winner, None);
+        assert_eq!(group.last_published_addr, "");
+        assert_eq!(group.last_confirmed_at, None);
+        assert!(group.degraded, "the changed address awaits a fresh probe");
+    }
+
+    /// The static-address rule has a necessary boundary: an exec transport
+    /// declares no address precisely because its provider discovers one at
+    /// runtime, so its cached address remains useful across a restart.
+    #[test]
+    fn restore_keeps_a_dynamic_transport_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"peers":{"host-b":{"winner":0,"degraded":false,
+               "lastPublishedAddress":"100.64.42.10",
+               "transports":[{"state":"up","consecutiveSuccess":7,"address":"100.64.42.10"}]}},"uplinks":{}}"#,
+        )
+        .unwrap();
+
+        let mut group = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let transport = add_transport(&mut group, 10, "");
+        let mut state = EngineState {
+            peers: HashMap::from([("host-b".to_string(), group)]),
+            uplinks: HashMap::new(),
+            ..Default::default()
+        };
+        Engine::load_state(&path, &mut state);
+
+        let group = &state.peers["host-b"];
+        let restored = &group.transports[transport];
+        assert_eq!(restored.current_address, "100.64.42.10");
+        assert_eq!(restored.state, super::TransportState::Up);
+        assert_eq!(group.winner, Some(0));
+        assert_eq!(group.last_published_addr, "100.64.42.10");
+        assert!(!group.degraded);
     }
 
     /// Guards the one construction the tests above all rely on: the engine
