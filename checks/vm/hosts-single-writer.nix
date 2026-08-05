@@ -8,10 +8,8 @@
 # never comes. Foreign entries die the same way: the daemon snapshots the
 # non-managed prefix once at start and replays that snapshot forever.
 #
-# This test runs against modules/core.nix AS IT STANDS. It is expected to fail
-# until the rebuild lands, and the shape of the failure is the specification:
-# what is asserted is not "the seed was deleted" but the three separable
-# outcomes PUB-1 names, each of which can regress on its own.
+# The assertions name the three separable outcomes PUB-1 requires, so a
+# regression in one cannot hide behind the others.
 #
 #   1. the daemon's DECLARED aliases resolve. Asserted with `getent`, not with
 #      a grep of the file: "the line is in the file" and "the name resolves"

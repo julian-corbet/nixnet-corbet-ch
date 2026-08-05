@@ -183,17 +183,40 @@ let
   #
   # netbird v0.74.3's `status --json` has NO `.managementState` object and
   # NO `.needsLogin` field at all -- confirmed directly against a live
-  # daemon. The real fields are `.management.url` (which ALWAYS carries an
-  # explicit port, e.g. "https://host:443", even when the configured
-  # managementUrl has none -- the naive exact-string comparison this
-  # replaced produced a false "drift-shaped failure" on a genuinely healthy,
-  # correctly-enrolled connection) and `.management.connected` (boolean).
+  # daemon. The real fields are `.management.url` (which in every observed
+  # version carries an explicit port, e.g. "https://host:443", even when the
+  # configured managementUrl has none -- the naive exact-string comparison
+  # this replaced produced a false "drift-shaped failure" on a genuinely
+  # healthy, correctly-enrolled connection) and `.management.connected`
+  # (boolean).
+  #
+  # BOTH sides are port-normalized, and the strip matches only a trailing
+  # `:<digits>`. Stripping the observed side alone was itself a permanent
+  # false-drift generator for any consumer whose managementUrl carries a
+  # port ("https://nb.example.com:33073", or NetBird's own default
+  # "https://api.netbird.io:443"): the observed value normalized to
+  # "https://nb.example.com" and could never equal the raw expected string,
+  # so every probe reported mgmt_healthy=no on a perfectly healthy daemon,
+  # the reprovision guard below could never answer "drift-already-resolved",
+  # and the module manufactured a `netbird down`/`up` outage every
+  # minReprovisionIntervalSec forever. The digit-shaped strip fixes the
+  # other half: a bare `${x%:*}` chops at the SCHEME colon when
+  # `.management.url` comes back without a port (leaving the literal
+  # "https") and inside an IPv6 literal's brackets.
+  stripPort = u:
+    let m = builtins.match "(.*):[0-9]+" u;
+    in if m == null then u else builtins.head m;
+
   identityHealthCheckBash = jqBin: expectedUrl: ''
     mgmt_url=$(echo "$status_json" | ${jqBin} -r '.management.url // empty' 2>/dev/null || true)
-    mgmt_url_no_port="''${mgmt_url%:*}"
+    mgmt_url_no_port="$mgmt_url"
+    case "''${mgmt_url##*:}" in
+      ""|*[!0-9]*) : ;;                              # no port to strip
+      *) mgmt_url_no_port="''${mgmt_url%:*}" ;;      # trailing :<digits>
+    esac
     mgmt_connected=$(echo "$status_json" | ${jqBin} -r '.management.connected // false' 2>/dev/null || echo false)
     mgmt_healthy=yes
-    if [ -n "$mgmt_url" ] && [ "$mgmt_url_no_port" != "${expectedUrl}" ]; then
+    if [ -n "$mgmt_url" ] && [ "$mgmt_url_no_port" != "${stripPort expectedUrl}" ]; then
       mgmt_healthy=no
     fi
     if [ "$mgmt_connected" != "true" ]; then
@@ -227,7 +250,11 @@ let
       if [ "$drift" -eq 0 ]; then
         ${identityHealthCheckBash "jq" cfg.managementUrl}
         if [ "$mgmt_healthy" = "no" ]; then
-          echo "nixnet-netbird-drift-check: management URL mismatch or management channel disconnected (url=$mgmt_url, expected ${cfg.managementUrl})"
+          # Log the NORMALIZED observed value next to the raw one and the
+          # normalized expectation: printing only the raw pair made a
+          # mismatch read as two identical strings, which is precisely how
+          # the port-normalization asymmetry stayed invisible.
+          echo "nixnet-netbird-drift-check: management URL mismatch or management channel disconnected (url=$mgmt_url normalized=$mgmt_url_no_port, expected ${stripPort cfg.managementUrl}, connected=$mgmt_connected)"
           drift=1
         fi
         if ! ip link show netbird0 >/dev/null 2>&1 && ! ip link show wt0 >/dev/null 2>&1; then
@@ -269,6 +296,25 @@ let
         exit 0
       fi
 
+      # The trigger file is an EDGE signal, and EVERY exit from here on
+      # consumes it. systemd.path(5): when the triggered service terminates
+      # -- successfully or not -- the monitored path is re-checked
+      # immediately and the service restarted instantly, and if that trips
+      # the service's start rate limit the failure PROPAGATES to the .path
+      # unit, which then stops watching for good. So any exit that left the
+      # file behind (rate-limited, no-setup-key, netbird-up-failed) busy-
+      # looped this oneshot until both units latched failed, killing the
+      # whole reactive recovery path until the next reboot -- while the
+      # drift-check timer kept happily touching a file nothing was watching.
+      # Dropping the signal on a rate-limited or failed exit is correct, not
+      # a lost wakeup: the drift-check timer (checkIntervalSec) and the
+      # exec-probe's own driftFailureThreshold counter re-touch it on the
+      # next detection, which is the intended safety-net cadence.
+      #
+      # Installed AFTER the flock, never before: the already-running exit
+      # above must not delete a trigger the in-flight instance still owns.
+      trap 'rm -f /run/nixnet/reprovision/netbird' EXIT
+
       now=$(date +%s)
       last=0
       [ -r "$last_attempt_file" ] && last=$(cat "$last_attempt_file")
@@ -293,7 +339,6 @@ let
       fi
       if [ "$drift_still_present" -eq 0 ]; then
         echo "NIXNET_NETBIRD_REPROVISION_SKIPPED reason=drift-already-resolved"
-        rm -f /run/nixnet/reprovision/netbird
         exit 0
       fi
 
@@ -347,7 +392,6 @@ let
       fi
 
       if [ "$plain_reconnect_ok" = "true" ]; then
-        rm -f /run/nixnet/reprovision/netbird
         echo "NIXNET_NETBIRD_REPROVISION_SUCCEEDED method=plain-reconnect"
         printf '{"result":"succeeded","method":"plain-reconnect","at":"%s"}\n' "$(date -Iseconds)" > "$status_file"
         exit 0
@@ -360,13 +404,19 @@ let
         echo '{"result":"failed","reason":"no-setup-key"}' > "$status_file"
         exit 1
       fi
-      setup_key=$(cat "${cfg.setupKeyFile}")
-
       netbird down || true
 
+      # `--setup-key-file`, never `--setup-key "$(cat ...)"`: the latter puts
+      # a long-lived, REUSABLE setup key into netbird's argv, and
+      # /proc/<pid>/cmdline is world-readable on a default Linux host (no
+      # hidepid=, no ProtectProc=). Anyone who reads it can enroll an
+      # arbitrary peer into the account. The flag reads the same
+      # root-readable file this script already stat'ed above and has existed
+      # since well before netbird 0.74.x, the oldest version this module is
+      # known to run against.
       if ! timeout ${toString cfg.reprovision.connectTimeoutSec} \
              netbird up --management-url "${cfg.managementUrl}" \
-                         --setup-key "$setup_key" \
+                         --setup-key-file "${cfg.setupKeyFile}" \
                          --hostname "${hostname}"; then
         echo "NIXNET_NETBIRD_REPROVISION_FAILED reason=netbird-up-failed" >&2
         echo '{"result":"failed","reason":"netbird-up-failed"}' > "$status_file"
@@ -375,8 +425,6 @@ let
 
       setup_deadline=$(( $(date +%s) + ${toString cfg.reprovision.connectTimeoutSec} ))
       connected=$(connect_wait "$setup_deadline")
-
-      rm -f /run/nixnet/reprovision/netbird
 
       if [ "$connected" = "true" ]; then
         echo "NIXNET_NETBIRD_REPROVISION_SUCCEEDED method=setup-key"
@@ -575,6 +623,24 @@ in
         # Root: required to drive `netbird up`/`down` and read the
         # root-readable setupKeyFile secret -- narrowly-scoped, rate-limited
         # oneshot, never a resident privileged process.
+      };
+      # Widened, deliberately NOT disabled. While drift persists, the
+      # exec-probe re-touches the trigger on EVERY probe tick (one per
+      # configured peer, at daemon.defaultProbe.intervalMs -- 3 s by
+      # default, and a consumer may set it lower), so this unit legitimately
+      # starts roughly once per tick per peer. systemd's default
+      # 5-starts-per-10s would read two peers on a default interval as a
+      # busy loop, fail this unit, and -- because a path-triggered service's
+      # start-limit failure PROPAGATES to the .path unit (systemd.path(5))
+      # -- take the reactive trigger down with it, permanently, until a
+      # reboot. StartLimitIntervalSec = 0 would be the wrong repair: with
+      # the trigger-consuming trap in reprovisionScript a real hot loop
+      # would run this ~30 ms body back-to-back, and 60 starts in 30 s still
+      # catches that within about two seconds while tolerating any sane
+      # probe cadence.
+      unitConfig = {
+        StartLimitIntervalSec = 30;
+        StartLimitBurst = 60;
       };
     };
 

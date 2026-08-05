@@ -83,21 +83,38 @@ let
     TOKEN=$(tr -d '[:space:]' < "$TOKENFILE")
     [ -n "$TOKEN" ] || skip "empty token in $TOKENFILE"
 
-    hdr="Authorization: Token $TOKEN"
-
     # Fetch to FILES (curl -o), never captured through nested command
     # substitution -- a large curl body round-tripped through `$(...)`
     # twice in a row has been observed to intermittently truncate the
     # SECOND fetch. api_get retries and validates the file is a JSON
     # array, so a transient bad response is a clean no-op (skip), never a
     # partial group wipe.
-    PEERS_F=$(mktemp); GROUPS_F=$(mktemp)
-    trap 'rm -f "$PEERS_F" "$GROUPS_F"' EXIT
+    #
+    # HDR_F is the same idea applied to the credential: the token must
+    # never become a curl ARGV element. /proc/<pid>/cmdline is world-
+    # readable on a default Linux box (nothing here or in any consumer
+    # sets hidepid= / ProtectProc=), and this unit re-runs every
+    # `interval` forever, spawning one token-bearing curl per managed
+    # group per tick -- each with --max-time 20 and up to 4 retries, so
+    # the window is tens of seconds, not microseconds. Any local uid that
+    # polls /proc (including a hostPID:true container running as nobody)
+    # would harvest a full-scope NetBird token: /api/groups, /api/policies,
+    # /api/routes -- the whole ACL model. That would also undo the
+    # boundary mesh-gateway.nix builds one file over: it unseals this
+    # exact token to a root-owned 0600 file precisely so it stays off
+    # every other uid's radar. `-H @file` (curl 7.55+) reads the header
+    # from a file instead; mktemp creates it 0600 regardless of umask, and
+    # the trap is installed BEFORE the secret is written into it so no
+    # failure path can leave it behind.
+    PEERS_F=$(mktemp); GROUPS_F=$(mktemp); HDR_F=$(mktemp)
+    trap 'rm -f "$PEERS_F" "$GROUPS_F" "$HDR_F"' EXIT
+    printf 'Authorization: Token %s\n' "$TOKEN" > "$HDR_F"
+    unset TOKEN
 
     api_get() { # $1 = endpoint, $2 = output file
       local ep="$1" f="$2" tries=0
       while [ "$tries" -lt 4 ]; do
-        if curl -fsS --max-time 20 -H "$hdr" "$API/$ep" -o "$f" 2>/dev/null \
+        if curl -fsS --max-time 20 -H @"$HDR_F" "$API/$ep" -o "$f" 2>/dev/null \
            && jq -e 'type=="array"' "$f" >/dev/null 2>&1; then
           return 0
         fi
@@ -163,7 +180,7 @@ let
       fi
       peers_json=$(printf '%s\n' $want | sed '/^$/d' | jq -R . | jq -s .)
       body=$(jq -n --arg name "$g" --argjson peers "$peers_json" '{name:$name, peers:$peers}')
-      if curl -fsS --max-time 20 -H "$hdr" -H 'Content-Type: application/json' \
+      if curl -fsS --max-time 20 -H @"$HDR_F" -H 'Content-Type: application/json' \
            -X PUT -d "$body" "$API/groups/$gid" >/dev/null; then
         n=$(printf '%s\n' $want | sed '/^$/d' | wc -l | tr -d ' ')
         log "reconciled '$g' → $n peers"; changed=1

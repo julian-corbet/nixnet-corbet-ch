@@ -151,11 +151,33 @@ let
       # is correct here anyway: a SUCCESSFUL unseal must stay done.
       Restart = "on-failure";
       RestartSec = "5s";
+      # The plaintext must be unreadable FROM THE open(2) THAT CREATES IT,
+      # not from a chmod after sops has already finished writing it. Under
+      # systemd's default umask 0022 the `> ...tmp` redirect below creates
+      # the file 0644, so for one whole sops decrypt any local uid that
+      # polls this entirely predictable path reads either a REUSABLE
+      # NetBird setup key (enrolls an arbitrary peer into the account) or
+      # the API token (which is also netbird-group-reconcile's and
+      # netbird-access-model's default tokenFile -- i.e. the account's ACL
+      # model). The window reopens on every boot, every RestartSec=5s
+      # retry, and every deploy switch. UMask= covers anything else this
+      # unit might ever write; the `umask 077` in the script is the same
+      # guarantee restated where a reader of the script can see it.
+      UMask = "0077";
     };
     startLimitIntervalSec = 300;
     startLimitBurst = 10;
     script = ''
       set -u
+      umask 077
+      # Plain `mkdir -p`, deliberately NOT `install -d -m 0700`: under the
+      # umask above a directory this script CREATES comes out 0700, while
+      # an /run/secrets that already exists is left exactly as its owner
+      # made it. Another secret manager on the same host (sops-nix, agenix)
+      # legitimately keeps that directory traversable so non-root units can
+      # reach their own 0600 secrets, and chmod'ing it out from under them
+      # would break those units for no gain -- a 0600 file is unreadable
+      # through a 0755 directory anyway.
       mkdir -p "$(dirname ${lib.escapeShellArg outFile})"
       if sops -d --input-type binary --output-type binary ${secretFile} > ${outFile}.tmp 2>/dev/null; then
         chmod 600 ${outFile}.tmp && mv -f ${outFile}.tmp ${outFile} && echo "${label} unsealed -> ${outFile}"

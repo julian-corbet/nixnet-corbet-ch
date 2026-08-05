@@ -101,14 +101,47 @@ rec {
   # Here it cannot be missing: every interface in `management.interfaces` gets an unconditional
   # accept on the management port, generated before the host's own rule list and not overridable
   # by it.
+  # PER SOURCE ADDRESS, never one shared bucket — and the difference is the whole value of the
+  # option. A bare `limit rate 6/minute` is ONE token bucket for the rule: every new connection on
+  # earth draws from it, so anyone who can reach the port can empty it and the very next rule drops
+  # the operator. A brute-forcer does not need to guess a password to lock you out of your own box;
+  # it needs to knock seven times a minute. That converts a hardening measure into a remote denial
+  # of service against exactly the interface you would use to fix it.
+  #
+  # A dynamic set keyed on the source address gives each source its own bucket, which is what
+  # "rate-limit new connections" was always meant to mean. Two sets because the table is `inet` and
+  # an address type cannot be both families; `meta nfproto` selects which rule a packet reaches.
+  mgmtSetV4 = "nixnet-management-ratelimit-v4";
+  mgmtSetV6 = "nixnet-management-ratelimit-v6";
+
+  # Element lifetime, not the rate window: an idle source's entry is garbage after this, and the
+  # set stays small on a host being scanned continuously.
+  mgmtSetTimeout = "10m";
+
+  managementSetLines = cfg:
+    lib.optionals (cfg.management.rateLimitNew != null && cfg.management.interfaces != [ ]) [
+      "set ${mgmtSetV4} {"
+      "  type ipv4_addr"
+      "  flags dynamic,timeout"
+      "  timeout ${mgmtSetTimeout}"
+      "}"
+      ""
+      "set ${mgmtSetV6} {"
+      "  type ipv6_addr"
+      "  flags dynamic,timeout"
+      "  timeout ${mgmtSetTimeout}"
+      "}"
+    ];
+
   managementLines = cfg:
     lib.concatMap
       (i:
         if cfg.management.rateLimitNew == null then
           [ "iifname \"${i}\" tcp dport ${toString cfg.management.port} accept  # nixnet: management, never removable" ]
         else [
-          "iifname \"${i}\" tcp dport ${toString cfg.management.port} ct state new limit rate ${cfg.management.rateLimitNew} accept  # nixnet: management, rate-limited"
-          "iifname \"${i}\" tcp dport ${toString cfg.management.port} ct state new drop  # nixnet: management, rate-limit exceeded"
+          "iifname \"${i}\" meta nfproto ipv4 tcp dport ${toString cfg.management.port} ct state new add @${mgmtSetV4} { ip saddr limit rate ${cfg.management.rateLimitNew} } accept  # nixnet: management, rate-limited per source"
+          "iifname \"${i}\" meta nfproto ipv6 tcp dport ${toString cfg.management.port} ct state new add @${mgmtSetV6} { ip6 saddr limit rate ${cfg.management.rateLimitNew} } accept  # nixnet: management, rate-limited per source"
+          "iifname \"${i}\" tcp dport ${toString cfg.management.port} ct state new drop  # nixnet: management, this source is over its rate"
         ])
       cfg.management.interfaces;
 

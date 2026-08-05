@@ -176,6 +176,7 @@ let
     delete table inet ${cfg.table}
 
     table inet ${cfg.table} {
+    ${indent 2 (rs.managementSetLines cfg)}
       chain input {
         type filter hook input priority filter; policy drop;
 
@@ -273,12 +274,21 @@ let
   revertScript = pkgs.writeShellScript "nixnet-firewall-revert" ''
     if [ -f ${pendingFile} ]; then
       echo "nixnet: confirmation window expired — restoring the previous ruleset."
-      ${pkgs.nftables}/bin/nft -f ${pendingFile}
-      rm -f ${pendingFile}
-      # Tell the reconcile loop to stand down for THIS ruleset. Without this it would find the
-      # generation marker missing one interval later, conclude the firewall had been flushed by a
-      # foreigner, and reload the very ruleset this revert just undid.
-      printf %s "${rulesetHash}" > ${revertedHashFile}
+      # The exit status decides what happens next, so it is checked rather than assumed. A failed
+      # restore that deleted the snapshot and told the reconcile loop to stand down would leave the
+      # host running the suspect ruleset with BOTH safety nets retired and nothing left that could
+      # put anything back.
+      if ${pkgs.nftables}/bin/nft -f ${pendingFile}; then
+        rm -f ${pendingFile}
+        # Tell the reconcile loop to stand down for THIS ruleset. Without this it would find the
+        # generation marker missing one interval later, conclude the firewall had been flushed by a
+        # foreigner, and reload the very ruleset this revert just undid.
+        printf %s "${rulesetHash}" > ${revertedHashFile}
+      else
+        echo "nixnet: restoring the previous ruleset FAILED — keeping the snapshot." >&2
+        echo "nixnet: the host is running the unconfirmed ruleset; reconcile stays enabled." >&2
+        exit 1
+      fi
     fi
   '';
 
@@ -312,13 +322,34 @@ let
       exit 0
     fi
 
-    if ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
-      { echo "table inet ${cfg.table}"; echo "delete table inet ${cfg.table}"; \
-        ${pkgs.nftables}/bin/nft list table inet ${cfg.table}; } > ${pendingFile}
-    else
-      # No prior table: reverting means removing ours entirely, not restoring nothing.
-      { echo "table inet ${cfg.table}"; echo "delete table inet ${cfg.table}"; } > ${pendingFile}
+    # ── NEVER ARM WITH NOTHING TO RESTORE ──────────────────────────────────────────────────────
+    # There is no prior table, so the only thing a revert could do is DELETE this one and leave the
+    # host with no packet filter. That is not a recovery from a bad ruleset, it is a worse outcome
+    # than the ruleset — and it is the failure that put corbet-eu-vultr, a public host and the
+    # overlay control plane, on the open internet unfiltered on 2026-08-04.
+    #
+    # Read the sequence, because "arm only on a change" was already implemented and did not prevent
+    # it: the first deploy of a nixnet ruleset to a host is BY DEFINITION a change, so the switch
+    # armed. The snapshot it took was of an empty kernel, so the restore file said `add table;
+    # delete table`. Nobody typed `nixnet-firewall-confirm`, because it was an unattended CI deploy
+    # and there is no human in that loop. `seconds` later the timer fired and did exactly what it
+    # was told. Green unit, no firewall, and every subsequent theory (the switch self-killing,
+    # deploy-rs rolling back, a podman health check) was looking at a different part of the elephant.
+    #
+    # A first apply therefore gets NO dead-man switch. The protection an unattended first deploy
+    # actually has is the deploy layer's own rollback, which reverts the whole generation rather
+    # than one table — and if that fails too, a firewall that is merely WRONG still leaves a host in
+    # a better state than a firewall that is ABSENT.
+    if ! ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
+      rm -f ${pendingFile}
+      printf %s "${rulesetHash}" > ${appliedHashFile}
+      echo "nixnet: no previous ruleset to restore — not arming auto-revert." >&2
+      echo "nixnet: a revert here could only DELETE this host's firewall, which is not a recovery." >&2
+      exit 0
     fi
+
+    { echo "table inet ${cfg.table}"; echo "delete table inet ${cfg.table}"; \
+      ${pkgs.nftables}/bin/nft list table inet ${cfg.table}; } > ${pendingFile}
 
     # Recorded BEFORE the countdown, not on confirmation. If the revert does fire, the next boot
     # must load this ruleset and LEAVE it alone rather than re-arming and re-reverting forever —
@@ -483,6 +514,13 @@ let
       echo "nixnet: table inet ${cfg.table} is still present after teardown." >&2
       exit 1
     fi
+
+    # Forget which ruleset was last applied. `applied-hash` means "this exact ruleset is loaded on
+    # this box"; after a teardown nothing is, and leaving the file behind means re-enabling the
+    # firewall with the SAME ruleset is read as "unchanged, do not arm" — the dead-man switch
+    # silently disarmed for a ruleset the host has not run since. The revert marker goes with it:
+    # it refers to a table that no longer exists either.
+    rm -f ${appliedHashFile} ${pendingFile} ${revertedHashFile}
   '';
 
   # ONE unit name on both planes, and NO ExecStop. Both are load-bearing:
@@ -926,10 +964,15 @@ in
     }
 
     # The derivation, published into the module that owns the confinement rules. mkDefault, so an
-    # operator can still override — and the assertion below then reports the disagreement instead
-    # of letting the two quietly differ. Gated on the overlay actually advertising routes: setting
+    # operator can still override — and the assertions report the disagreement instead of letting
+    # the two quietly differ. Gated on the overlay actually advertising routes: setting
     # `confineExternalRanges` on a non-routing peer trips that module's own assertion, which is
     # correct there and would be this module's fault here.
+    #
+    # NOTE what this block is NOT gated on: `cfg.enable`. A host can run the overlay's confinement
+    # while leaving this module's own firewall off, and then this derivation is the only thing
+    # deciding where the fence goes. That is why its four guards sit in the UNCONDITIONAL assertion
+    # list below rather than beside the rest of the firewall's checks.
     (lib.optionalAttrs (options.nixnet ? overlay) {
       nixnet.overlay.confineExternalRanges =
         lib.mkIf (confinementActive && (overlayCfg.advertiseRoutes or [ ]) != [ ])
@@ -984,6 +1027,79 @@ in
             overlay's confinement and source-NAT on every boot.
 
             Give this module a table name of its own.
+          '';
+        }
+
+        # ── The confinement checks, and why they are OUT here too ─────────────────────────────
+        #
+        # Same reasoning as the table-name assertion above, and measurably so for these: the
+        # derivation they guard is published OUTSIDE the enable gate (the
+        # `nixnet.overlay.confineExternalRanges` block further up), so a host that runs the overlay
+        # for its confinement while leaving THIS module's firewall off gets the derived fence — and,
+        # with the checks inside the gate, none of the guards that make it trustworthy.
+        #
+        # Proved by evaluating it rather than by reading it: with `enable = false` and a band that
+        # does not exist, `derivedConfinementRanges` degrades to `[ ]`, `mkDefault [ ]` is published,
+        # the overlay renders NO jump to its confine chain, and not one assertion fires. Every
+        # least-trust peer then has unrestricted reach into the advertised LAN, both units green and
+        # `nft list ruleset` looking correct. `enable = true` on the identical config is an eval
+        # error — which is the wrong way round, since `enable` defaults to false.
+        #
+        # All four are additionally guarded by `confinementActive`, so a host that never sets
+        # `overlayConfinement.network` is unaffected either way.
+        #
+        # DISAGREEING CONTENT: the confinement lives in the overlay's table, this module derives
+        # what it should contain. If the effective value drops a derived range, the peers in that
+        # part of the band are unconfined — every rule still present, `nft list ruleset` still
+        # looking correct, and the hole exactly where the operator believes the fence is.
+        {
+          assertion =
+            !(confinementActive && (overlayCfg.advertiseRoutes or [ ]) != [ ])
+            || lib.all (r: lib.elem r (overlayCfg.confineExternalRanges or [ ])) derivedConfinementRanges;
+          message = ''
+            nixnet.firewall.overlayConfinement derives, from the "${toString confinedBandName}" band:
+              ${lib.concatStringsSep ", " derivedConfinementRanges}
+            nixnet.overlay.confineExternalRanges does not contain every one of them:
+              ${lib.concatStringsSep ", " (overlayCfg.confineExternalRanges or [ ])}
+
+            The confinement is rendered from the overlay's value, so any derived range missing
+            above is NOT confined: those peers keep full reach into the advertised LAN while the
+            band they belong to is the one the account treats as least-trust. Nothing fails at
+            runtime — the rules that exist are correct, the ones that are missing are the point.
+
+            This is a check on the LIST, not on address coverage: each derived CIDR must appear
+            verbatim in `confineExternalRanges`. A single wider prefix that happens to contain
+            them all trips this too, deliberately — proving containment would mean this module
+            re-deriving the boundary a second way, which is the duplicated statement of one fact
+            the whole derivation exists to remove.
+
+            So: drop the override and let the band decide, widen the band, or — if the override
+            really must stand — include the derived CIDRs above in it verbatim.
+          '';
+        }
+        {
+          assertion = !confinementActive || networkMatch != null;
+          message = ''
+            nixnet.firewall.overlayConfinement.network ("${toString confinement.network}") is not
+            a /24. The band scheme it derives from keys off the last octet, so a different prefix
+            length means the two declarations are not describing the same address space.
+          '';
+        }
+        {
+          assertion = !confinementActive || confinedBandName != null;
+          message = ''
+            nixnet.firewall.overlayConfinement.network is set but there is no band to derive from:
+            `nixnet.netbirdGroupReconcile.excludeFromCatchAll.forBand` is unset and
+            `overlayConfinement.band` names nothing. The derivation would produce an empty
+            confinement — a fence that evaluates clean and does not exist.
+          '';
+        }
+        {
+          assertion = !confinementActive || confinedBands != [ ];
+          message = ''
+            nixnet.firewall.overlayConfinement derives from band "${toString confinedBandName}",
+            which is not among the declared `nixnet.netbirdGroupReconcile.bands`. The derivation
+            produces nothing, so the confinement would silently not exist.
           '';
         }
       ];
@@ -1056,64 +1172,6 @@ in
             '';
           }
 
-          # The SAME-NAME half of "two tables, one host" is asserted unconditionally, above,
-          # outside the enable gate — see the comment there for why `enable = false` is the more
-          # dangerous case rather than the safe one.
-          #
-          # DISAGREEING CONTENT: the confinement lives in the overlay's table, this module derives
-          # what it should contain. If the effective value drops a derived range, the peers in that
-          # part of the band are unconfined — every rule still present, `nft list ruleset` still
-          # looking correct, and the hole exactly where the operator believes the fence is.
-          {
-            assertion =
-              !(confinementActive && (overlayCfg.advertiseRoutes or [ ]) != [ ])
-              || lib.all (r: lib.elem r (overlayCfg.confineExternalRanges or [ ])) derivedConfinementRanges;
-            message = ''
-              nixnet.firewall.overlayConfinement derives, from the "${toString confinedBandName}" band:
-                ${lib.concatStringsSep ", " derivedConfinementRanges}
-              nixnet.overlay.confineExternalRanges does not contain every one of them:
-                ${lib.concatStringsSep ", " (overlayCfg.confineExternalRanges or [ ])}
-
-              The confinement is rendered from the overlay's value, so any derived range missing
-              above is NOT confined: those peers keep full reach into the advertised LAN while the
-              band they belong to is the one the account treats as least-trust. Nothing fails at
-              runtime — the rules that exist are correct, the ones that are missing are the point.
-
-              This is a check on the LIST, not on address coverage: each derived CIDR must appear
-              verbatim in `confineExternalRanges`. A single wider prefix that happens to contain
-              them all trips this too, deliberately — proving containment would mean this module
-              re-deriving the boundary a second way, which is the duplicated statement of one fact
-              the whole derivation exists to remove.
-
-              So: drop the override and let the band decide, widen the band, or — if the override
-              really must stand — include the derived CIDRs above in it verbatim.
-            '';
-          }
-          {
-            assertion = !confinementActive || networkMatch != null;
-            message = ''
-              nixnet.firewall.overlayConfinement.network ("${toString confinement.network}") is not
-              a /24. The band scheme it derives from keys off the last octet, so a different prefix
-              length means the two declarations are not describing the same address space.
-            '';
-          }
-          {
-            assertion = !confinementActive || confinedBandName != null;
-            message = ''
-              nixnet.firewall.overlayConfinement.network is set but there is no band to derive from:
-              `nixnet.netbirdGroupReconcile.excludeFromCatchAll.forBand` is unset and
-              `overlayConfinement.band` names nothing. The derivation would produce an empty
-              confinement — a fence that evaluates clean and does not exist.
-            '';
-          }
-          {
-            assertion = !confinementActive || confinedBands != [ ];
-            message = ''
-              nixnet.firewall.overlayConfinement derives from band "${toString confinedBandName}",
-              which is not among the declared `nixnet.netbirdGroupReconcile.bands`. The derivation
-              produces nothing, so the confinement would silently not exist.
-            '';
-          }
         ];
 
         warnings =

@@ -1,8 +1,16 @@
 //! Managed `/etc/hosts` block for peers. Content outside the BEGIN/END
-//! markers ("the static prefix") is never touched by the daemon -- it is
-//! seeded once, at boot/switch, by the NixOS activation script
+//! markers is never touched by the daemon -- BOTH sides of the block. The
+//! prefix is seeded once, at boot/switch, by the NixOS activation script
 //! (`modules/core.nix`), from the user's own `networking.hosts` /
-//! `extraHosts` plus best-effort last-known-good winners.
+//! `extraHosts` plus best-effort last-known-good winners. The suffix --
+//! everything after the END marker -- is where an append lands: the seed
+//! writes `# END nixnet` as the file's LAST line and `modules/core.nix`
+//! points `/etc/hosts` at this file, so `echo ... >> /etc/hosts`, the one
+//! way an operator or a foreign tool actually adds a host entry, writes
+//! there and nowhere else. Carrying only the prefix across a rewrite would
+//! make that append a data-loss event on the next tick (TF-2 rewrites on
+//! every tick), while preserving exactly the region no shell one-liner can
+//! reach.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,17 +38,20 @@ pub struct Entry {
 /// Owns atomic rewrites of the managed hosts file.
 pub struct HostsPublisher {
     path: PathBuf,
-    /// The static prefix as it looked when the daemon started, used ONLY
-    /// when the file has since vanished. Every ordinary publication reads
-    /// the prefix back off disk instead: TF-2 turned publication into a
-    /// per-tick operation, and a snapshot replayed every few seconds
-    /// deletes anything a human or another tool appended within one tick
-    /// of them writing it.
+    /// The static content around the block as it looked when the daemon
+    /// started, used ONLY when the file has since vanished. Every ordinary
+    /// publication reads both halves back off disk instead: TF-2 turned
+    /// publication into a per-tick operation, and a snapshot replayed every
+    /// few seconds deletes anything a human or another tool wrote outside
+    /// the markers within one tick of them writing it.
     static_prefix: String,
+    /// Everything that followed the END marker at start, same fallback
+    /// role as `static_prefix`.
+    static_suffix: String,
 }
 
 impl HostsPublisher {
-    /// Loads the static prefix from whatever already exists at `path`
+    /// Loads the static content from whatever already exists at `path`
     /// (normally written moments earlier by the activation script). If
     /// `path` doesn't exist yet, or has no marker block, its entire
     /// existing content -- or nothing at all -- becomes the static prefix;
@@ -49,25 +60,30 @@ impl HostsPublisher {
     /// supported thing to do.
     ///
     /// The value read here is a FALLBACK for a file that later disappears:
-    /// `publish` re-reads the prefix off the live file every time, so
-    /// nothing written outside the markers after this point is lost.
+    /// `publish` re-reads prefix and suffix off the live file every time,
+    /// so nothing written outside the markers after this point is lost.
     pub fn new(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        let prefix = match std::fs::read_to_string(&path) {
-            Ok(data) => split_static(&data).0,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        let (prefix, suffix) = match std::fs::read_to_string(&path) {
+            Ok(data) => {
+                let (p, s, _) = split_static(&data);
+                (p, s)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (String::new(), String::new()),
             Err(e) => return Err(e),
         };
         Ok(Self {
             path,
             static_prefix: prefix,
+            static_suffix: suffix,
         })
     }
 
-    /// Rewrites the whole hosts file: static prefix, unchanged, plus a
-    /// freshly rendered marker block for `entries`. Entries are sorted by
-    /// address for deterministic, diff-friendly output across ticks.
-    /// Returns whether the file was actually written.
+    /// Rewrites the whole hosts file: static prefix, unchanged, a freshly
+    /// rendered marker block for `entries`, then the static suffix,
+    /// unchanged. Entries are sorted by address for deterministic,
+    /// diff-friendly output across ticks. Returns whether the file was
+    /// actually written.
     ///
     /// TF-2: called on every reconcile tick, not only when a winner
     /// changes, and therefore a NO-OP whenever the live file already says
@@ -90,12 +106,17 @@ impl HostsPublisher {
             Err(e) => return Err(e),
         };
 
-        // The prefix comes off the LIVE file, so an entry a human or
+        // Both static halves come off the LIVE file, so an entry a human or
         // another tool put outside the markers survives (PUB-1) instead of
-        // being deleted by the next tick's replay of a start-time snapshot.
-        let prefix = match &current {
-            Some(c) => split_static(c).0,
-            None => self.static_prefix.clone(),
+        // being deleted by the next tick's replay of a start-time snapshot
+        // -- and the suffix is the half that matters most in practice,
+        // because `>> /etc/hosts` can only write there.
+        let (prefix, suffix) = match &current {
+            Some(c) => {
+                let (p, s, _) = split_static(c);
+                (p, s)
+            }
+            None => (self.static_prefix.clone(), self.static_suffix.clone()),
         };
 
         let mut sorted: Vec<&Entry> = entries.iter().collect();
@@ -121,6 +142,12 @@ impl HostsPublisher {
         }
         out.push_str(END_MARKER);
         out.push('\n');
+        // Verbatim, unlike the prefix: `split_static` normalizes the
+        // prefix's trailing newlines, and normalizing here too would make
+        // a suffix that gains or loses a byte on read-back a difference
+        // that never converges -- TF-2's comparison would then rewrite
+        // /etc/hosts on every tick, forever.
+        out.push_str(&suffix);
 
         if let Some(c) = &current {
             if same_but_for_freshness(c, &out) {
@@ -157,15 +184,39 @@ fn same_but_for_freshness(a: &str, b: &str) -> bool {
     significant(a) == significant(b)
 }
 
-/// Returns the content strictly before the BEGIN marker line (trailing
-/// blank lines trimmed). If no BEGIN marker is present, the whole input is
-/// treated as static content. Second return value mirrors the Go
+/// Splits a live hosts file into the two static regions `publish` must
+/// carry over untouched: everything strictly before the BEGIN marker line
+/// (trailing blank lines trimmed) and everything strictly after the END
+/// marker line (verbatim). If no BEGIN marker is present, the whole input
+/// is the prefix and there is no suffix. Third return value mirrors the Go
 /// original's `hadMarkers` (unused by callers here, kept for parity with
 /// `splitStatic`'s documented signature).
-fn split_static(content: &str) -> (String, bool) {
-    let (raw, had_markers) = match content.find(BEGIN_MARKER) {
-        Some(idx) => (&content[..idx], true),
-        None => (content, false),
+///
+/// The suffix half is not decoration: `modules/core.nix` seeds
+/// `# END nixnet` as the LAST line of the file and symlinks `/etc/hosts`
+/// onto it, so every `>>` append an operator or another tool makes lands
+/// after END. Returning only the prefix -- which is what this did until
+/// the append region was noticed -- deleted that append on the next tick.
+fn split_static(content: &str) -> (String, String, bool) {
+    let (raw, suffix, had_markers) = match content.find(BEGIN_MARKER) {
+        Some(begin) => {
+            // Searched forward from BEGIN, and line-anchored: an
+            // END-looking line sitting in the PREFIX (a leftover from a
+            // half-written file, or a comment someone pasted) must not be
+            // mistaken for this block's terminator, or the real block
+            // would be swallowed into the suffix and republished forever.
+            let suffix = match block_end(content, begin) {
+                Some(end) => content[end..].to_string(),
+                // BEGIN with no END is a mangled block -- nothing wrote it
+                // that way, since every publication here is atomic. There
+                // is no way to tell where the block was meant to stop, so
+                // nothing after it can be attributed to a static writer
+                // and none of it is carried over.
+                None => String::new(),
+            };
+            (&content[..begin], suffix, true)
+        }
+        None => (content, String::new(), false),
     };
     let trimmed = raw.trim_end_matches('\n');
     // An EMPTY prefix renders as nothing, not as a blank line. It matters
@@ -175,10 +226,23 @@ fn split_static(content: &str) -> (String, bool) {
     // so the daemon would rewrite the hosts file on every single tick while
     // reporting that it had reconciled.
     if trimmed.is_empty() {
-        (String::new(), had_markers)
+        (String::new(), suffix, had_markers)
     } else {
-        (format!("{}\n", trimmed), had_markers)
+        (format!("{}\n", trimmed), suffix, had_markers)
     }
+}
+
+/// Byte offset just past the END marker line (its newline included) of the
+/// block that starts at `begin`, or `None` if the block is unterminated.
+fn block_end(content: &str, begin: usize) -> Option<usize> {
+    let mut off = begin;
+    for line in content[begin..].split_inclusive('\n') {
+        if line.trim() == END_MARKER {
+            return Some(off + line.len());
+        }
+        off += line.len();
+    }
+    None
 }
 
 /// Reads `# nixnet <address> confirmed=<rfc3339>` back into its two parts.
@@ -249,17 +313,50 @@ mod tests {
 
     #[test]
     fn split_static_no_marker_keeps_whole_file() {
-        let (prefix, had) = split_static("127.0.0.1 localhost\n::1 localhost\n");
+        let (prefix, suffix, had) = split_static("127.0.0.1 localhost\n::1 localhost\n");
         assert_eq!(prefix, "127.0.0.1 localhost\n::1 localhost\n");
+        assert_eq!(suffix, "");
         assert!(!had);
     }
 
     #[test]
-    fn split_static_keeps_only_content_before_marker() {
-        let content =
-            "static line 1\nstatic line 2\n\n\n# BEGIN nixnet\n1.2.3.4\tfoo\n# END nixnet\n";
-        let (prefix, had) = split_static(content);
+    fn split_static_keeps_the_content_on_both_sides_of_the_block() {
+        let content = "static line 1\nstatic line 2\n\n\n# BEGIN nixnet\n1.2.3.4\tfoo\n\
+                       # END nixnet\n192.0.2.7\tbuild-cache\n";
+        let (prefix, suffix, had) = split_static(content);
         assert_eq!(prefix, "static line 1\nstatic line 2\n");
+        assert_eq!(
+            suffix, "192.0.2.7\tbuild-cache\n",
+            "the append region after the END marker was dropped"
+        );
+        assert!(had);
+    }
+
+    /// The END marker is located by scanning FORWARD from BEGIN, and only
+    /// whole lines count. A file that carries an END-looking line ahead of
+    /// the real block -- a leftover, a pasted comment -- would otherwise
+    /// terminate the block before it started, and the daemon would then
+    /// republish its own managed entries as static suffix content on every
+    /// tick, growing the file without bound.
+    #[test]
+    fn split_static_ignores_an_end_marker_that_precedes_the_block() {
+        let content = "# END nixnet\n# BEGIN nixnet\n1.2.3.4\tfoo\n# END nixnet\nafter\n";
+        let (prefix, suffix, had) = split_static(content);
+        assert_eq!(prefix, "# END nixnet\n");
+        assert_eq!(suffix, "after\n");
+        assert!(had);
+    }
+
+    /// A BEGIN with no END is a block something else mangled (every
+    /// publication here is atomic, so nixnet cannot produce one). There is
+    /// no way to tell where the block was meant to stop, so nothing after
+    /// it is claimed as static content.
+    #[test]
+    fn split_static_carries_nothing_over_from_an_unterminated_block() {
+        let content = "static\n# BEGIN nixnet\n1.2.3.4\tfoo\n";
+        let (prefix, suffix, had) = split_static(content);
+        assert_eq!(prefix, "static\n");
+        assert_eq!(suffix, "");
         assert!(had);
     }
 
@@ -450,11 +547,117 @@ mod tests {
         );
     }
 
+    /// PUB-1's other half, and the one an operator actually reaches: the
+    /// seed writes `# END nixnet` as the file's LAST line and `/etc/hosts`
+    /// points at this file, so `echo '192.0.2.7 build-cache' >>
+    /// /etc/hosts` -- the one-liner everybody types -- lands strictly
+    /// AFTER the managed block. Nothing can append into the prefix. While
+    /// `publish` carried only the prefix over, that append was deleted by
+    /// the next tick (TF-2 made publication per-tick), silently and
+    /// forever: re-adding it never worked, on any nixnet host.
     #[test]
-    fn new_hosts_publisher_on_missing_file_has_empty_prefix() {
+    fn a_line_appended_after_the_end_marker_survives_the_next_publication() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "# static\n").unwrap();
+        let hp = HostsPublisher::new(&path).unwrap();
+
+        let entries = [Entry {
+            address: "10.0.0.1".into(),
+            hostnames: vec!["a".into()],
+            confirmed_at: None,
+        }];
+        hp.publish(&entries).unwrap();
+
+        // Exactly what `>>` does: bytes on the end of the file, after the
+        // END marker line.
+        let published = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            published.ends_with("# END nixnet\n"),
+            "the append region is not at the end of the file, so this test \
+             is not exercising what an operator's `>>` hits:\n{published}"
+        );
+        std::fs::write(&path, format!("{published}192.0.2.7\tbuild-cache\n")).unwrap();
+        let before = std::fs::metadata(&path).unwrap().ino();
+
+        assert!(
+            !hp.publish(&entries).unwrap(),
+            "an append outside the markers provoked a rewrite of the file"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            before,
+            "the file was replaced over a change nixnet does not own"
+        );
+
+        // ...and it must still survive a publication that DOES rewrite,
+        // which is the tick that actually destroyed it before.
+        assert!(
+            hp.publish(&[Entry {
+                address: "10.0.0.9".into(),
+                hostnames: vec!["a".into()],
+                confirmed_at: None,
+            }])
+            .unwrap(),
+            "a changed address did not reach the file"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("192.0.2.7\tbuild-cache"),
+            "an entry appended after the END marker was deleted:\n{after}"
+        );
+        assert!(
+            after.contains("10.0.0.9\ta"),
+            "the managed block was lost:\n{after}"
+        );
+        assert!(
+            after.ends_with("192.0.2.7\tbuild-cache\n"),
+            "the appended entry moved out of the append region, so the next \
+             append would land somewhere else again:\n{after}"
+        );
+    }
+
+    #[test]
+    fn new_hosts_publisher_on_missing_file_has_empty_prefix_and_suffix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hosts");
         let hp = HostsPublisher::new(&path).unwrap();
         assert_eq!(hp.static_prefix, "");
+        assert_eq!(hp.static_suffix, "");
+    }
+
+    /// The vanished-file fallback: `publish` normally re-reads both static
+    /// halves off the live file, but a file that has been deleted under
+    /// the daemon has neither, and then the start-time snapshot is all
+    /// there is. It must restore both halves, not just the prefix -- a
+    /// restored file with the append region silently missing is the same
+    /// data loss one recovery step later.
+    #[test]
+    fn a_vanished_file_is_restored_with_both_static_halves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(
+            &path,
+            "# static\n# BEGIN nixnet\n10.0.0.1\ta\n# END nixnet\n192.0.2.7\tbuild-cache\n",
+        )
+        .unwrap();
+        let hp = HostsPublisher::new(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(hp
+            .publish(&[Entry {
+                address: "10.0.0.1".into(),
+                hostnames: vec!["a".into()],
+                confirmed_at: None,
+            }])
+            .unwrap());
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with("# static\n"), "prefix lost:\n{after}");
+        assert!(
+            after.ends_with("192.0.2.7\tbuild-cache\n"),
+            "suffix lost:\n{after}"
+        );
     }
 }

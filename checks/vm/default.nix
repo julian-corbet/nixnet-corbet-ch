@@ -19,6 +19,7 @@ let
   specs = map (f: import f { inherit pkgs; }) [
     ./dhcp-addressing.nix
     ./firewall-apply-failure.nix
+    ./firewall-autorevert.nix
     ./firewall-foreign-table.nix
     ./firewall-reconcile.nix
     ./hosts-single-writer.nix

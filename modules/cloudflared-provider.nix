@@ -36,10 +36,24 @@ let
     text = ''
       set -euo pipefail
 
-      state_dir="/run/nixnet/reprovision"
-      drift_count_file="$state_dir/.cloudflared-drift-count"
-      last_restart_file="/var/lib/nixnet-cloudflared/.last-restart"
-      mkdir -p "$state_dir" "$(dirname "$last_restart_file")"
+      # BOTH files live in this module's OWN directory. The drift counter
+      # used to sit in /run/nixnet/reprovision, which is inside nixnetd's
+      # `RuntimeDirectory = nixnet` (core.nix) -- and with
+      # RuntimeDirectoryPreserve at its default `no`, systemd rm -rf's that
+      # tree every time nixnetd stops, including the automatic
+      # Restart=always/RestartSec=1 restarts a crash-looping nixnetd
+      # produces. The hysteresis count then never reached
+      # driftFailureThreshold, so a genuinely wedged tunnel was never
+      # restarted while this unit logged a plausible-looking count=1 every
+      # minute: heal-too-late, invisible. That is also why the module's
+      # own tmpfiles rule no longer declares /run/nixnet/reprovision --
+      # RuntimeDirectory= re-chowns that directory's contents to
+      # nixnetd:nixnetd on every start, so it is netbird-provider's path
+      # to own, not this module's to borrow.
+      state_dir="/var/lib/nixnet-cloudflared"
+      drift_count_file="$state_dir/.drift-count"
+      last_restart_file="$state_dir/.last-restart"
+      mkdir -p "$state_dir"
 
       ready_json=$(curl -fsS --max-time 5 "http://${cfg.metricsAddr}/ready" 2>/dev/null || echo '{}')
 
@@ -199,20 +213,16 @@ in
     };
 
     systemd.tmpfiles.rules = [
-      # Same path netbird-provider's own tmpfiles rule declares -- a plain
-      # duplicate list entry across modules is harmless (systemd-tmpfiles
-      # is idempotent), and cloudflared-provider must not assume
-      # netbird-provider (or even nixnet.core) is enabled on the
-      # same host, so it declares this independently rather than relying
-      # on another module having already done so.
-      "d /run/nixnet/reprovision 0750 root root -"
-      # Deliberately NOT /var/lib/nixnet: that path is nixnetd's own
-      # `StateDirectory=nixnet` (core.nix), owned by its own fixed user --
-      # this module must work with or without core.nix enabled at all, and
-      # even when both are enabled, two independent systemd mechanisms
-      # (StateDirectory= vs a plain tmpfiles `d` rule) fighting over the
-      # same top-level directory's ownership across reboots is exactly the
-      # kind of footgun worth a few extra bytes to avoid.
+      # This module's ONE directory, holding both its rate-limit stamp and
+      # its drift counter. Deliberately NOT /var/lib/nixnet and deliberately
+      # NOT anything under /run/nixnet: the first is nixnetd's own
+      # `StateDirectory=nixnet` and the second its own
+      # `RuntimeDirectory=nixnet` (both core.nix), each owned and, in the
+      # runtime case, periodically DELETED by systemd on nixnetd's behalf.
+      # This module must work with or without core.nix enabled at all, and
+      # even when both are enabled, letting another service's systemd-
+      # managed directory hold this module's state is how a hysteresis
+      # counter silently resets to zero on an unrelated daemon restart.
       "d /var/lib/nixnet-cloudflared 0750 root root -"
     ];
   };

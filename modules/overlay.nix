@@ -482,9 +482,15 @@ in
           echo "  netbird up --management-url ${cfg.managementUrl} --setup-key <key> --hostname ${cfg.hostname}"
           exit 0
         fi
+        # `--setup-key-file`, never `--setup-key "$(cat ...)"`: the latter
+        # hands a long-lived, reusable setup key to netbird as an argv
+        # element, and /proc/<pid>/cmdline is world-readable on a default
+        # Linux host (no hidepid=, no ProtectProc=) -- any local uid could
+        # read it and enroll an arbitrary peer into the account. The flag
+        # reads the same root-readable file checked just above.
         netbird up \
           --management-url "${cfg.managementUrl}" \
-          --setup-key "$(cat ${cfg.setupKeyFile})" \
+          --setup-key-file "${cfg.setupKeyFile}" \
           --hostname "${cfg.hostname}"
       '';
     };

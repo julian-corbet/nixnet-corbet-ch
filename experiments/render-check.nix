@@ -57,6 +57,12 @@ let
     let msgs = failed cfg; in
     lib.length msgs == 1 && lib.hasInfix infix (lib.head msgs);
 
+  # Same idea, for a config that legitimately trips MORE than one assertion. Unsetting the band
+  # makes it both "no band named" and "the named band is not declared", and both messages are
+  # correct — `firesWith`'s exactly-one rule would read that as a failure. Still names the message
+  # it expects, so it cannot pass on an unrelated refusal.
+  firesAmong = cfg: infix: lib.any (m: lib.hasInfix infix m) (failed cfg);
+
   # The management interface, declared as a fact on every host below: the overlay tunnel, static v4,
   # no v6. `unmanaged` would do as well — what matters is that SOMETHING was said.
   mgmtIface = { addressing = { v4 = "static"; v6 = "none"; }; };
@@ -252,6 +258,33 @@ let
     nixnet.firewall.table = lib.mkForce "nixnet-overlay";
   };
 
+  # ── The confinement derivation with the firewall OFF ──────────────────────────────────────────
+  #
+  # The derivation is published outside the enable gate, so it is LIVE on a host that runs the
+  # overlay's confinement without this module's own firewall. Both halves are pinned here, because
+  # the two failure modes are opposite and each would look like the other being fixed:
+  #
+  #   * it must still WORK with the firewall off — moving the publication inside the gate would
+  #     silently turn `overlayConfinement.network` into a no-op on exactly the hosts it serves,
+  #     replacing a missing fence with a removed one;
+  #   * its guards must still FIRE with the firewall off — while they lived under `mkIf cfg.enable`,
+  #     a band that does not exist produced `[ ]`, published `mkDefault [ ]`, rendered no jump to
+  #     the confine chain, and asserted nothing. The identical config with `enable = true` was an
+  #     eval error, which is the wrong way round: `enable` defaults to FALSE.
+  peerConfinementDisabled = routingPeer {
+    nixnet.firewall.enable = lib.mkForce false;
+  };
+
+  peerConfinementDisabledNoBand = routingPeer {
+    nixnet.firewall.enable = lib.mkForce false;
+    nixnet.netbirdGroupReconcile.excludeFromCatchAll.forBand = lib.mkForce null;
+  };
+
+  peerConfinementDisabledUndeclaredBand = routingPeer {
+    nixnet.firewall.enable = lib.mkForce false;
+    nixnet.netbirdGroupReconcile.excludeFromCatchAll.forBand = lib.mkForce "ext-renamed";
+  };
+
   # ── Inspection tooling ────────────────────────────────────────────────────────────────────────
   #
   # The failure being tested for: a host enforcing a nixnet-authored nftables table with no `nft`
@@ -367,6 +400,19 @@ rec {
   tableCollisionFires = firesWith peerTableCollision "deletes the other's chains";
   tableCollisionFiresWhenDisabled = firesWith peerTableCollisionDisabled "deletes the other's chains";
 
+  # The confinement derivation is live, and guarded, with the firewall DISABLED. Both directions:
+  # the fence is still derived, and a config that would derive an EMPTY fence still refuses to
+  # build. While these guards sat under `mkIf cfg.enable`, the second half was silently untrue.
+  confinementDerivedWhenDisabled =
+    peerConfinementDisabled.nixnet.overlay.confineExternalRanges == [ "198.51.100.0/28" ]
+    && (lib.length (failed peerConfinementDisabled)) == 0;
+  confinementJumpRenderedWhenDisabled =
+    lib.hasInfix "ext-confine-v4" peerConfinementDisabled.nixnet.overlay.ruleset;
+  confinementNoBandFiresWhenDisabled =
+    firesAmong peerConfinementDisabledNoBand "a fence that evaluates clean and does not exist";
+  confinementUndeclaredBandFiresWhenDisabled =
+    firesWith peerConfinementDisabledUndeclaredBand "is not among the declared";
+
   # ── Ported guards ────────────────────────────────────────────────────────────────────────────
   # Management first, and not overridable by the host's own rules — ordering is the whole point.
   mgmtPresent = lib.hasInfix ''iifname "wt0" tcp dport 22 accept'' dhcpRules;
@@ -417,8 +463,25 @@ rec {
   mixedSet = lib.hasInfix "tcp dport { 80, 8000-8010 } accept" rangedRules;
 
   noUnconditionalAccept = !(lib.hasInfix ''iifname "enp1s0" tcp dport 22 accept  #'' rateLimitedRules);
-  hasRateLimitAccept = lib.hasInfix ''ct state new limit rate 6/minute accept'' rateLimitedRules;
-  hasRateLimitDrop = lib.hasInfix ''ct state new drop  # nixnet: management, rate-limit exceeded'' rateLimitedRules;
+
+  # PER SOURCE, not one shared bucket — the difference between rate-limiting an attacker and
+  # handing an attacker the ability to rate-limit you. A bare `limit rate` is one bucket for the
+  # whole rule: anyone who can reach the port can empty it, and the drop rule that follows then
+  # applies to the operator. So the accept must key the limit on the source address, and both
+  # families must be covered, since an `inet` table cannot express one address type for both.
+  hasRateLimitAcceptV4 =
+    lib.hasInfix ''meta nfproto ipv4 tcp dport 22 ct state new add @nixnet-management-ratelimit-v4 { ip saddr limit rate 6/minute } accept'' rateLimitedRules;
+  hasRateLimitAcceptV6 =
+    lib.hasInfix ''meta nfproto ipv6 tcp dport 22 ct state new add @nixnet-management-ratelimit-v6 { ip6 saddr limit rate 6/minute } accept'' rateLimitedRules;
+  hasRateLimitSets =
+    lib.hasInfix "set nixnet-management-ratelimit-v4 {" rateLimitedRules
+    && lib.hasInfix "set nixnet-management-ratelimit-v6 {" rateLimitedRules
+    && lib.hasInfix "flags dynamic,timeout" rateLimitedRules;
+  # The shared-bucket form must be GONE, not merely joined by a better one.
+  noSharedBucket = !(lib.hasInfix ''ct state new limit rate 6/minute accept'' rateLimitedRules);
+  # No sets rendered on a host that did not ask for a rate limit.
+  noRateLimitSetsByDefault = !(lib.hasInfix "nixnet-management-ratelimit" dhcpRules);
+  hasRateLimitDrop = lib.hasInfix ''ct state new drop  # nixnet: management, this source is over its rate'' rateLimitedRules;
 
   # The dead-man switch is armed by the snapshot path, never by a target that fires on every boot —
   # which is what made the revert fire on every headless boot and delete the firewall outright.
@@ -483,13 +546,16 @@ rec {
     && cidrExactUnaligned && cidrWholeTwentyFour && cidrSingleAddress
     && forwardAcceptsOverlayIn && forwardAcceptsOverlayOut && noForwardByDefault
     && peerAgrees && disagreementFires && tableCollisionFires && tableCollisionFiresWhenDisabled
+    && confinementDerivedWhenDisabled && confinementJumpRenderedWhenDisabled
+    && confinementNoBandFiresWhenDisabled && confinementUndeclaredBandFiresWhenDisabled
     && mgmtPresent && mgmtBeforeHostRules
     && neverFlushesInText && scopedDelete && doesNotDelegateToNftablesModule
     && applyUnitExists && applyUnitHasNoExecStop && applyKeyedToRuleset
     && disabledHostStillTearsDown && nixpkgsFirewallConflictFires
     && policyDrop && conntrackFirst && loopbackByName && v4Matcher && silentDrop
     && bareRange && mixedSet
-    && noUnconditionalAccept && hasRateLimitAccept && hasRateLimitDrop
+    && noUnconditionalAccept && hasRateLimitAcceptV4 && hasRateLimitAcceptV6
+    && hasRateLimitSets && noSharedBucket && noRateLimitSetsByDefault && hasRateLimitDrop
     && revertTimerNotWantedByTarget && applyBeforeNetworkPre
     && lockoutFires && typoFires && unstatedAddressingFires && noPortsFires
     && goodConfigPasses && staticConfigPasses

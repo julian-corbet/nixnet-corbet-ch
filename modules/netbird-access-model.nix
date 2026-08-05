@@ -237,10 +237,18 @@ let
     [ -r "$TOKENFILE" ] || skip "token $TOKENFILE not readable yet (unseal not done)"
     TOKEN=$(tr -d '[:space:]' < "$TOKENFILE")
     [ -n "$TOKEN" ] || skip "empty token in $TOKENFILE"
-    hdr="Authorization: Token $TOKEN"
 
-    GROUPS_F=$(mktemp); POLICIES_F=$(mktemp); ROUTES_F=$(mktemp)
-    trap 'rm -f "$GROUPS_F" "$POLICIES_F" "$ROUTES_F"' EXIT
+    GROUPS_F=$(mktemp); POLICIES_F=$(mktemp); ROUTES_F=$(mktemp); HDR_F=$(mktemp)
+    trap 'rm -f "$GROUPS_F" "$POLICIES_F" "$ROUTES_F" "$HDR_F"' EXIT
+    # The token goes into a 0600 file (mktemp's mode, umask-independent),
+    # never onto curl's argv: /proc/<pid>/cmdline is world-readable on a
+    # default Linux box, and this unit runs on its own timer forever, so
+    # `-H "Authorization: Token $TOKEN"` would publish a full-scope NetBird
+    # token to every local uid on the host -- undoing the root-only 0600
+    # file mesh-gateway.nix unseals it into. `-H @file` is curl 7.55+.
+    # Written AFTER the trap above so no failure path leaks the file.
+    printf 'Authorization: Token %s\n' "$TOKEN" > "$HDR_F"
+    unset TOKEN
 
     # Fetch to FILES (curl -o), never captured through nested command
     # substitution -- see netbird-group-reconcile.nix's own comment for
@@ -249,7 +257,7 @@ let
     api_get() { # $1 = endpoint, $2 = output file
       local ep="$1" f="$2" tries=0
       while [ "$tries" -lt 4 ]; do
-        if curl -fsS --max-time 20 -H "$hdr" "$API/$ep" -o "$f" 2>/dev/null \
+        if curl -fsS --max-time 20 -H @"$HDR_F" "$API/$ep" -o "$f" 2>/dev/null \
            && jq -e 'type=="array"' "$f" >/dev/null 2>&1; then
           return 0
         fi

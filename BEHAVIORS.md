@@ -154,16 +154,26 @@ Not: it does not repair a ruleset the dead-man switch deliberately replaced. Tha
 correct action is to leave the host as it is and go red — repairing would reload the rules that just locked an
 operator out, once per interval, forever. `nixnet-firewall-confirm` is the way back.
 
-### FW-5 — the dead-man switch arms on a change, not on a boot
-**GIVEN** a reboot with a ruleset byte-identical to the last one applied, **THEN** the auto-revert timer does
-not arm, and the host is still firewalled after the confirmation window would have expired.
+### FW-5 — the dead-man switch never reverts INTO an unfirewalled host
+**GIVEN** an apply with no previous ruleset to restore — a host's first, or its first after a reimage —
+**THEN** the auto-revert timer does not arm, and the host is still firewalled after the confirmation window
+would have expired. **GIVEN** a reboot with a ruleset byte-identical to the last one applied, likewise.
 
-Why: found in production. Arming every boot meant the timer fired on every headless boot, nobody typed the
-confirmation, and the revert — with no prior table to restore — deleted the firewall outright. Every unattended
-host on the default spent every boot unfirewalled from the window's expiry until the next reboot.
+Why: both halves are the same production failure, found twice because the first fix was too narrow. Arming
+every boot meant the timer fired on every headless boot, nobody typed the confirmation, and the revert — with
+no prior table to restore — deleted the firewall outright. Narrowing to "arm only on a CHANGE" left the hole
+open, because a host's FIRST ruleset is by definition a change: on 2026-08-04 that put a public host, the
+overlay control plane, on the open internet with no packet filter, unit green. A revert whose restore file
+says only `add table; delete table` is not a recovery from a bad ruleset — it is a worse outcome than the
+ruleset, and a firewall that is merely WRONG beats one that is ABSENT.
 
-Not: this is not remote-lockout protection for an unattended deploy. That is the deploy layer's rollback, and
-conflating the two produced the bug above.
+Not: this is not remote-lockout protection for an unattended deploy. That is the deploy layer's rollback,
+which reverts the whole generation rather than one table; conflating the two produced both bugs above. A host
+deployed with no human in the loop should turn this off and rely on that.
+
+Also: a revert that FAILS keeps its snapshot and leaves the reconcile loop enabled. Discarding the only copy
+of the previous ruleset and standing the repair loop down, on the strength of a command whose exit status
+nobody read, retires both safety nets at once.
 
 ### FW-6 — a host that enforces a ruleset can read it
 **GIVEN** a host where `nixnet.firewall` or `nixnet.overlay` is enabled, on a backend that has nftables, **THEN**

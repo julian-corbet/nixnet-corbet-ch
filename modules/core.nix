@@ -519,17 +519,45 @@ let
   nixnetPackage = pkgs.callPackage ../package.nix { };
 
   # ---------------------------------------------------------------------
-  # Boot-time hosts seeding: synchronous, so
-  # cfg.daemon.hostsFile is NEVER dangling even before nixnetd's first
-  # tick. Runs as an activation script on NixOS; system-manager has no
-  # `networking.hosts` to merge in at all, so this is simply empty there
-  # (see the systemd-oneshot seeding path AND the preActivationAssertions
-  # hook below for that backend instead).
+  # Initial hosts seeding: synchronous, so cfg.daemon.hostsFile is NEVER
+  # dangling even before nixnetd's first tick. Later activations refresh only
+  # the declarative static prefix and preserve the daemon-owned marker block
+  # byte-for-byte. Runs as an activation script on NixOS; system-manager has no
+  # `networking.*` host options to merge in at all, so the prefix is just
+  # the two localhost lines there (see the systemd-oneshot seeding path AND
+  # the preActivationAssertions hook below for that backend instead).
   # ---------------------------------------------------------------------
-  extraHostsLines = concatStringsSep "\n" (
-    mapAttrsToList (address: names: "${address}\t${concatStringsSep " " (if isList names then names else [ names ])}")
-      (if isSystemManager then { } else config.networking.hosts)
-  );
+  # The WHOLE static prefix nixpkgs would have written, not a re-derivation
+  # of one slice of it. `environment.etc.hosts` is mkForce'd at the bottom of
+  # this file to point at cfg.daemon.hostsFile, so whatever this seed does
+  # not reproduce is simply GONE from /etc/hosts the moment nixnet.enable is
+  # set -- silently, with no warning and no assertion. Rendering
+  # `networking.hosts` alone dropped every other contributor to
+  # `networking.hostFiles` (which nixpkgs defines as
+  # `mkBefore [ localhostHosts stringHosts extraHosts ]`): the user's own
+  # `networking.extraHosts`, and modules that append their own file --
+  # stevenblack, nixos-containers, kubernetes/pki, and
+  # google-compute-config, whose 169.254.169.254 metadata.google.internal
+  # mapping `networking.timeServers` then depends on. Handing the whole list
+  # to the same `pkgs.concatText` builder nixpkgs itself uses makes the
+  # seeded prefix byte-identical to the /etc/hosts this host would have had
+  # without nixnet -- which is exactly the contract src/publish/hosts.rs
+  # already documents. Concatenating the built files also picks up
+  # `networking.enableIPv6 = false` for free (nixpkgs guards its own `::1
+  # localhost` line with it; a hardcoded one cannot).
+  #
+  # No recursion: `networking.hostFiles` is computed from
+  # `networking.{hosts,extraHosts,enableIPv6}` and never reads
+  # `environment.etc`. system-manager has none of those options, hence the
+  # literal fallback there.
+  staticPrefixFile =
+    if isSystemManager
+    then
+      pkgs.writeText "nixnet-static-hosts" ''
+        127.0.0.1 localhost
+        ::1 localhost
+      ''
+    else pkgs.concatText "nixnet-static-hosts" config.networking.hostFiles;
 
   seedHostsScript = pkgs.writeShellScript "nixnet-seed-hosts" ''
     set -euo pipefail
@@ -567,17 +595,41 @@ let
     chown nixnetd:nixnetd "$hosts_dir" 2>/dev/null || true
     chmod 0755 "$hosts_dir"
 
+    # `nixnetd` owns the marker block. Activation may need to refresh the
+    # declarative static prefix when networking.hosts/hostFiles changed, but
+    # it must not reconstruct that block from state.json: the daemon has the
+    # authoritative aliases, winner addresses, and confirmation timestamps.
+    # Preserve every byte from BEGIN onward (including a foreign suffix) and
+    # avoid a replace altogether when the resulting file is unchanged.
+    if [ -r "${cfg.daemon.hostsFile}" ] && ${pkgs.gawk}/bin/awk '
+      $0 == "# BEGIN nixnet" { begin = 1 }
+      begin && $0 == "# END nixnet" { end = 1; exit }
+      END { exit !(begin && end) }
+    ' "${cfg.daemon.hostsFile}"; then
+      tmp=$(mktemp "${cfg.daemon.hostsFile}.seed.XXXXXX")
+      trap 'rm -f "$tmp"' EXIT
+
+      {
+        cat ${staticPrefixFile}
+        ${pkgs.gawk}/bin/awk '
+          $0 == "# BEGIN nixnet" { copy = 1 }
+          copy { print }
+        ' "${cfg.daemon.hostsFile}"
+      } > "$tmp"
+
+      if ! ${pkgs.diffutils}/bin/cmp -s "$tmp" "${cfg.daemon.hostsFile}"; then
+        mv -f "$tmp" "${cfg.daemon.hostsFile}"
+      fi
+      chmod 0644 "${cfg.daemon.hostsFile}"
+      chown nixnetd:nixnetd "${cfg.daemon.hostsFile}" 2>/dev/null || true
+      exit 0
+    fi
+
     tmp=$(mktemp "${cfg.daemon.hostsFile}.seed.XXXXXX")
     trap 'rm -f "$tmp"' EXIT
 
     {
-      echo "127.0.0.1 localhost"
-      echo "::1 localhost"
-      ${optionalString (extraHostsLines != "") ''
-        cat <<'NIXNET_EXTRA_HOSTS_EOF'
-        ${extraHostsLines}
-        NIXNET_EXTRA_HOSTS_EOF
-      ''}
+      cat ${staticPrefixFile}
       echo "# BEGIN nixnet"
       # Best-effort: seed from the last-known-good winners in
       # state.json, if a previous boot left one. Never fatal if missing,

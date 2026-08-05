@@ -91,4 +91,70 @@ fn load_nix_rendered_example() {
         cfg.needs_net_raw(),
         "needs_net_raw() = false, want true (wireless0 uses icmp+bindToInterface)"
     );
+
+    // STALE-2: the bound the README quickstart declares has to arrive
+    // intact. A bound that renders but does not reach the daemon is
+    // indistinguishable from no bound at all -- which is the defect.
+    assert_eq!(
+        peer.last_known_good.max_age_sec,
+        Some(900),
+        "the rendered lastKnownGood.maxAgeSec did not survive the wire"
+    );
+}
+
+/// The other shape the same field takes: Nix renders an UNSET bound as an
+/// explicit JSON `null`, which the daemon must read as "unbounded" rather
+/// than as a parse error. This is what every peer that has not opted in
+/// emits, so getting it wrong would fail closed on the majority case.
+#[test]
+fn an_unset_last_known_good_bound_reads_as_unbounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+          "peers": {
+            "host-b": {
+              "hostnames": ["host-b"],
+              "lastKnownGood": { "maxAgeSec": null },
+              "transports": [ { "address": "192.0.2.20", "priority": 10 } ]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let cfg = config::load(&path).expect("an explicit null must load, not error");
+    assert_eq!(cfg.peers["host-b"].last_known_good.max_age_sec, None);
+}
+
+/// A zero or negative bound is not "expire immediately" -- `onAllDown =
+/// "unpublish"` is. Nix's `ints.positive` rejects it at eval time; a
+/// hand-written config.json (a supported adoption path) reaches the daemon
+/// unchecked, so the daemon checks it too rather than silently reading a
+/// typo as a policy change.
+#[test]
+fn a_non_positive_last_known_good_bound_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+          "peers": {
+            "host-b": {
+              "hostnames": ["host-b"],
+              "lastKnownGood": { "maxAgeSec": 0 },
+              "transports": [ { "address": "192.0.2.20", "priority": 10 } ]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let err = config::load(&path).expect_err("maxAgeSec = 0 must not load");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("maxAgeSec"),
+        "error does not name the offending option: {msg}"
+    );
 }

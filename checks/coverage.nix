@@ -29,9 +29,9 @@ let
   #
   # Read the circularity honestly: TEST-1 says "every behaviour id has a VM
   # test", and the check that claims to prove it is this one -- which passes
-  # with 21 of 28 ids waived. So TEST-1 proves the LINK exists and is
+  # with 19 of 28 ids waived. So TEST-1 proves the LINK exists and is
   # maintained, not that the obligation is met. The `waived` list below is the
-  # actual answer to TEST-1, and it is 21 entries long.
+  # actual answer to TEST-1, and it is 19 entries long.
   selfCovered = [ "TEST-1" ];
 
   # A behaviour whose check exercises only PART of the entry. Not a waiver --
@@ -50,7 +50,6 @@ let
     "ADDR-2" = "eval-time failure, same instrument problem as ADDR-1; the `probe.target` requirement on a dynamically-addressed transport is not implemented either";
     "ADDR-3" = "needs the addressing drift reconciler, which does not exist; the VM shape is clear (declare a static address the kernel does not hold, assert the subject degrades)";
     "FW-1" = "eval-time failure, so a VM test is the wrong instrument -- a refusal's whole point is that no machine ever boots. Covered by `lockoutFires` in experiments/render-check.nix, which checks/default.nix now runs, so this is waived from a VM test rather than from evidence";
-    "FW-5" = "the dead-man switch arms on change and not on boot; a VM test needs two boots of the same generation plus a boot of a changed one, which the driver supports but no test does yet";
     "FW-6" = "waived from a VM test rather than from evidence, same as FW-1. What lands in `environment.systemPackages` is decided at eval time, so eval checks are the sharper instrument here, and both directions plus all three backends are covered by `firewallInstallsNft`, `overlayInstallsNft`, `noToolingInstallsNothing`, `overlayNoToolingInstallsNothing`, `disabledFirewallInstallsNothing`, `toolingSilentWhenSatisfied`, `nixosResolvesToPackage`, `systemManagerResolvesToPackage`, `darwinResolvesToNothingAndSaysSo`, `darwinDeclaredNullNotMissing` and `unavailableWarningNamesOption` in experiments/render-check.nix, which checks/default.nix runs. STATE THE GAP HONESTLY: those prove the PACKAGE is selected and installed, not that the BINARY resolves as bare `nft` for a root shell. On NixOS the system profile makes that equivalent; on system-manager it does not -- delivery is /run/system-manager/sw/bin prepended by /etc/profile.d and /etc/environment.d, so a shell that sources neither (fish is an open TODO in system-manager's own source) has the package installed and `nft` still not on PATH. That is a VM test nobody has written, and it is the half that would actually fail. The nix-darwin arm is proved at the resolver, not on a darwin machine, because nixnet publishes no darwinModules to evaluate";
     "TF-1" = "winner determinism and the hysteresis hold window are exercised by unit tests only; a VM test would flap a probe target and assert the published value's timing";
     "TF-2" = "publish-on-reconcile is IMPLEMENTED and unit-tested on both backends -- a settled single-uplink host with no winner change publishes its metric (`a_settled_single_uplink_host_still_publishes_its_metric`), an emptied hosts block is restored on the next tick (`a_hosts_block_emptied_behind_the_daemon_is_restored_on_the_next_tick`), and the 'Not:' half is pinned from both sides: an agreeing routing table produces zero route commands and an unchanged peer set does not even change the hosts file's inode. It stays WAIVED because none of that boots a machine: the VM shape is to change the live route out from under a settled daemon, with a real DHCP client on the other side, and assert it is re-asserted within one reconcile interval. Unit tests prove the daemon issues the right commands; only a VM proves the kernel ends up in the state the commands intended";
