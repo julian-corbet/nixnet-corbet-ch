@@ -211,6 +211,115 @@ the service publicly or introducing stateful address translation.
 
 Not: the hub never allocates public addresses, NATs the tunnel, or grants forwarding to another interface.
 
+## Wireless association — radios, keys, and what stays powered
+### RADIO-1 — a declared network associates with nobody there to type the key
+**GIVEN** a host declaring a Wi-Fi network whose key is a runtime file, booted headless with no
+interactive secret agent anywhere on it, **THEN** the radio associates, the device reports
+`connected`, and NetworkManager asks for nothing.
+
+Why: the observable failure was one line — `no secrets: No agents were available for this request`.
+The profile was hand-made and its key agent-owned, and the agent it wants is a logged-in session, so
+on a headless boot that profile is not a slow path, it is a dead one. A declared profile stores the
+key itself (`psk-flags=0`) precisely so that association needs no human and no session.
+
+Also: a profile nixnet wrote for a network it no longer declares is REMOVED. The host this
+generalises carries two profiles for one SSID, one of them stale and keyless, and NetworkManager is
+free to pick either — a declaration that only ever ADDS reproduces that on every rename.
+
+Also: a WPA3 network is rendered with management-frame protection REQUIRED, not negotiated. PMF is
+mandatory in WPA3, so an SAE profile that leaves it at NetworkManager's global default is one an AP
+may simply refuse — and the refusal reads as "wrong key" or "out of range", which is the same
+indistinguishable-symptom class this entry is about. WPA2 does not get it: forcing PMF on an AP that
+does not offer it breaks an association that works.
+
+Not: nixnet runs no secret agent and provisions no secret. It reads a path at activation; where the
+file comes from is the host's business, and if it is not there the unit fails loudly rather than
+writing a profile a human would have to complete.
+
+### RADIO-2 — an associated Wi-Fi network outranks the modem
+**GIVEN** a host whose Wi-Fi radio and WWAN radio both carry a default route, **THEN** the Wi-Fi
+route's metric is strictly lower, no two radios share a metric, and the kernel sends a new
+connection over Wi-Fi — all of it derived from the radios' declared `priority`, the same lower-wins
+order `TF-1` already uses.
+
+Why: without a declared ranking the host still prefers one uplink — measured in a VM, NetworkManager
+hands two wired uplinks 100 and 101, breaking the tie by DEVICE ENUMERATION ORDER. That is a fact
+about how the kernel found the hardware, not about anything an operator said, and it moves when a
+modem appears late or an adapter is replaced. The link it silently moves to is the metered one. Two
+radios sharing a priority would put nixnet's own routes back into the tie `TF-3` names, so that is an
+evaluation error rather than a runtime coin-flip.
+
+Not: this is not a second failover engine. The module writes the metric each radio's connections
+rank at and stops; `TF-1` and `TF-3` remain the only ranking model in this repo, and a WWAN radio's
+own connection stays ModemManager's to bring up.
+
+Also: NetworkManager ranks `autoconnect-priority` the other way up — higher wins — so the renderer
+negates, into the positive half specifically, because a hand-made profile left on the host sits at 0
+and must not keep winning. One order in the declaration, two spellings underneath; a second ranking
+in the option surface is a fact that can disagree with itself.
+
+### RADIO-3 — the power policy decides which radios stay powered, and never leaves none
+**GIVEN** `powerPolicy.onBattery = "preferredOnly"` and a host on battery whose Wi-Fi is associated,
+**THEN** the modem's radio is powered down and the Wi-Fi radio stays up; **GIVEN** the same host on
+mains with `onAc = "all"`, **THEN** every declared radio is powered.
+
+Why: a modem associated beside an associated Wi-Fi radio spends battery on a link nothing is routing
+over. On mains that power buys a faster failover and costs nothing worth saving, so the two states
+get different answers rather than one compromise.
+
+Not: when NO declared radio is associated, every radio is powered ON regardless of policy. A power
+policy that can leave a host with no radio at all has stopped saving power and started removing the
+machine — the same judgement `FW-5` makes about a firewall that is merely wrong versus absent.
+
+Also: the switch is NetworkManager's per-KIND radio state, because that is the control the mechanism
+has — `nmcli radio wifi off` is rfkill for every Wi-Fi phy on the box. Two radios of one kind
+therefore cannot express `preferredOnly`, and that is an evaluation error rather than a policy that
+quietly powers down the winner too.
+
+### RADIO-4 — a radio names an interface this host declared
+**GIVEN** a radio whose `interface` is absent from `nixnet.interfaces` or whose addressing nobody
+stated, or a network naming a radio that does not exist or is not a Wi-Fi radio, or two radios
+sharing a priority, **THEN** evaluation fails on the build host, naming what is missing.
+
+Why: `ADDR-1`, on the one option surface that had no reason to be exempt. A misspelled radio
+interface does not fail loudly — NetworkManager matches no device, the profile sits there looking
+correct, and the host silently keeps doing whatever the legacy profile did. That is the same
+fails-open typo class the firewall closed, and it is worse here, because "did not associate" reads
+as "out of range".
+
+Not: nixnet does not discover radios. A host declares the radios it has; an adapter nobody declared
+is not nixnet's, and `nixnet.interfaces` stays the one place an interface becomes a fact.
+
+### RADIO-5 — the key reaches the host without passing through the Nix store
+**GIVEN** a network with a `secretFile`, **THEN** the profile in the store carries no key material,
+the assembled keyfile is mode 0600 owned by root, unreadable by any other user, and lives on a
+tmpfs; **GIVEN** a `secretFile` under `/nix/store`, **THEN** evaluation fails.
+
+Why: the store is world-readable on the host and world-copyable off it. An option taking the key as
+a string publishes it to every user on the machine and to every machine the closure reaches, with
+nothing about the running system looking any different — a leak with no symptom. So the option takes
+a PATH, the file is assembled at activation, and the copy that is readable is the copy without the
+key.
+
+Not: nixnet does not manage the secret's lifecycle — no rotation, no re-read on change. The profile
+is assembled when the unit runs; a key that changed underneath it takes a restart of that unit,
+which is the operator's action and says so.
+
+### RADIO-6 — a backend that cannot associate says so
+**GIVEN** `nixnet.wireless.enable` on a backend with no NetworkManager — nix-darwin, where
+association is CoreWLAN's — **THEN** evaluation SAYS the selection is unsatisfiable; **GIVEN** a
+Linux backend where nothing enables the NetworkManager mechanism (or, for a declared WWAN radio,
+ModemManager), likewise.
+
+Why: `FW-6` one layer up, and the same shape of blindness. Rendering no profile on a backend that
+cannot use one is indistinguishable from having worked: the host builds clean, activates clean, and
+is simply never on a network — with the declaration sitting in the config looking like the reason it
+should be.
+
+Not: nixnet does not install the mechanism. `nixnet.backend` names the distro's packages for the
+host's own reconciler and NixOS has its own option; this entry is about the selection being
+IMPOSSIBLE, not about nixnet making it possible.
+
 ## Transport failover — winners, publication, demotion
 ### TF-1 — the winner is deterministic and damped
 **GIVEN** a subject with N priority-ordered transports in mixed health, **THEN** the winner is the lowest

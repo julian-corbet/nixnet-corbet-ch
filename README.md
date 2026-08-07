@@ -265,6 +265,13 @@ of these contribute a peer/uplink transport and none require
   private dual-stack transit. It transports private IPv4 and IPv6 addresses
   over WireGuard; only a declared hub listener opens a public UDP port, and
   forwarding is limited to the tunnel's own authenticated interface pair.
+- **`nixnet.wireless`** (`modules/wireless.nix`) — the radios a host has,
+  the networks it may join, and which of them stays powered on battery.
+  Renders one NetworkManager keyfile per declared network, with the key
+  appended at activation from a runtime path rather than rendered into the
+  world-readable store, and one per-radio route metric that ranks Wi-Fi
+  above the modem through the same lower-wins priority the failover engine
+  uses. See [Radios](#radios--declared-networks-a-ranked-link-and-a-key-that-stays-out-of-the-store).
 - **`lib.svcProxyConfig`** (`lib/svc-proxy-config.nix`) — not a module, a
   pure function: turns a service registry into a split-horizon in-cluster
   nginx config + CoreDNS zone, so an in-cluster caller of `<svc>.<zone>`
@@ -272,10 +279,15 @@ of these contribute a peer/uplink transport and none require
   Called from a consumer's own flake `outputs` or host config, same as
   `nixpkgs.lib` itself.
 
-These six modules are NixOS-only for now — each uses at least one
-primitive (`boot.kernel.sysctl`, `networking.firewall.extraCommands`, or
-upstream `services.cloudflared`) outside `system-manager`'s smaller option
-surface (see the `system-manager` section below for that boundary).
+The overlay, mesh-gateway, group-reconcile, access-model, ingress and
+bpftune modules are NixOS-only for now — each uses at least one primitive
+(`boot.kernel.sysctl`, `networking.firewall.extraCommands`, or upstream
+`services.cloudflared`) outside `system-manager`'s smaller option surface
+(see the `system-manager` section below for that boundary).
+`nixnet.wireguard` and `nixnet.wireless` are not: both are exported for
+`system-manager` too, and for `wireless` that is the primary plane — the
+host it was written for is a foreign distro whose own NetworkManager
+package `nixnet.backend` names.
 `netbirdAccessModel` itself only touches `systemd.services`/`.timers`
 (so it *could* run on `system-manager`), but it's listed here because it
 has no purpose without the overlay/reconcile mechanism the rest of this
@@ -492,6 +504,105 @@ count:
 nix-instantiate --eval --strict experiments/render-check.nix -A ok
 ```
 
+## Radios — declared networks, a ranked link, and a key that stays out of the store
+
+`nixnet.wireless` (`modules/wireless.nix`) declares the radios a host has
+(`wifi`/`wwan`), the Wi-Fi networks it may join, and which of them stays
+powered on battery. It renders one NetworkManager keyfile per network and
+one connection-default per radio; it does not fail over — `TF-1`/`TF-3`
+and the engine already do that, and this module feeds them.
+
+**Why it exists.** The Wi-Fi profiles it replaces were hand-made files in
+`/etc/NetworkManager/system-connections`, owned by nobody, including a
+duplicate stale profile for the same SSID whose key NetworkManager would
+only ever ask a human for. On a headless boot that is one line in the
+journal — `no secrets: No agents were available for this request` — and
+the host is simply not on a network. A declared profile stores the key
+itself (`psk-flags=0`), so association needs no session; a profile nixnet
+wrote and no longer declares is removed, so a rename cannot leave the
+duplicate behind.
+
+**The key never reaches the store.** `secretFile` is a runtime PATH, not
+the key and not a `types.path`: the store is world-readable on the host
+and world-copyable off it, so a key that lands there is published with no
+symptom at all. The template in the store carries the key-management
+flags and nothing else; `nixnet-wireless-profiles.service` appends the
+key's first line at activation into a 0600 root-owned file on a tmpfs, so
+the key exists on the host only while it is running. A `secretFile` under
+`/nix/store` is an evaluation error.
+
+**Quote a numeric key in YAML.** An all-digit pre-shared key is a string
+that looks like a number, and a sops/agenix YAML pipeline will treat it as
+one unless it is quoted: a leading zero disappears, and 19 digits or more
+overflows a 64-bit integer and comes back as a float —
+`12345678901234567890` re-emitted as `1.2345678901234567e+19`. Neither
+mangling shows up anywhere except as an association that fails claiming
+the key is wrong. Write `key: "0123456789…"`.
+
+**WPA3 gets PMF.** `security = "sae"` renders `pmf=3` (NetworkManager's
+*required*), because WPA3 mandates management-frame protection and a
+profile that leaves it to NetworkManager's global default is one an AP can
+simply refuse. `wpa-psk` deliberately does not: WPA2 does not mandate PMF,
+and forcing it on an AP that lacks it converts a working association into
+a silent refusal.
+
+**One ranking, two spellings.** A radio's `priority` is lower-wins, the
+same order as everything else in this repo. It becomes a route metric
+(`metricBase + priority`) applied to every connection on that device —
+including the modem's, which ModemManager creates and nixnet never writes
+— which is what makes "Wi-Fi outranks the modem" a fact about
+`ip route` rather than about a profile. Two radios sharing a priority is
+an eval error: equal metrics are two default routes the kernel picks
+between on its own, which is exactly `TF-3`. NetworkManager's own
+`autoconnect-priority` ranks the other way up, so the renderer negates
+into the positive half — a hand-made profile left on the host sits at 0
+and must not keep winning.
+
+**Power.** `powerPolicy.onBattery`/`.onAc` are `all` or `preferredOnly`.
+Under `preferredOnly` only the currently-winning radio's kind stays
+powered; with nothing associated at all, everything is powered on
+regardless, because a policy that can leave a host with no radio has
+stopped saving power. The switch is NetworkManager's per-KIND radio state
+(rfkill), so `preferredOnly` on a host with two radios of one kind is an
+eval error rather than a policy that powers down the winner too. It is
+applied by a boot unit, by a NetworkManager dispatcher script (the winner
+changes when a connection does) and by a udev rule on `power_supply` (the
+policy changes when the cable does) — all three call one script,
+`nixnet-radio-power`, which takes an optional `ac`/`battery` override.
+
+**The addressing method is derived, not assumed.** The profile's
+`ipv4`/`ipv6` method comes from `nixnet.interfaces.<if>.addressing`, so a
+radio declared `none` renders a profile that configures no IP and one
+declared `dhcp` renders `auto`. `static`/`unmanaged` have no honest
+rendering here and are an eval error rather than a profile that quietly
+DHCPs an interface someone declared static.
+
+```nix
+nixnet.interfaces.wlp0s20f3.addressing = { v4 = "dhcp"; v6 = "slaac"; };
+nixnet.interfaces.wwan0.addressing     = { v4 = "dhcp"; v6 = "none"; };
+
+nixnet.wireless = {
+  enable = true;
+  radios = {
+    wifi0 = { interface = "wlp0s20f3"; kind = "wifi"; priority = 10; };  # metric 110
+    modem = { interface = "wwan0";     kind = "wwan"; priority = 50; };  # metric 150
+  };
+  networks.home = {
+    radio      = "wifi0";
+    ssid       = "example-net";
+    security   = "sae";                       # or "wpa-psk" / "open"
+    secretFile = "/run/secrets/wlan-home";    # a PATH, read at activation
+  };
+  powerPolicy = { onBattery = "preferredOnly"; onAc = "all"; };
+};
+```
+
+`nixnet.wireless.profiles` is read-only and rendered even when `enable`
+is false — `nix eval` it to see exactly what a host will present to
+NetworkManager, key excluded. The same text lands on the host at
+`/etc/nixnet/wireless/`, as a symlink into the store, which is the copy
+you can read and the copy with no key in it.
+
 ## Options reference
 
 `nixnet.*` (`modules/core.nix`):
@@ -624,6 +735,35 @@ each of these exists to prevent:
   dead-man switch, armed on a ruleset change and disarmed by running
   `nixnet-firewall-confirm`.
 - `ruleset` — read-only, the exact text both planes apply.
+
+`nixnet.wireless.*` (`modules/wireless.nix`) — see
+[Radios](#radios--declared-networks-a-ranked-link-and-a-key-that-stays-out-of-the-store):
+
+- `enable` — render the declared profiles and the ranking. Off means the
+  profiles nixnet wrote are **removed**, not unmentioned: the assembly
+  unit exists either way, exactly like the firewall's.
+- `backend` (default `"networkmanager"`, the only value today) — which
+  association mechanism renders this. A backend that cannot associate
+  (nix-darwin) is an eval error naming the selection, never a silent
+  no-op.
+- `radios.<id>.interface` / `.kind` (`wifi`/`wwan`) / `.priority`
+  (0–999, **lower wins**, must be unique across radios).
+- `networks.<id>.radio` (a key of `radios`, of kind `wifi`), `.ssid`,
+  `.security` (`sae` default, which also renders `pmf=3` / `wpa-psk`,
+  which does not / `open`), `.secretFile` (a runtime PATH whose FIRST
+  LINE is the key — quote it in YAML if it is all digits; required unless
+  `open`, refused under `/nix/store`), `.autoconnect` (default `true`),
+  `.priority` (0–999, lower wins among the networks of one radio).
+- `powerPolicy.onBattery` (default `"preferredOnly"`) /
+  `.onAc` (default `"all"`) — `all` or `preferredOnly`.
+- `metricBase` (default `100`) — a radio ranks at `metricBase + priority`
+  (◐ same open question as the uplink metric band, `BEHAVIORS.md` #1).
+- `nmcli` (default: the nixpkgs binary on NixOS, `nmcli` from `PATH`
+  elsewhere — on a foreign distro the distro owns NetworkManager and its
+  own client is the one that matches its daemon).
+- `profileDirectory` (default `/run/NetworkManager/system-connections`) —
+  a tmpfs, which is half of why the key never persists.
+- `profiles` — read-only, the rendered templates (no key). `nix eval` it.
 
 `nixnet.netbird.*` (`modules/netbird-provider.nix`) — see
 [Quickstart](#quickstart) for a worked example and the module's own
@@ -787,6 +927,13 @@ and `bluez.hid2hci` are independent opt-ins for OBEX transfers and Bluetooth
 HID adapter conversion. The NixOS overlay and ingress modules already own
 their respective NixOS package/service paths; they do not use this native
 package output.
+
+`nixnet.backend.networkManager` and `.modemManager` are also what
+`nixnet.wireless` checks for on this backend: declaring radios without the
+mechanism that drives them is an eval error rather than a host that writes
+correct profiles for a daemon nobody installed. On NixOS the equivalent is
+`networking.networkmanager.enable` (which turns ModemManager on by
+default), and either answer satisfies it.
 
 ## Security
 

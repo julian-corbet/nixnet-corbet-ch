@@ -8,6 +8,18 @@
 # DHCP, and assertions on machine state -- `ip addr`, `nft list table`, the
 # published file, `systemctl is-failed` -- never on log strings.
 #
+# THE ONE KIND OF EVIDENCE THAT IS NOT A BOOTED MACHINE. Some behaviours in the
+# contract are REFUSALS -- `FW-1`, `RADIO-4`, `RADIO-6`: a configuration that must
+# fail on the build host rather than render. A refusal's whole point is that no
+# machine ever boots, so a VM test is the wrong instrument, and until now the only
+# way to record that was a waiver in ../coverage.nix. A waiver says "nothing proves
+# this"; for a refusal that is simply false -- an evaluation either fails with the
+# named message or it does not, which is as decidable from outside as any packet
+# counter. So a spec may declare `refusals` instead of (or alongside) `test`, and
+# gets a check of the same name either way. Both directions are still required: a
+# refusal case names the message it expects, and every refusal set carries at least
+# one control config that must evaluate CLEAN, or "refuses everything" would pass.
+#
 # The one piece of machinery here worth explaining is the RUNNABILITY GATE.
 # These tests are written against the rebuild's target contract (BEHAVIORS.md),
 # and parts of that contract do not exist in modules/ yet. A test written
@@ -99,6 +111,76 @@ let
   };
 
   # ---------------------------------------------------------------------
+  # Refusal evidence: a configuration that must FAIL to evaluate, and the
+  # message it must fail with.
+  #
+  # The minimal-but-complete NixOS baseline, identical in shape to the one
+  # ../default.nix and experiments/render-check.nix use.
+  # `networking.firewall.enable = false` because nixnet's own firewall
+  # asserts against it, and several of these configs enable both.
+  # ---------------------------------------------------------------------
+  evalBaseline = {
+    boot.loader.grub.enable = false;
+    fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+    system.stateVersion = "25.05";
+    networking.firewall.enable = false;
+  };
+
+  evalConfig = mods:
+    (import (nixpkgs + "/nixos/lib/eval-config.nix") {
+      system = pkgs.stdenv.hostPlatform.system;
+      modules = mods ++ [ evalBaseline ];
+    }).config;
+
+  # Narrowed to nixnet's own, and `.message` is forced ONLY for assertions that
+  # already failed -- Nix's `&&` is lazy, and an unrelated nixpkgs assertion's
+  # message can throw against a baseline this bare (filesystems.nix's
+  # topological sort on the fake root above is the known one).
+  nixnetFailures = cfg:
+    map (a: a.message)
+      (lib.filter (a: !a.assertion && lib.hasInfix "nixnet" a.message) cfg.assertions);
+
+  # case = { name; modules = [ ... ]; expect = "infix" | null; }
+  # `expect = null` is a CONTROL: the same shape, correct, which must evaluate
+  # with no nixnet assertion failing at all.
+  runRefusal = case:
+    let
+      msgs = nixnetFailures (evalConfig case.modules);
+      ok =
+        if case.expect == null
+        then msgs == [ ]
+        else lib.any (m: lib.hasInfix case.expect m) msgs;
+      detail =
+        if case.expect == null
+        then "expected a clean evaluation, got: ${builtins.toJSON msgs}"
+        else "expected an assertion containing ${builtins.toJSON case.expect}, got: ${builtins.toJSON msgs}";
+    in
+    { inherit (case) name; inherit ok detail; };
+
+  mkRefusals = name: cases:
+    let
+      results = map runRefusal cases;
+      failures = builtins.filter (r: !r.ok) results;
+      hasControl = lib.any (c: c.expect == null) cases;
+    in
+    assert lib.assertMsg hasControl
+      "checks/vm: refusal set '${name}' has no control case (expect = null); a set that only ever refuses cannot tell a working module from a broken one";
+    pkgs.runCommand "nixnet-refusal-${name}"
+      {
+        failed = lib.concatMapStringsSep "\n" (r: "  - ${r.name}: ${r.detail}") failures;
+        total = toString (builtins.length results);
+      }
+      ''
+        if [ -n "$failed" ]; then
+          echo "nixnet refusal check '${name}' FAILED:" >&2
+          echo "$failed" >&2
+          exit 1
+        fi
+        echo "all $total refusal cases held"
+        touch $out
+      '';
+
+  # ---------------------------------------------------------------------
   # mkTest: spec in, derivation out.
   #
   # spec = {
@@ -107,7 +189,13 @@ let
   #   requiresModules = [ "firewall.nix" ];
   #   requiresOptions = [ [ "nixnet" "firewall" "enable" ] ... ];
   #   test            = { modules, baseline }: <runNixOSTest argument>;
+  #   refusals        = { modules, evalBaseline }: [ <case> ];
   # }
+  #
+  # A spec declaring both gets ONE derivation that depends on both, because a
+  # behaviour id names one check: `RADIO-5` is a file mode on a booted machine
+  # AND an evaluation that refuses a store path, and evidence for half of it is
+  # not evidence.
   # ---------------------------------------------------------------------
   mkTest = spec:
     let
@@ -134,12 +222,27 @@ let
       modules = builtins.listToAttrs (map
         (f: { name = lib.removeSuffix ".nix" f; value = modulePath f; })
         ([ "core.nix" ] ++ needModules));
+
+      vmDrv = pkgs.testers.runNixOSTest (spec.test { inherit modules; baseline = nodeBaseline; });
+      refusalDrv = mkRefusals spec.name (spec.refusals { inherit modules evalBaseline; });
     in
     if reasons != [ ]
     then unrunnable spec.name reasons
-    else pkgs.testers.runNixOSTest (spec.test { inherit modules; baseline = nodeBaseline; });
+    else if !(spec ? refusals) then vmDrv
+    else if !(spec ? test) then refusalDrv
+    else
+    # Both kinds of evidence, one check. Named as env attrs so each is a real
+    # build-time dependency: this derivation cannot exist unless both did.
+      pkgs.runCommand "nixnet-vm-${spec.name}"
+        { vm = vmDrv; refusals = refusalDrv; }
+        ''
+          echo "vm test:  $vm"
+          echo "refusals: $refusals"
+          touch $out
+        '';
 
 in
 {
-  inherit mkTest nodeBaseline modulePath hasOptionPath probeOptions unrunnable;
+  inherit mkTest nodeBaseline modulePath hasOptionPath probeOptions unrunnable
+    evalBaseline evalConfig nixnetFailures;
 }

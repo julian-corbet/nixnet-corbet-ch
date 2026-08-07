@@ -40,11 +40,13 @@
       # -- they provision/manage the underlying network connections
       # themselves (a NetBird overlay client, an embed multi-peer gateway, an
       # ACL group reconciler, a Cloudflare Tunnel) rather than health-checking
-      # an address someone else already brought up. NixOS-only for now (each
-      # uses at least one primitive -- boot.kernel.sysctl,
-      # networking.firewall.extraCommands, or upstream services.cloudflared --
-      # outside system-manager's smaller option surface; see core.nix's own
-      # header for that boundary).
+      # an address someone else already brought up. The FIVE immediately below
+      # are NixOS-only for now (each uses at least one primitive --
+      # boot.kernel.sysctl, networking.firewall.extraCommands, or upstream
+      # services.cloudflared -- outside system-manager's smaller option surface;
+      # see core.nix's own header for that boundary). `wireguard` and
+      # `wireless`, which follow them, are NOT: both are exported for
+      # system-manager as well, and for `wireless` that is the primary plane.
       nixosModules.overlay = ./modules/overlay.nix;
       nixosModules.mesh-gateway = ./modules/mesh-gateway.nix;
       nixosModules.netbird-group-reconcile = ./modules/netbird-group-reconcile.nix;
@@ -54,6 +56,11 @@
       # Authenticated private dual-stack transit. This transports both address
       # families over WireGuard; it never performs address translation.
       nixosModules.wireguard = ./modules/wireguard.nix;
+
+      # The radios a host has, the networks it may join, and which of them stays
+      # powered. Renders NetworkManager profiles whose key is assembled at
+      # activation from a runtime path -- never from the store.
+      nixosModules.wireless = ./modules/wireless.nix;
 
       # ---------------------------------------------------------------
       # Same files, rendered onto system-manager's smaller option surface
@@ -70,6 +77,11 @@
       systemManagerModules.cloudflared-provider = ./modules/cloudflared-provider.nix;
       systemManagerModules.backend = ./modules/backend.nix;
       systemManagerModules.wireguard = ./modules/wireguard.nix;
+      # The host this module was written for is a foreign distro applying config
+      # with system-manager, so this is not a courtesy export: it is the primary
+      # plane. `nixnet.backend.networkManager`/`.modemManager` name the distro
+      # packages; this module writes the profiles and the ranking.
+      systemManagerModules.wireless = ./modules/wireless.nix;
 
       packages = forAllSystems (system: {
         nixnet = (pkgsFor system).callPackage ./package.nix { };

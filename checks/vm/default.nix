@@ -1,7 +1,14 @@
-# checks/vm/default.nix — the VM check set.
+# checks/vm/default.nix — the behaviour check set.
+#
+# Mostly VM tests, plus the REFUSAL checks for the behaviours that are decided on
+# the build host and therefore never boot anything (see ./lib.nix's header). Both
+# kinds are registered identically, because what this directory is FOR is binding
+# a behaviour id to evidence; which instrument produced the evidence is the
+# spec's business.
 #
 # Each test file returns a SPEC (name, the BEHAVIORS.md ids it proves, what it
-# needs from modules/, and the runNixOSTest argument). Assembling them here
+# needs from modules/, and the runNixOSTest argument and/or refusal cases).
+# Assembling them here
 # rather than exporting derivations directly is what lets `../coverage.nix`
 # answer TEST-1 mechanically: the id set is data, not a comment.
 #
@@ -25,6 +32,12 @@ let
     ./hosts-single-writer.nix
     ./lastknowngood-staleness.nix
     ./wireguard-transit.nix
+    ./wireless-association.nix
+    ./wireless-backend-boundary.nix
+    ./wireless-declaration.nix
+    ./wireless-outranks-modem.nix
+    ./wireless-power-policy.nix
+    ./wireless-secret-handling.nix
   ];
 
   built = map (s: s // { drv = harness.mkTest s; }) specs;
