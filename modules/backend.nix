@@ -12,6 +12,7 @@ let
 
   selectedNames = lib.flatten [
     (lib.optional cfg.netbird.enable "netbird")
+    (lib.optional cfg.netbird.ui.enable "netbird-ui")
     (lib.optional cfg.cloudflared.enable "cloudflared")
     (lib.optional cfg.networkManager.enable "networkmanager")
     (lib.optional cfg.networkManager.enable "wpa-supplicant")
@@ -29,7 +30,10 @@ in
   options.nixnet.backend = {
     enable = lib.mkEnableOption "declaring this host's native NixNet mechanism packages";
 
-    netbird.enable = lib.mkEnableOption "the native NetBird client";
+    netbird = {
+      enable = lib.mkEnableOption "the native NetBird client";
+      ui.enable = lib.mkEnableOption "the NetBird GUI tray companion, for a host with a Wayland session";
+    };
     cloudflared.enable = lib.mkEnableOption "the native Cloudflare Tunnel client";
 
     networkManager.enable = lib.mkEnableOption "NetworkManager with wpa_supplicant Wi-Fi association";
@@ -79,6 +83,10 @@ in
       {
         assertion = cfg.enable || selectedNames == [ ];
         message = "nixnet.backend: mechanism selections require nixnet.backend.enable = true.";
+      }
+      {
+        assertion = !cfg.netbird.ui.enable || cfg.netbird.enable;
+        message = "nixnet.backend: the NetBird tray UI requires nixnet.backend.netbird.enable = true.";
       }
       {
         assertion = !cfg.bluez.obex.enable || cfg.bluez.enable;

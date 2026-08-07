@@ -9,6 +9,11 @@
       aur = true;
       reason = "The native NetBird client and its distro-owned systemd unit.";
     };
+    netbird-ui = {
+      arch = "netbird-ui-bin";
+      aur = true;
+      reason = "The GUI tray companion to the native NetBird client, for a host with a Wayland session.";
+    };
     cloudflared = {
       arch = "cloudflared";
       reason = "The native Cloudflare Tunnel client and its distro-owned systemd unit.";
