@@ -16,6 +16,7 @@ let
     (lib.optional cfg.cloudflared.enable "cloudflared")
     (lib.optional cfg.networkManager.enable "networkmanager")
     (lib.optional cfg.networkManager.enable "wpa-supplicant")
+    (lib.optional cfg.networkManager.applet.enable "networkmanager-applet")
     (lib.optional cfg.modemManager.enable "modemmanager")
     (lib.optionals cfg.bluez.enable [ "bluez" "bluez-utils" ])
     (lib.optional cfg.bluez.obex.enable "bluez-obex")
@@ -36,7 +37,24 @@ in
     };
     cloudflared.enable = lib.mkEnableOption "the native Cloudflare Tunnel client";
 
-    networkManager.enable = lib.mkEnableOption "NetworkManager with wpa_supplicant Wi-Fi association";
+    networkManager = {
+      enable = lib.mkEnableOption "NetworkManager with wpa_supplicant Wi-Fi association";
+
+      applet.enable = lib.mkEnableOption ''
+        nm-applet, NetworkManager's tray front end, for a session whose bar hosts a tray.
+
+        Its own option rather than part of `networkManager.enable`, and off by default,
+        because it is useful only where something HOSTS a StatusNotifierItem: the applet
+        publishes one over D-Bus and paints nothing itself. NetworkManager does not need a
+        front end to work, so on a headless host -- or in a session whose bar has no tray
+        module -- selecting the daemon must not also buy a resident process that draws
+        nothing.
+
+        System plane, like everything this module declares: a home-manager module evaluates
+        in a different module system and cannot read `nixnet.backend.*` at all, so a
+        user-session autostart still takes the PACKAGE from here
+      '';
+    };
     modemManager.enable = lib.mkEnableOption "ModemManager for a WWAN uplink";
 
     bluez = {
@@ -87,6 +105,10 @@ in
       {
         assertion = !cfg.netbird.ui.enable || cfg.netbird.enable;
         message = "nixnet.backend: the NetBird tray UI requires nixnet.backend.netbird.enable = true.";
+      }
+      {
+        assertion = !cfg.networkManager.applet.enable || cfg.networkManager.enable;
+        message = "nixnet.backend: the NetworkManager tray applet requires nixnet.backend.networkManager.enable = true.";
       }
       {
         assertion = !cfg.bluez.obex.enable || cfg.bluez.enable;

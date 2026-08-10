@@ -26,6 +26,10 @@
       arch = "wpa_supplicant";
       reason = "NetworkManager's selected Wi-Fi association backend.";
     };
+    networkmanager-applet = {
+      arch = "network-manager-applet";
+      reason = "The optional NetworkManager tray front end (nm-applet), for a session with a tray to host it.";
+    };
     modemmanager = {
       arch = "modemmanager";
       reason = "The WWAN control plane for a cellular uplink.";
