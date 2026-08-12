@@ -48,6 +48,27 @@ let
       autoRevert.enable = false;
     };
   };
+
+  # Reproduce the systemd-initrd boundary that exposed the production boot
+  # failure.  The initrd's module-load service remains active across
+  # switch-root, so stage 2 does not get a second chance to load modules.
+  # Locking module loading before sysinit.target makes that boundary
+  # deterministic in the VM: anything the firewall needs must already have
+  # been loaded by the initrd.
+  lockModuleLoading = {
+    boot.initrd.systemd.enable = true;
+    systemd.services.nixnet-test-lock-module-loading = {
+      description = "nixnet test: forbid module loading after the initrd";
+      wantedBy = [ "sysinit.target" ];
+      before = [ "sysinit.target" "nixnet-firewall.service" ];
+      after = [ "systemd-modules-load.service" ];
+      unitConfig.DefaultDependencies = false;
+      serviceConfig.Type = "oneshot";
+      script = ''
+        echo 1 > /proc/sys/kernel/modules_disabled
+      '';
+    };
+  };
 in
 {
   name = "firewall-apply-failure";
@@ -79,6 +100,22 @@ in
         imports = [ modules.core modules.firewall baseline firewalled ];
         virtualisation.vlans = [ 1 ];
         nixnet.firewall.silentDrops = unloadable;
+      };
+
+      # A healthy boot with post-initrd module loading forbidden.  This is the
+      # case a syntax-only failure fixture cannot cover: the nftables socket,
+      # conntrack expressions, rate limiter and AF_PACKET must all exist before
+      # nixnet runs, without demand-loading hiding an incomplete module.
+      modulelocked = { ... }: {
+        imports = [ modules.core modules.firewall baseline firewalled lockModuleLoading ];
+        nixnet.firewall.management.rateLimitNew = "6/minute";
+      };
+
+      # `enable = false` still owns removal of a table left by an earlier
+      # generation.  On a clean boot absence is already proven and that
+      # teardown must not degrade the host even after module loading is locked.
+      disabledlocked = { ... }: {
+        imports = [ modules.core modules.firewall baseline lockModuleLoading ];
       };
 
       # A second machine, because FW-3's "Not" is about reachability and
@@ -130,6 +167,21 @@ in
       assert status in ("degraded", "maintenance"), (
           f"a host with no firewall and a failed apply reports itself as '{status}'"
       )
+
+      # ── the systemd-initrd module boundary ──────────────────────────────
+      modulelocked.wait_for_unit("multi-user.target")
+      modulelocked.succeed("test $(cat /proc/sys/kernel/modules_disabled) -eq 1")
+      modulelocked.succeed("systemctl is-active --quiet nixnet-firewall.service")
+      modulelocked.succeed("nft list table inet nixnet")
+      for module in (
+          "af_packet", "nfnetlink", "nf_conntrack", "nf_tables", "nft_ct", "nft_limit"
+      ):
+          modulelocked.succeed(f"test -d /sys/module/{module}")
+
+      disabledlocked.wait_for_unit("multi-user.target")
+      disabledlocked.succeed("test $(cat /proc/sys/kernel/modules_disabled) -eq 1")
+      disabledlocked.succeed("systemctl is-active --quiet nixnet-firewall.service")
+      disabledlocked.fail("nft list table inet nixnet")
     '';
   };
 }

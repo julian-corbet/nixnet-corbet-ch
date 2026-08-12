@@ -48,6 +48,26 @@ let
   # backend that has no answer.
   tooling = tl.resolve { inherit pkgs options; names = cfg.tooling; };
 
+  # This unit deliberately runs before network-pre.target with default dependencies disabled.
+  # On a systemd-initrd host the initrd's systemd-modules-load.service survives switch-root, so
+  # stage 2 does not necessarily run a second module-load pass.  Relying on nft's first netlink
+  # socket or networkd's first packet socket to demand-load these therefore loses the host: nft
+  # reports EPROTONOSUPPORT, AF_PACKET is absent, and the physical interface enters failed state.
+  #
+  # Keep the declaration on both sides of switch-root.  The initrd list establishes the boot
+  # ordering invariant; the stage-2 list retains the modules and preserves the invariant if a
+  # future initrd implementation stops carrying its module-load service across the boundary.
+  # `enable = false` needs them too: that generation's unit still owns removal of a table left by
+  # an enabled predecessor.
+  firewallKernelModules = [
+    "af_packet"
+    "nfnetlink"
+    "nf_conntrack"
+    "nf_tables"
+    "nft_ct"
+    "nft_limit"
+  ];
+
   # ── The facts, read from wherever nixnet already declares them ──────────────────────────────
   #
   # Sibling modules are read defensively (`or`), the same idiom netbird-access-model.nix uses:
@@ -1131,6 +1151,14 @@ in
         }
       ];
     }
+
+    # Kernel-module ownership exists only on real NixOS.  system-manager controls a userspace
+    # plane on a foreign distro and has no boot option surface; its host administrator owns kernel
+    # availability.
+    (lib.optionalAttrs (!isSystemManager) {
+      boot.initrd.kernelModules = firewallKernelModules;
+      boot.kernelModules = firewallKernelModules;
+    })
 
     (lib.mkIf cfg.enable (lib.mkMerge [
       {

@@ -45,6 +45,25 @@ let
 
   tableName = "nixnet-overlay";
 
+  # The table and the NetBird tunnel are kernel-backed parts of this module's
+  # contract.  Loading these in both initrd and stage 2 matters on a systemd
+  # initrd: its modules-load unit remains active across switch-root, so a
+  # stage-2 declaration alone does not get another attempt before this unit
+  # starts.  Keep the list unconditional because the disabled generation owns
+  # teardown of a table left by the enabled generation.
+  overlayKernelModules = [
+    "af_packet"
+    "nfnetlink"
+    "nf_conntrack"
+    "nf_tables"
+    "nf_nat"
+    "nft_chain_nat"
+    "nft_masq"
+    "tun"
+  ];
+
+  overlayRulesActive = cfg.enable && cfg.advertiseRoutes != [ ];
+
   indent = n: lib.concatMapStringsSep "\n" (l: "    ${l}") n;
 
   # Confinement is built PER ADDRESS FAMILY, and that is not cosmetic: a
@@ -140,7 +159,8 @@ ${confineRules}${snatRules}}
       # housekeeping for a chain that is already redundant, and must never
       # be able to take the actual rules down with it.
       if command -v iptables >/dev/null 2>&1; then
-        for chain in NIXNET-EXT-CONFINE ${lib.escapeShellArgs cfg.legacyChains}; do
+        cleanup_legacy_chain() {
+          local chain="$1"
           # Collected into a variable with `|| true` rather than piped
           # straight into the loop: this script runs under `set -o pipefail`
           # (writeShellApplication), and grep exits 1 when a chain has no
@@ -159,7 +179,10 @@ ${confineRules}${snatRules}}
           fi
           iptables -t raw -F "$chain" 2>/dev/null || true
           iptables -t raw -X "$chain" 2>/dev/null || true
-        done
+        }
+
+        cleanup_legacy_chain NIXNET-EXT-CONFINE
+        ${lib.concatMapStringsSep "\n" (chain: "cleanup_legacy_chain ${lib.escapeShellArg chain}") cfg.legacyChains}
       fi
     '';
   };
@@ -311,7 +334,37 @@ in
   config = lib.mkMerge [
     # Rendered unconditionally, OUTSIDE the enable gate, so a consumer can
     # inspect what enabling this would apply before committing to it.
-    { nixnet.overlay.ruleset = ruleset; }
+    {
+      nixnet.overlay.ruleset = ruleset;
+
+      boot.initrd.kernelModules = overlayKernelModules;
+      boot.kernelModules = overlayKernelModules;
+
+      # This unit deliberately exists in disabled generations too.  A live
+      # switch from enabled to disabled must actively remove the table left by
+      # the old generation; merely omitting the unit leaves stale packet-path
+      # policy behind.  Conversely, there is deliberately NO ExecStop: during
+      # an enabled-to-enabled switch, stopping the old unit must preserve the
+      # last known-good table until the new atomic nft transaction succeeds.
+      systemd.services.nixnet-overlay-firewall = {
+        description = "nixnet overlay packet-path rules (own nftables table: ${tableName})";
+        after = [ "network-pre.target" "firewall.service" "nftables.service" ];
+        wantedBy = [ "multi-user.target" ];
+        # Anything that rebuilds the host ruleset can flush this table out from
+        # under us -- nixpkgs' own nftables module defaults to `flush ruleset`
+        # on every start, which takes every table on the box, not just its own.
+        # partOf makes their restart restart us, so the rules come back instead
+        # of silently staying gone. Only wired to units this host actually has:
+        # a partOf on an absent unit would be dead weight.
+        partOf = lib.optional config.networking.firewall.enable "firewall.service"
+          ++ lib.optional config.networking.nftables.enable "nftables.service";
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = lib.getExe (if overlayRulesActive then applyScript else teardownScript);
+        };
+      };
+    }
 
     (lib.mkIf cfg.enable {
     services.netbird.enable = true;
@@ -411,26 +464,6 @@ in
     # ruleset, and with NetBird's own tables, without any of them needing to
     # know this exists. One `inet` table also covers v4 and v6 together,
     # which is what makes confining an advertised v6 prefix possible at all.
-    systemd.services.nixnet-overlay-firewall = lib.mkIf (cfg.advertiseRoutes != [ ]) {
-      description = "nixnet overlay packet-path rules (own nftables table: ${tableName})";
-      after = [ "network-pre.target" "firewall.service" "nftables.service" ];
-      wantedBy = [ "multi-user.target" ];
-      # Anything that rebuilds the host ruleset can flush this table out from
-      # under us -- nixpkgs' own nftables module defaults to `flush ruleset`
-      # on every start, which takes every table on the box, not just its own.
-      # partOf makes their restart restart us, so the rules come back instead
-      # of silently staying gone. Only wired to units this host actually has:
-      # a partOf on an absent unit would be dead weight.
-      partOf = lib.optional config.networking.firewall.enable "firewall.service"
-        ++ lib.optional config.networking.nftables.enable "nftables.service";
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        ExecStart = lib.getExe applyScript;
-        ExecStop = lib.getExe teardownScript;
-      };
-    };
-
     # ── LAN → overlay egress SOURCE-NAT ──────────────────────────────────
     # advertiseRoutes gives the OVERLAY reach INTO the LAN (overlay peer →
     # LAN device). The REVERSE — a client-less LAN device reaching OUT to
