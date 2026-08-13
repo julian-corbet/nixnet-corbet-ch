@@ -131,11 +131,22 @@ in
 
       # ── The unit's own refusal ───────────────────────────────────────────────────────────────
       # A missing secret must fail the unit rather than write a profile with no key -- which is
-      # the profile NetworkManager would then ask a human about (RADIO-1).
+      # the profile NetworkManager would then ask a human about (RADIO-1). The service deliberately
+      # retries forever so a late secret recovers without an operator; start it asynchronously and
+      # observe that retry instead of waiting for a terminal failed state it must never enter.
       machine.succeed("rm -f /run/test-secrets/wlan")
       machine.succeed(f"rm -f {live}")
-      machine.fail("systemctl restart nixnet-wireless-profiles.service")
+      machine.succeed("systemctl stop nixnet-wireless-profiles.service")
+      before = int(machine.succeed(
+          "systemctl show -p NRestarts --value nixnet-wireless-profiles.service"
+      ).strip())
+      machine.succeed("systemctl start --no-block nixnet-wireless-profiles.service")
+      machine.wait_until_succeeds(
+          f"test $(systemctl show -p NRestarts --value nixnet-wireless-profiles.service) -gt {before}",
+          timeout=30,
+      )
       machine.fail(f"test -e {live}")
+      machine.succeed("systemctl stop nixnet-wireless-profiles.service")
     '';
   };
 
