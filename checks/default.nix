@@ -64,11 +64,12 @@ let
   # forcing it is never a surprise.
   check = name: ok: detail: { inherit name ok detail; };
 
-  cfg = evalFor { };
-  nixnetdService = cfg.systemd.services.nixnetd.serviceConfig;
-  nestedStateCfg = evalFor {
+  # Use a nested state path in the main fixture so the ordinary service
+  # checks and the path-preservation regression share one NixOS evaluation.
+  cfg = evalFor {
     nixnet.daemon.stateDir = "/var/lib/nixnet/nested-state";
   };
+  nixnetdService = cfg.systemd.services.nixnetd.serviceConfig;
 
   results = [
     # THE regression this file exists for. Pre-fix, `DynamicUser = true`
@@ -102,9 +103,8 @@ let
       "users.groups keys: ${builtins.toJSON (builtins.attrNames cfg.users.groups)}")
 
     (check "nixnetd/state-directory-preserves-nested-path"
-      ((nestedStateCfg.systemd.services.nixnetd.serviceConfig.StateDirectory or null)
-        == "nixnet/nested-state")
-      "serviceConfig.StateDirectory: ${builtins.toJSON (nestedStateCfg.systemd.services.nixnetd.serviceConfig.StateDirectory or null)}")
+      ((nixnetdService.StateDirectory or null) == "nixnet/nested-state")
+      "serviceConfig.StateDirectory: ${builtins.toJSON (nixnetdService.StateDirectory or null)}")
 
   ];
 
@@ -221,6 +221,8 @@ let
   # ---------------------------------------------------------------------
   overlayCfg = evalModules [
     overlayModule
+    (moduleDir + "/ingress.nix")
+    (moduleDir + "/netbird-access-model.nix")
     {
       nixnet.overlay = {
         enable = true;
@@ -234,6 +236,29 @@ let
         advertiseRoutes = [ "192.0.2.0/24" "2001:db8:42::/64" ];
         confineExternalRanges = [ "198.51.100.192/26" "2001:db8:ff::/64" ];
         confineExternalAllow = [ "192.0.2.6" "2001:db8:42::6" ];
+      };
+      nixnet.netbirdAccessModel = {
+        enable = true;
+        internalGroup = "internal";
+        groups.internal.description = "All internally managed peers.";
+        audit.apiUrl = "https://mesh.example.com/api";
+      };
+      nixnet.ingress = {
+        enable = true;
+        tunnelId = "00000000-0000-0000-0000-000000000001";
+        credentialsFile = "/run/secrets/cloudflared-credentials.json";
+        edgeIpVersion = "6";
+        transportProtocol = "http2";
+        ingress = [{
+          hostname = "app.example.com";
+          path = "^/hook$";
+          service = "http://127.0.0.1:8080";
+        }];
+        dnsReconcile = {
+          enable = true;
+          apiTokenFile = "/run/secrets/cloudflare-api-token";
+          zone = "example.com";
+        };
       };
     }
   ];
@@ -322,6 +347,8 @@ let
   # against a module that turned v6 forwarding on unconditionally.
   overlayV4OnlyCfg = evalModules [
     overlayModule
+    (moduleDir + "/netbird-access-model.nix")
+    (moduleDir + "/netbird-group-reconcile.nix")
     {
       nixnet.overlay = {
         enable = true;
@@ -330,6 +357,16 @@ let
         setupKeyFile = "/run/secrets/nixnet-overlay-key";
         advertiseRoutes = [ "192.0.2.0/24" ];
         confineExternalRanges = [ "198.51.100.192/26" ];
+      };
+      nixnet.netbirdAccessModel = {
+        enable = true;
+        internalGroup = "internal";
+        groups.internal.description = "All internally managed peers.";
+        audit.apiUrl = "https://mesh.example.com/api";
+      };
+      nixnet.netbirdGroupReconcile = {
+        enable = true;
+        apiUrl = "https://mesh.example.com/api";
       };
     }
   ];
@@ -348,68 +385,19 @@ let
   # integration with group reconciliation must not make that export depend on
   # importing the sibling module, while still supplying the shared default
   # when both are present.
-  accessModelBase = {
-    nixnet.netbirdAccessModel = {
-      enable = true;
-      internalGroup = "internal";
-      groups.internal.description = "All internally managed peers.";
-      audit.apiUrl = "https://mesh.example.com/api";
-    };
-  };
-
-  accessModelStandaloneCfg = evalModules [
-    (moduleDir + "/netbird-access-model.nix")
-    accessModelBase
-  ];
-
-  accessModelCombinedCfg = evalModules [
-    (moduleDir + "/netbird-access-model.nix")
-    (moduleDir + "/netbird-group-reconcile.nix")
-    accessModelBase
-    {
-      nixnet.netbirdGroupReconcile = {
-        enable = true;
-        apiUrl = "https://mesh.example.com/api";
-      };
-    }
-  ];
-
   accessModelResults = [
     (check "netbird-access-model/imports-standalone"
-      (!(accessModelStandaloneCfg.nixnet ? netbirdGroupReconcile)
-        && accessModelStandaloneCfg.nixnet.netbirdAccessModel.internalGroup == "internal")
+      (!(overlayCfg.nixnet ? netbirdGroupReconcile)
+        && overlayCfg.nixnet.netbirdAccessModel.internalGroup == "internal")
       "standalone module unexpectedly requires or defines nixnet.netbirdGroupReconcile")
 
     (check "netbird-access-model/defaults-reconciler-catch-all"
-      (accessModelCombinedCfg.nixnet.netbirdGroupReconcile.catchAllGroup == "internal")
-      "catchAllGroup: ${builtins.toJSON accessModelCombinedCfg.nixnet.netbirdGroupReconcile.catchAllGroup}")
+      (overlayV4OnlyCfg.nixnet.netbirdGroupReconcile.catchAllGroup == "internal")
+      "catchAllGroup: ${builtins.toJSON overlayV4OnlyCfg.nixnet.netbirdGroupReconcile.catchAllGroup}")
   ];
 
   ingressTunnelId = "00000000-0000-0000-0000-000000000001";
-  ingressCfg = evalModules [
-    (moduleDir + "/ingress.nix")
-    {
-      nixnet.ingress = {
-        enable = true;
-        tunnelId = ingressTunnelId;
-        credentialsFile = "/run/secrets/cloudflared-credentials.json";
-        edgeIpVersion = "6";
-        transportProtocol = "http2";
-        ingress = [{
-          hostname = "app.example.com";
-          path = "^/hook$";
-          service = "http://127.0.0.1:8080";
-        }];
-        dnsReconcile = {
-          enable = true;
-          apiTokenFile = "/run/secrets/cloudflare-api-token";
-          zone = "example.com";
-        };
-      };
-    }
-  ];
-
-  ingressTunnel = ingressCfg.services.cloudflared.tunnels.${ingressTunnelId};
+  ingressTunnel = overlayCfg.services.cloudflared.tunnels.${ingressTunnelId};
   ingressResults = [
     (check "ingress/uses-native-edge-ip-option"
       (ingressTunnel.edgeIPVersion == "6")
@@ -421,8 +409,8 @@ let
 
     (check "ingress/dns-reconciler-waits-for-token-mount"
       (lib.elem "/run/secrets/cloudflare-api-token"
-        (lib.toList (ingressCfg.systemd.services.nixnet-ingress-dns-reconcile.unitConfig.RequiresMountsFor or [ ])))
-      "RequiresMountsFor: ${builtins.toJSON (ingressCfg.systemd.services.nixnet-ingress-dns-reconcile.unitConfig.RequiresMountsFor or null)}")
+        (lib.toList (overlayCfg.systemd.services.nixnet-ingress-dns-reconcile.unitConfig.RequiresMountsFor or [ ])))
+      "RequiresMountsFor: ${builtins.toJSON (overlayCfg.systemd.services.nixnet-ingress-dns-reconcile.unitConfig.RequiresMountsFor or null)}")
   ];
 
   # Source-text checks for the two assertions, rather than reading the
