@@ -156,8 +156,14 @@ pub struct Engine {
 
     status_path: PathBuf,
     state_path: PathBuf,
+    status_ttl: Duration,
 
     state: Mutex<EngineState>,
+    /// Serializes external publication without serializing probe state
+    /// updates behind the external I/O itself.
+    io_lock: Mutex<()>,
+    last_state_write: Mutex<Option<Instant>>,
+    last_status_write: Mutex<Option<Instant>>,
     initialized: AtomicBool,
 }
 
@@ -166,6 +172,17 @@ pub struct Engine {
 struct Candidate {
     idx: usize,
     priority: i64,
+}
+
+enum Action {
+    None,
+    /// Re-render the managed hosts block. `passive` marks a tick that
+    /// changed nothing in nixnet's own state, where an empty block must not
+    /// overwrite the activation seed.
+    PublishPeers {
+        passive: bool,
+    },
+    PublishUplink(Vec<publish::RankedInterface>, i64, i64),
 }
 
 /// STALE-2's verdict on one retained last-known-good entry.
@@ -248,6 +265,7 @@ impl Engine {
         status_path: PathBuf,
         state_path: PathBuf,
     ) -> Self {
+        let status_ttl = status_ttl(&cfg);
         let mut peers = HashMap::new();
         for (name, p) in cfg.peers {
             let mut transports = Vec::with_capacity(p.transports.len());
@@ -344,7 +362,11 @@ impl Engine {
             routes,
             status_path,
             state_path,
+            status_ttl,
             state: Mutex::new(state),
+            io_lock: Mutex::new(()),
+            last_state_write: Mutex::new(None),
+            last_status_write: Mutex::new(None),
             initialized: AtomicBool::new(false),
         }
     }
@@ -377,18 +399,7 @@ impl Engine {
                 state.group_mut(*kind, name).transports[*idx].next_probe_due = Some(now);
             }
         }
-        for key in keys {
-            let eng = Arc::clone(&self);
-            let sd = shutdown.clone();
-            handles.push(std::thread::spawn(move || eng.run_transport(key, sd)));
-        }
-
-        // Publish an initial status snapshot immediately, so nixnetctl has
-        // something sane to read even before the first probe tick
-        // completes.
-        self.write_status();
-
-        // ...and re-assert the hosts block from the winners restored out
+        // Re-assert the hosts block from the winners restored out
         // of state.json, for the same reason: until this call existed,
         // NOTHING was published until some group's winner actually
         // CHANGED. A restart on a settled fleet changes no winner, so the
@@ -401,9 +412,21 @@ impl Engine {
         // winners for hours. The uplink half is the same claim about the
         // routing table: a DHCP client that renewed while this process was
         // down has already put the metric back where nixnet does not want
-        // it.
+        // it. Workers start only after these publications, so a first probe
+        // cannot race a restored-state publication.
         self.publish_restored_peers();
         self.publish_restored_uplinks();
+
+        // Publish an initial status snapshot after startup I/O, so any
+        // publication error is visible before READY=1 rather than being
+        // hidden until a later probe tick.
+        self.write_status(true);
+
+        for key in keys {
+            let eng = Arc::clone(&self);
+            let sd = shutdown.clone();
+            handles.push(std::thread::spawn(move || eng.run_transport(key, sd)));
+        }
         self.initialized.store(true, Ordering::Release);
         ready();
 
@@ -542,7 +565,7 @@ impl Engine {
             (tr.spec.clone(), tr.id.clone())
         };
 
-        let res = match probe::run(&spec) {
+        let mut res = match probe::run(&spec) {
             Ok(r) => r,
             Err(e) => {
                 logf!("transport={} probe misconfigured: {}", tr_id, e);
@@ -553,40 +576,52 @@ impl Engine {
                 }
             }
         };
+        if res.healthy
+            && !res.address.is_empty()
+            && res.address.parse::<std::net::IpAddr>().is_err()
+        {
+            res.healthy = false;
+            res.detail = format!(
+                "exec probe returned invalid address {:?}; expected an IPv4 or IPv6 literal",
+                res.address
+            );
+            res.address.clear();
+        }
 
         let observed_at = OffsetDateTime::now_utc();
         let mut state = self.state.lock().unwrap();
-        let (old_state, new_state, transition_count, tr_detail);
+        let (old_state, new_state, transition_count, tr_detail, address_changed);
         {
             let g = state.group_mut(kind, name);
             let tr = &mut g.transports[idx];
             old_state = tr.state;
             if res.healthy {
                 tr.consecutive_failure = 0;
-                tr.consecutive_success += 1;
-                if tr.state != TransportState::Up
-                    && tr.consecutive_success >= threshold(tr.spec.probe.up_threshold, 2)
-                {
+                let up_threshold = threshold(tr.spec.probe.up_threshold, 2);
+                tr.consecutive_success = tr.consecutive_success.saturating_add(1).min(up_threshold);
+                if tr.state != TransportState::Up && tr.consecutive_success >= up_threshold {
                     tr.state = TransportState::Up;
                 }
                 tr.last_success_at = Some(observed_at);
             } else {
                 tr.consecutive_success = 0;
-                tr.consecutive_failure += 1;
-                if tr.state != TransportState::Down
-                    && tr.consecutive_failure >= threshold(tr.spec.probe.down_threshold, 3)
-                {
+                let down_threshold = threshold(tr.spec.probe.down_threshold, 3);
+                tr.consecutive_failure =
+                    tr.consecutive_failure.saturating_add(1).min(down_threshold);
+                if tr.state != TransportState::Down && tr.consecutive_failure >= down_threshold {
                     tr.state = TransportState::Down;
                 }
             }
             // Only a healthy provider result may commit a newly-discovered
             // address. Otherwise down-threshold hysteresis can publish an
             // address that has never passed a probe.
+            let old_address = tr.current_address.clone();
             if res.healthy && !res.address.is_empty() {
                 tr.current_address = res.address.clone();
             } else if tr.current_address.is_empty() {
                 tr.current_address = tr.spec.address.clone();
             }
+            address_changed = tr.current_address != old_address;
             tr.detail = res.detail.clone();
             new_state = tr.state;
             transition_count = if new_state != old_state {
@@ -601,9 +636,10 @@ impl Engine {
             tr_detail = tr.detail.clone();
         }
 
-        self.reconcile_locked(&mut state, kind, name);
-        self.save_state_locked(&state);
         drop(state);
+
+        let publication_changed = self.reconcile(kind, name);
+        self.save_state(new_state != old_state || address_changed || publication_changed);
 
         if new_state != old_state {
             logf!(
@@ -616,7 +652,7 @@ impl Engine {
             );
         }
 
-        self.write_status();
+        self.write_status(new_state != old_state || publication_changed);
     }
 
     /// Implements winner-selection: among currently-healthy candidates,
@@ -640,22 +676,9 @@ impl Engine {
     /// against observed reality, and a transition-driven publisher is
     /// correct exactly until something else changes the world behind its
     /// back -- which is always.
-    fn reconcile_locked(&self, state: &mut EngineState, kind: GroupKind, name: &str) {
+    fn decide_action_locked(&self, state: &mut EngineState, kind: GroupKind, name: &str) -> Action {
         let now = OffsetDateTime::now_utc();
         let group_label = format!("{}={}", kind.label(), name);
-
-        enum Action {
-            None,
-            /// Re-render the managed hosts block. `passive` marks a tick
-            /// that changed nothing in nixnet's own state, where an EMPTY
-            /// block must never be rendered over the activation seed --
-            /// the same rule, and the same reason, as
-            /// `publish_restored_peers`.
-            PublishPeers {
-                passive: bool,
-            },
-            PublishUplink(Vec<publish::RankedInterface>, i64, i64),
-        }
 
         // The uplink half of TF-2, in one place: the ranking a group
         // publishes does not depend on whether anything changed this tick,
@@ -850,6 +873,17 @@ impl Engine {
             }
         };
 
+        action
+    }
+
+    fn apply_action_locked(
+        &self,
+        state: &mut EngineState,
+        kind: GroupKind,
+        name: &str,
+        action: Action,
+    ) {
+        let group_label = format!("{}={}", kind.label(), name);
         match action {
             Action::None => {}
             Action::PublishPeers { passive } => {
@@ -890,6 +924,94 @@ impl Engine {
                 );
             }
         }
+    }
+
+    /// Reconciles one group while keeping every filesystem operation and
+    /// route command outside the engine-state mutex. Other probe workers
+    /// can therefore record failures and make watchdog progress even when
+    /// an external publisher is slow. `io_lock` preserves publication
+    /// ordering across those workers.
+    fn reconcile(&self, kind: GroupKind, name: &str) -> bool {
+        let _io = self.io_lock.lock().unwrap();
+        let (action, entries, peer_set_empty, state_changed) = {
+            let mut state = self.state.lock().unwrap();
+            let group = state.group(kind, name);
+            let before = (
+                group.winner,
+                group.degraded,
+                group.last_published_addr.clone(),
+            );
+            let action = self.decide_action_locked(&mut state, kind, name);
+            let group = state.group(kind, name);
+            let after = (
+                group.winner,
+                group.degraded,
+                group.last_published_addr.clone(),
+            );
+            let entries = if matches!(&action, Action::PublishPeers { .. }) {
+                peer_entries(&state)
+            } else {
+                Vec::new()
+            };
+            let empty = nothing_to_publish(&state);
+            (action, entries, empty, before != after)
+        };
+
+        let mut changed = state_changed;
+        let group_label = format!("{}={}", kind.label(), name);
+        match action {
+            Action::None => {}
+            Action::PublishPeers { passive } => {
+                if passive && peer_set_empty {
+                    return state_changed;
+                }
+                let result = self.hosts.publish(&entries);
+                if let Ok(true) = result {
+                    logf!(
+                        "hosts re-assert: wrote {} entries -- the live file did not match what this daemon publishes",
+                        entries.len()
+                    );
+                }
+                let mut state = self.state.lock().unwrap();
+                let old_error = state.last_hosts_error.clone();
+                log_publish_error(
+                    &mut state.last_hosts_error,
+                    "publish hosts",
+                    result.err().map(|e| e.to_string()),
+                );
+                changed |= old_error != state.last_hosts_error;
+            }
+            Action::PublishUplink(ranked, metric_base, metric_step) => {
+                let out = self.routes.apply(&ranked, metric_base, metric_step);
+                for change in &out.changes {
+                    logf!(
+                        "group={} route re-assert dev={} metric={}->{}",
+                        group_label,
+                        change.interface,
+                        change.from_metric,
+                        change.to_metric
+                    );
+                }
+                let what = format!("publish routes for group={}", group_label);
+                let mut state = self.state.lock().unwrap();
+                let group = state.group_mut(kind, name);
+                let old_error = group.last_publish_error.clone();
+                log_publish_error(
+                    &mut group.last_publish_error,
+                    &what,
+                    out.error.map(|e| e.to_string()),
+                );
+                changed |= old_error != group.last_publish_error;
+            }
+        }
+        changed
+    }
+
+    /// Test/startup compatibility wrapper. Runtime probe ticks use
+    /// [`Engine::reconcile`], which releases the state lock before I/O.
+    fn reconcile_locked(&self, state: &mut EngineState, kind: GroupKind, name: &str) {
+        let action = self.decide_action_locked(state, kind, name);
+        self.apply_action_locked(state, kind, name, action);
     }
 
     /// Publishes the peer block once at startup, from the winners
@@ -963,22 +1085,7 @@ impl Engine {
     /// the rendered block differs from the live file, so the ordinary
     /// outcome is one read and nothing else.
     fn publish_peers_locked(&self, state: &mut EngineState) {
-        let mut entries = Vec::new();
-        for g in state.peers.values() {
-            if g.last_published_addr.is_empty() {
-                continue;
-            }
-            entries.push(publish::Entry {
-                address: g.last_published_addr.clone(),
-                hostnames: g.hostnames.clone(),
-                // STALE-1: the published artifact carries when it was last
-                // confirmed, so a consumer can compute its age without
-                // knowing this daemon's probe cadence -- and without
-                // reading status.json, which most consumers of /etc/hosts
-                // will never do.
-                confirmed_at: g.last_confirmed_at.and_then(|t| t.format(&Rfc3339).ok()),
-            });
-        }
+        let entries = peer_entries(state);
         let result = self.hosts.publish(&entries);
         if let Ok(true) = result {
             logf!(
@@ -994,9 +1101,16 @@ impl Engine {
         );
     }
 
-    /// Renders `/run/nixnet/status.json` -- every tick, regardless of
-    /// whether anything changed.
-    fn write_status(&self) {
+    /// Renders `/run/nixnet/status.json`. Transitions are immediate; steady
+    /// ticks are coalesced to at most one filesystem transaction per
+    /// second when multiple transport workers complete together.
+    fn write_status(&self, force: bool) {
+        // This guard is also the status writer lock. Keep it across the
+        // atomic rename so two workers cannot land snapshots out of order.
+        let mut last = self.last_status_write.lock().unwrap();
+        if !force && last.is_some_and(|time| time.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
         let snap = {
             let state = self.state.lock().unwrap();
             let mut peers = HashMap::new();
@@ -1009,16 +1123,59 @@ impl Engine {
             }
             status::Snapshot {
                 generated_at: String::new(),
+                valid_until: String::new(),
                 last_hosts_publish_error: state.last_hosts_error.clone(),
                 peers,
                 uplinks,
             }
         };
 
-        if let Err(e) = status::write(&self.status_path, snap) {
+        if let Err(e) = status::write(&self.status_path, snap, self.status_ttl) {
             logf!("write status: {}", e);
+        } else {
+            *last = Some(Instant::now());
         }
     }
+}
+
+fn status_ttl(cfg: &Config) -> Duration {
+    let longest_ms = cfg
+        .peers
+        .values()
+        .flat_map(|group| group.transports.iter())
+        .chain(
+            cfg.uplinks
+                .values()
+                .flat_map(|group| group.transports.iter()),
+        )
+        .map(|transport| {
+            transport
+                .probe
+                .interval_ms
+                .saturating_add(transport.probe.timeout_ms)
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(5_000)
+        .max(15_000);
+    Duration::from_millis(longest_ms as u64)
+}
+
+fn peer_entries(state: &EngineState) -> Vec<publish::Entry> {
+    state
+        .peers
+        .values()
+        .filter(|group| !group.last_published_addr.is_empty())
+        .map(|group| publish::Entry {
+            address: group.last_published_addr.clone(),
+            hostnames: group.hostnames.clone(),
+            // STALE-1: consumers can compute age without knowing the probe
+            // cadence or reading status.json.
+            confirmed_at: group
+                .last_confirmed_at
+                .and_then(|time| time.format(&Rfc3339).ok()),
+        })
+        .collect()
 }
 
 /// True when no peer group has anything to publish -- a first-ever start,
@@ -1198,7 +1355,11 @@ mod tests {
             routes,
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
+            status_ttl: Duration::from_secs(30),
             state: Mutex::new(EngineState::default()),
+            io_lock: Mutex::new(()),
+            last_state_write: Mutex::new(None),
+            last_status_write: Mutex::new(None),
             initialized: AtomicBool::new(false),
         };
         (eng, dir)
@@ -1217,7 +1378,11 @@ mod tests {
             },
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
+            status_ttl: Duration::from_secs(30),
             state: Mutex::new(EngineState::default()),
+            io_lock: Mutex::new(()),
+            last_state_write: Mutex::new(None),
+            last_status_write: Mutex::new(None),
             initialized: AtomicBool::new(false),
         };
         (eng, dir)
@@ -1487,7 +1652,11 @@ mod tests {
             },
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
+            status_ttl: Duration::from_secs(30),
             state: Mutex::new(EngineState::default()),
+            io_lock: Mutex::new(()),
+            last_state_write: Mutex::new(None),
+            last_status_write: Mutex::new(None),
             initialized: AtomicBool::new(false),
         };
         // A configured peer whose winner was never established, i.e. no
@@ -2106,7 +2275,11 @@ mod tests {
             },
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
+            status_ttl: Duration::from_secs(30),
             state: Mutex::new(EngineState::default()),
+            io_lock: Mutex::new(()),
+            last_state_write: Mutex::new(None),
+            last_status_write: Mutex::new(None),
             initialized: AtomicBool::new(false),
         };
         let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
@@ -2244,6 +2417,42 @@ mod tests {
             confirmed < ago(3500),
             "a different transport laundered the stale winner into a fresh publication"
         );
+    }
+
+    #[test]
+    fn a_failing_exec_probe_cannot_replace_the_published_address() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (eng, dir) = new_test_engine();
+        let script = dir.path().join("failing-provider");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"address\":\"203.0.113.99\"}'\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut group = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let transport = add_transport(&mut group, 10, "192.0.2.10");
+        group.transports[transport].state = TransportState::Up;
+        group.transports[transport].spec.probe.method = "exec".into();
+        group.transports[transport].spec.probe.exec = script.display().to_string();
+        group.transports[transport].spec.probe.timeout_ms = 1000;
+        group.transports[transport].spec.probe.down_threshold = 3;
+        group.winner = Some(transport);
+        group.last_published_addr = "192.0.2.10".into();
+        eng.state
+            .lock()
+            .unwrap()
+            .peers
+            .insert("host-b".into(), group);
+
+        eng.probe_once(GroupKind::Peer, "host-b", transport);
+
+        let state = eng.state.lock().unwrap();
+        let group = &state.peers["host-b"];
+        assert_eq!(group.transports[transport].current_address, "192.0.2.10");
+        assert_eq!(group.last_published_addr, "192.0.2.10");
     }
 
     /// THE behaviour, on the live path: a peer down continuously for
@@ -2473,7 +2682,7 @@ mod tests {
             state.uplinks.insert("internet".to_string(), uplink);
         }
 
-        eng.write_status();
+        eng.write_status(true);
         let snapshot = status::read(&dir.path().join("status.json")).unwrap();
         assert_eq!(
             snapshot.last_hosts_publish_error, "read-only file system",

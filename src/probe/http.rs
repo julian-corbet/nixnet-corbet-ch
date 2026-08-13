@@ -13,7 +13,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -41,14 +41,19 @@ pub fn run(t: &Transport, timeout: Duration) -> Result<ProbeResult, ProbeError> 
 
     let req = plain_request(target, t.probe.port, &t.probe.path);
 
-    let addr = match (req.connect_host.as_str(), req.connect_port)
+    let started = Instant::now();
+    let addresses = match (req.connect_host.as_str(), req.connect_port)
         .to_socket_addrs()
-        .and_then(|mut it| {
-            it.next().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses found")
+        .map(|iter| iter.collect::<Vec<_>>())
+    {
+        Ok(addresses) if !addresses.is_empty() => addresses,
+        Ok(_) => {
+            return Ok(ProbeResult {
+                healthy: false,
+                detail: "no addresses found".to_string(),
+                ..Default::default()
             })
-        }) {
-        Ok(a) => a,
+        }
         Err(e) => {
             return Ok(ProbeResult {
                 healthy: false,
@@ -58,53 +63,63 @@ pub fn run(t: &Transport, timeout: Duration) -> Result<ProbeResult, ProbeError> 
         }
     };
 
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let socket = match Socket::new(domain, Type::STREAM, Some(Protocol::TCP)) {
-        Ok(s) => s,
-        Err(e) => {
-            return Ok(ProbeResult {
-                healthy: false,
-                detail: e.to_string(),
-                ..Default::default()
-            })
+    let mut last_error = "probe deadline exhausted during name resolution".to_string();
+    for addr in addresses {
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
         }
-    };
-    if t.probe.bind_to_interface && !t.interface.is_empty() {
-        if let Err(e) = bind_to_device(&socket, &t.interface) {
-            return Ok(ProbeResult {
-                healthy: false,
-                detail: e.to_string(),
-                ..Default::default()
-            });
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = match Socket::new(domain, Type::STREAM, Some(Protocol::TCP)) {
+            Ok(socket) => socket,
+            Err(e) => {
+                last_error = e.to_string();
+                continue;
+            }
+        };
+        if t.probe.bind_to_interface && !t.interface.is_empty() {
+            if let Err(e) = bind_to_device(&socket, &t.interface) {
+                last_error = e.to_string();
+                continue;
+            }
         }
-    }
-    if let Err(e) = socket.connect_timeout(&addr.into(), timeout) {
-        return Ok(ProbeResult {
-            healthy: false,
-            detail: e.to_string(),
-            ..Default::default()
-        });
-    }
-    let mut stream: TcpStream = socket.into();
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+        if let Err(e) = socket.connect_timeout(&addr.into(), remaining) {
+            last_error = format!("{addr}: {e}");
+            continue;
+        }
+        let mut stream: TcpStream = socket.into();
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
+        let _ = stream.set_write_timeout(Some(remaining));
 
-    match do_get(&mut stream, &req.header_host, &req.path) {
-        Ok(code) => Ok(ProbeResult {
-            healthy: code < 400,
-            detail: format!("http status {}", code),
-            ..Default::default()
-        }),
-        Err(e) => Ok(ProbeResult {
-            healthy: false,
-            detail: e.to_string(),
-            ..Default::default()
-        }),
+        return match do_get(&mut stream, &req.header_host, &req.path) {
+            Ok(code) => Ok(ProbeResult {
+                healthy: code < 400,
+                detail: format!("http status {} ({addr})", code),
+                ..Default::default()
+            }),
+            Err(e) => Ok(ProbeResult {
+                healthy: false,
+                detail: format!("{addr}: {e}"),
+                ..Default::default()
+            }),
+        };
     }
+
+    Ok(ProbeResult {
+        healthy: false,
+        detail: last_error,
+        ..Default::default()
+    })
 }
 
 fn split_host_path(rest: &str) -> (String, String) {

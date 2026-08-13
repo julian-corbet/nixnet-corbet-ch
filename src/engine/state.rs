@@ -148,27 +148,58 @@ impl super::Engine {
 
     /// Writes the full state atomically. Callers must hold the lock.
     pub(super) fn save_state_locked(&self, state: &EngineState) {
-        let ps = PersistedState {
-            peers: dump(&state.peers),
-            uplinks: dump(&state.uplinks),
-        };
-
-        let mut data = match serde_json::to_vec_pretty(&ps) {
-            Ok(d) => d,
-            Err(e) => {
-                crate::logf!("state: marshal failed: {}", e);
-                return;
-            }
-        };
-        data.push(b'\n');
-
-        let dir = self.state_path.parent().unwrap_or_else(|| Path::new("."));
-        if let Err(e) =
-            crate::atomic::write_no_chmod(dir, &self.state_path, &data, ".state.json.tmp-")
-        {
-            crate::logf!("state: {}", e);
+        if let Some(data) = serialized_state(state) {
+            let _ = self.write_state_data(&data);
         }
     }
+
+    /// Runtime persistence path: snapshot under the state mutex, then fsync
+    /// and rename with no engine-state lock held. `last_state_write` is
+    /// also the writer lock, preventing an older concurrent snapshot from
+    /// landing after a newer one without delaying route/hosts publication.
+    pub(super) fn save_state(&self, force: bool) {
+        let mut last = self.last_state_write.lock().unwrap();
+        if !force && last.is_some_and(|time| time.elapsed() < std::time::Duration::from_secs(15)) {
+            return;
+        }
+        let data = {
+            let state = self.state.lock().unwrap();
+            serialized_state(&state)
+        };
+        if let Some(data) = data {
+            if self.write_state_data(&data) {
+                *last = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    fn write_state_data(&self, data: &[u8]) -> bool {
+        let dir = self.state_path.parent().unwrap_or_else(|| Path::new("."));
+        if let Err(e) =
+            crate::atomic::write_no_chmod(dir, &self.state_path, data, ".state.json.tmp-")
+        {
+            crate::logf!("state: {}", e);
+            return false;
+        }
+        true
+    }
+}
+
+fn serialized_state(state: &EngineState) -> Option<Vec<u8>> {
+    let ps = PersistedState {
+        peers: dump(&state.peers),
+        uplinks: dump(&state.uplinks),
+    };
+
+    let mut data = match serde_json::to_vec_pretty(&ps) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::logf!("state: marshal failed: {}", e);
+            return None;
+        }
+    };
+    data.push(b'\n');
+    Some(data)
 }
 
 fn restore(groups: &mut HashMap<String, Group>, saved: &HashMap<String, PersistedGroup>) {
@@ -654,6 +685,37 @@ mod tests {
         assert_eq!(restored.transports[0].state, super::TransportState::Unknown);
     }
 
+    #[test]
+    fn steady_confirmation_ticks_are_checkpointed_not_fsynced_every_tick() {
+        let (eng, dir) = new_test_engine();
+        let mut group = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let winner = add_transport(&mut group, 10, "192.0.2.10");
+        group.winner = Some(winner);
+        group.last_published_addr = "192.0.2.10".into();
+        group.last_confirmed_at = Some(ago(10));
+        eng.state
+            .lock()
+            .unwrap()
+            .peers
+            .insert("host-b".into(), group);
+
+        eng.save_state(false);
+        let path = dir.path().join("state.json");
+        let first = std::fs::read(&path).unwrap();
+        eng.state
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut("host-b")
+            .unwrap()
+            .last_confirmed_at = Some(OffsetDateTime::now_utc());
+        eng.save_state(false);
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+
+        eng.save_state(true);
+        assert_ne!(std::fs::read(&path).unwrap(), first);
+    }
+
     /// A corrupt state file is a logged COLD START, never an error and
     /// never a crash loop: this is the layer that makes the host reachable
     /// at all, and under `Restart=always` a refusal to start is a machine
@@ -800,7 +862,11 @@ mod tests {
             },
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
+            status_ttl: std::time::Duration::from_secs(30),
             state: std::sync::Mutex::new(EngineState::default()),
+            io_lock: std::sync::Mutex::new(()),
+            last_state_write: std::sync::Mutex::new(None),
+            last_status_write: std::sync::Mutex::new(None),
             initialized: std::sync::atomic::AtomicBool::new(false),
         };
         let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);

@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -51,6 +52,10 @@ pub struct Group {
 pub struct Snapshot {
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
+    /// HEALTH-2: after this instant, silence is red even if this file still
+    /// contains a formerly-green snapshot.
+    #[serde(default, rename = "validUntil")]
+    pub valid_until: String,
     /// The managed hosts file is one shared artifact for every peer group,
     /// so a failure to write it is a snapshot-wide error rather than an
     /// error attributable to whichever peer's tick discovered it.
@@ -67,11 +72,14 @@ pub struct Snapshot {
 /// Atomically publishes `snap` to `path` -- the same "write .tmp, fsync,
 /// rename()" discipline as the hosts file, since `status.json` is read by
 /// `nixnetctl` at arbitrary times and must never be observed half-written.
-/// Unlike the hosts file, no explicit chmod is applied here (inherits the
-/// temp file's default permissions) -- matching the Go original's
-/// asymmetry exactly, not "fixing" it to be consistent.
-pub fn write(path: &Path, mut snap: Snapshot) -> io::Result<()> {
-    snap.generated_at = OffsetDateTime::now_utc()
+/// Status contains no secrets and is the public interface consumed by
+/// `nixnetctl`, so publish it 0644. A root-run daemon with a 0600 snapshot
+/// makes the ordinary unprivileged CLI unusable.
+pub fn write(path: &Path, mut snap: Snapshot, valid_for: Duration) -> io::Result<()> {
+    let now = OffsetDateTime::now_utc();
+    snap.generated_at = now.format(&Rfc3339).unwrap_or_default();
+    let valid_ms = i64::try_from(valid_for.as_millis()).unwrap_or(i64::MAX);
+    snap.valid_until = (now + time::Duration::milliseconds(valid_ms))
         .format(&Rfc3339)
         .unwrap_or_default();
 
@@ -79,11 +87,67 @@ pub fn write(path: &Path, mut snap: Snapshot) -> io::Result<()> {
     data.push(b'\n');
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    crate::atomic::write_no_chmod(dir, path, &data, ".status.json.tmp-")
+    crate::atomic::write_with_chmod(dir, path, &data, ".status.json.tmp-", 0o644)
 }
 
 /// Loads a previously-written status.json -- used by `nixnetctl`.
 pub fn read(path: &Path) -> io::Result<Snapshot> {
     let data = std::fs::read(path)?;
     serde_json::from_slice(&data).map_err(io::Error::from)
+}
+
+impl Snapshot {
+    pub fn is_healthy_at(&self, now: OffsetDateTime) -> bool {
+        let fresh = OffsetDateTime::parse(&self.valid_until, &Rfc3339)
+            .map(|deadline| now <= deadline)
+            .unwrap_or(false);
+        fresh
+            && self.last_hosts_publish_error.is_empty()
+            && self.peers.values().all(group_healthy)
+            && self.uplinks.values().all(group_healthy)
+    }
+}
+
+fn group_healthy(group: &Group) -> bool {
+    !group.degraded && !group.winner.is_empty() && group.last_publish_error.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn written_status_is_fresh_and_world_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        write(&path, Snapshot::default(), Duration::from_secs(60)).unwrap();
+
+        let snapshot = read(&path).unwrap();
+        assert!(snapshot.is_healthy_at(OffsetDateTime::now_utc()));
+        assert!(!snapshot.valid_until.is_empty());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn expired_or_degraded_status_is_not_healthy() {
+        let mut snapshot = Snapshot {
+            valid_until: "2000-01-01T00:00:00Z".into(),
+            ..Default::default()
+        };
+        assert!(!snapshot.is_healthy_at(OffsetDateTime::now_utc()));
+
+        snapshot.valid_until = "2999-01-01T00:00:00Z".into();
+        snapshot.peers.insert(
+            "peer".into(),
+            Group {
+                degraded: true,
+                ..Default::default()
+            },
+        );
+        assert!(!snapshot.is_healthy_at(OffsetDateTime::now_utc()));
+    }
 }

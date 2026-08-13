@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use nixnet::status;
+use time::OffsetDateTime;
 
 fn main() -> ExitCode {
     let (status_path, as_json) = match parse_args() {
@@ -24,6 +25,8 @@ fn main() -> ExitCode {
         }
     };
 
+    let healthy = snap.is_healthy_at(OffsetDateTime::now_utc());
+
     if as_json {
         match serde_json::to_string_pretty(&snap) {
             Ok(s) => println!("{}", s),
@@ -32,7 +35,11 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        return ExitCode::SUCCESS;
+        return if healthy {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
     }
 
     println!("nixnet status as of {}", snap.generated_at);
@@ -41,7 +48,12 @@ fn main() -> ExitCode {
     }
     print_groups("peers", &snap.peers);
     print_groups("uplinks", &snap.uplinks);
-    ExitCode::SUCCESS
+    if healthy {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("nixnetctl: status is degraded, stale, or has a publication error");
+        ExitCode::FAILURE
+    }
 }
 
 fn parse_args() -> Result<(PathBuf, bool), ExitCode> {

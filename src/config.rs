@@ -304,6 +304,18 @@ impl Config {
     /// standalone, rather than silently trusting Nix to have been the one
     /// who wrote the file.
     fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("intervalMs", self.daemon.default_probe.interval_ms),
+            ("timeoutMs", self.daemon.default_probe.timeout_ms),
+            ("upThreshold", self.daemon.default_probe.up_threshold),
+            ("downThreshold", self.daemon.default_probe.down_threshold),
+        ] {
+            if value <= 0 {
+                return Err(format!(
+                    "daemon.defaultProbe.{name} must be positive (got {value})"
+                ));
+            }
+        }
         let mut seen_hostnames: HashMap<String, String> = HashMap::new();
         // Sort peer names for deterministic error messages -- Go's map
         // iteration is randomized, so this is a small, harmless
@@ -316,6 +328,12 @@ impl Config {
                 return Err(format!("peer \"{}\": hostnames must not be empty", name));
             }
             for h in &p.hostnames {
+                if h.is_empty() || h.chars().any(char::is_whitespace) || h.contains('#') {
+                    return Err(format!(
+                        "peer \"{}\": hostname {:?} is not one hosts-file token",
+                        name, h
+                    ));
+                }
                 if let Some(owner) = seen_hostnames.get(h) {
                     return Err(format!(
                         "hostname \"{}\" claimed by both peer \"{}\" and peer \"{}\"",
@@ -328,6 +346,12 @@ impl Config {
             for (i, t) in p.transports.iter().enumerate() {
                 validate_probe(&t.probe)
                     .map_err(|e| format!("peer \"{}\" transport[{}]: {}", name, i, e))?;
+                if !t.address.is_empty() && t.address.parse::<std::net::IpAddr>().is_err() {
+                    return Err(format!(
+                        "peer \"{}\" transport[{}]: address must be an IPv4 or IPv6 literal",
+                        name, i
+                    ));
+                }
             }
             if p.on_all_down != ON_ALL_DOWN_LAST_KNOWN_GOOD
                 && p.on_all_down != ON_ALL_DOWN_UNPUBLISH
@@ -480,6 +504,22 @@ fn validate_probe(p: &Probe) -> Result<(), String> {
     if p.method == "exec" && p.exec.is_empty() {
         return Err("probe.method=exec requires probe.exec".to_string());
     }
+    if matches!(p.method.as_str(), "tcp" | "http") && !(1..=65_535).contains(&p.port) {
+        return Err(format!(
+            "probe.port must be in 1..65535 for {} (got {})",
+            p.method, p.port
+        ));
+    }
+    for (name, value) in [
+        ("intervalMs", p.interval_ms),
+        ("timeoutMs", p.timeout_ms),
+        ("upThreshold", p.up_threshold),
+        ("downThreshold", p.down_threshold),
+    ] {
+        if value <= 0 {
+            return Err(format!("probe.{name} must be positive (got {value})"));
+        }
+    }
     Ok(())
 }
 
@@ -531,6 +571,40 @@ mod tests {
         )
         .expect_err("duplicate stable identities must not load");
         assert!(err.to_string().contains("same stable id"), "{err}");
+    }
+
+    #[test]
+    fn hand_written_config_rejects_wrapping_ports_and_non_positive_timing() {
+        for probe in [
+            r#"{"method":"tcp","port":70000}"#,
+            r#"{"method":"tcp","timeoutMs":-1}"#,
+            r#"{"method":"tcp","intervalMs":-1}"#,
+            r#"{"method":"tcp","upThreshold":-1}"#,
+            r#"{"method":"tcp","downThreshold":-1}"#,
+        ] {
+            let json = format!(
+                r#"{{"peers":{{"host":{{"hostnames":["host"],"transports":[{{"address":"192.0.2.10","priority":10,"probe":{probe}}}]}}}}}}"#
+            );
+            assert!(load_str(&json).is_err(), "unsafe probe loaded: {probe}");
+        }
+    }
+
+    #[test]
+    fn invalid_daemon_probe_defaults_fail_even_without_transports() {
+        let err = load_str(r#"{"daemon":{"defaultProbe":{"timeoutMs":-1}}}"#)
+            .expect_err("an invalid unused default must not load");
+        assert!(err.to_string().contains("defaultProbe.timeoutMs"), "{err}");
+    }
+
+    #[test]
+    fn hosts_file_tokens_are_validated_before_publication() {
+        let err = load_str(
+            r##"{"peers":{"host":{"hostnames":["host\n# injected"],"transports":[
+              {"address":"192.0.2.10","priority":10}
+            ]}}}"##,
+        )
+        .expect_err("a multi-line hostname must not load");
+        assert!(err.to_string().contains("hosts-file token"), "{err}");
     }
 
     const ONE_UPLINK: &str = r#"{

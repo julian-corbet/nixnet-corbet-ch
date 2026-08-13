@@ -45,11 +45,15 @@ fn write_impl(
 ) -> io::Result<()> {
     let mut tmp = tempfile::Builder::new().prefix(prefix).tempfile_in(dir)?;
     tmp.write_all(data)?;
-    tmp.as_file().sync_all()?;
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))?;
     }
+    tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|e| e.error)?;
+    // fsyncing the file makes its bytes durable; fsyncing the containing
+    // directory makes the rename itself durable. Without this, a clean
+    // atomic state update may disappear after power loss.
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
