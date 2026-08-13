@@ -94,6 +94,13 @@ impl Probe {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Transport {
+    /// Stable identity within its peer/uplink group. When omitted, the
+    /// loader derives one from the transport's mechanism-defining fields.
+    /// Priority and probe cadence are deliberately excluded: changing
+    /// policy must not transplant or discard health state, while changing
+    /// the actual path being probed must start cold.
+    #[serde(deserialize_with = "null_as_empty_string")]
+    pub id: String,
     #[serde(deserialize_with = "null_as_empty_string")]
     pub address: String,
     #[serde(deserialize_with = "null_as_empty_string")]
@@ -272,6 +279,7 @@ impl Config {
                 if t.probe.target.is_empty() {
                     t.probe.target = t.address.clone();
                 }
+                assign_transport_id(t);
             }
         }
 
@@ -285,6 +293,7 @@ impl Config {
             }
             for t in uplink.transports.iter_mut() {
                 t.probe.apply_defaults(&default_probe);
+                assign_transport_id(t);
             }
         }
     }
@@ -315,6 +324,7 @@ impl Config {
                 }
                 seen_hostnames.insert(h.clone(), name.clone());
             }
+            validate_transport_ids("peer", name, &p.transports)?;
             for (i, t) in p.transports.iter().enumerate() {
                 validate_probe(&t.probe)
                     .map_err(|e| format!("peer \"{}\" transport[{}]: {}", name, i, e))?;
@@ -348,6 +358,7 @@ impl Config {
         uplink_names.sort();
         for name in uplink_names {
             let u = &self.uplinks[name];
+            validate_transport_ids("uplink", name, &u.transports)?;
             // TF-3 requires that no two transports of a subject share a
             // metric, and that the winner's is the lowest. Both are
             // delivered by spacing the ranking `metricStep` apart, which
@@ -409,6 +420,53 @@ impl Config {
     }
 }
 
+/// FNV-1a is sufficient here: this is a deterministic compact key, not a
+/// security boundary. Keeping the derivation in the config loader means the
+/// Nix-rendered and hand-written JSON paths use exactly the same identity.
+fn assign_transport_id(t: &mut Transport) {
+    if !t.id.is_empty() {
+        return;
+    }
+
+    let canonical = format!(
+        "provider={}\ninterface={}\naddress={}\nmethod={}\ntarget={}\nport={}\npath={}\nbind={}\nexec={}",
+        t.provider_id,
+        t.interface,
+        t.address,
+        t.probe.method,
+        t.probe.target,
+        t.probe.port,
+        t.probe.path,
+        t.probe.bind_to_interface,
+        t.probe.exec,
+    );
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in canonical.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    t.id = format!("auto-{hash:016x}");
+}
+
+fn validate_transport_ids(kind: &str, name: &str, transports: &[Transport]) -> Result<(), String> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for (i, transport) in transports.iter().enumerate() {
+        if transport.id.trim().is_empty() {
+            return Err(format!(
+                "{} \"{}\" transport[{}]: id must not be empty",
+                kind, name, i
+            ));
+        }
+        if let Some(first) = seen.insert(transport.id.as_str(), i) {
+            return Err(format!(
+                "{} \"{}\": transport[{}] and transport[{}] have the same stable id \"{}\"",
+                kind, name, first, i, transport.id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_probe(p: &Probe) -> Result<(), String> {
     match p.method.as_str() {
         "tcp" | "icmp" | "http" | "exec" => {}
@@ -434,6 +492,45 @@ mod tests {
         let path = dir.path().join("config.json");
         std::fs::write(&path, json).unwrap();
         load(&path)
+    }
+
+    #[test]
+    fn derived_transport_identity_survives_list_reordering() {
+        let first = load_str(
+            r#"{"peers":{"host":{"hostnames":["host"],"transports":[
+              {"address":"192.0.2.10","priority":10},
+              {"address":"192.0.2.20","priority":20}
+            ]}}}"#,
+        )
+        .unwrap();
+        let reordered = load_str(
+            r#"{"peers":{"host":{"hostnames":["host"],"transports":[
+              {"address":"192.0.2.20","priority":20},
+              {"address":"192.0.2.10","priority":10}
+            ]}}}"#,
+        )
+        .unwrap();
+
+        let ids = |cfg: &Config| {
+            cfg.peers["host"]
+                .transports
+                .iter()
+                .map(|tr| (tr.address.clone(), tr.id.clone()))
+                .collect::<HashMap<_, _>>()
+        };
+        assert_eq!(ids(&first), ids(&reordered));
+    }
+
+    #[test]
+    fn duplicate_explicit_transport_ids_are_rejected() {
+        let err = load_str(
+            r#"{"peers":{"host":{"hostnames":["host"],"transports":[
+              {"id":"same-path","address":"192.0.2.10","priority":10},
+              {"id":"same-path","address":"192.0.2.20","priority":20}
+            ]}}}"#,
+        )
+        .expect_err("duplicate stable identities must not load");
+        assert!(err.to_string().contains("same stable id"), "{err}");
     }
 
     const ONE_UPLINK: &str = r#"{

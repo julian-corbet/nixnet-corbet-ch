@@ -92,20 +92,13 @@ fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = Shutdown::new();
     install_signal_handlers(shutdown.clone())?;
 
-    if let Err(e) = sdnotify::notify("READY=1") {
-        logf!(
-            "sd_notify READY=1: {} (continuing -- likely not running under systemd)",
-            e
-        );
-    }
-
-    // Watchdog heartbeat: deliberately independent of probe cycles so a
-    // wedged event loop still gets caught even if every individual
-    // transport's ticker is somehow fine. A separate, cheap thread, not
-    // threaded through the engine.
+    // The heartbeat thread is cheap, but its verdict is the engine's real
+    // bounded progress. It sends nothing before run_with_ready establishes
+    // worker supervision and initial publication.
     if let Some(interval) = sdnotify::watchdog_interval() {
         let sd = shutdown.clone();
-        std::thread::spawn(move || heartbeat(sd, interval));
+        let watchdog_engine = Arc::clone(&eng);
+        std::thread::spawn(move || heartbeat(watchdog_engine, sd, interval));
     }
 
     logf!(
@@ -113,14 +106,26 @@ fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         peer_count,
         uplink_count
     );
-    eng.run(shutdown);
+    eng.run_with_ready(shutdown, || {
+        if let Err(e) = sdnotify::notify("READY=1") {
+            logf!(
+                "sd_notify READY=1: {} (continuing -- likely not running under systemd)",
+                e
+            );
+        }
+    });
     Ok(())
 }
 
-fn heartbeat(shutdown: Shutdown, interval: Duration) {
+fn heartbeat(engine: Arc<Engine>, shutdown: Shutdown, interval: Duration) {
+    let stall_limit = interval.checked_mul(2).unwrap_or(interval);
     loop {
         if shutdown.wait(interval) {
             return;
+        }
+        if !engine.watchdog_healthy(stall_limit) {
+            logf!("watchdog: engine progress is stale; withholding heartbeat");
+            continue;
         }
         if let Err(e) = sdnotify::notify("WATCHDOG=1") {
             logf!("sd_notify WATCHDOG=1: {}", e);

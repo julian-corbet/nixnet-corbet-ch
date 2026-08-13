@@ -136,6 +136,18 @@ let
 
   transportType = types.submodule ({ config, ... }: {
     options = {
+      id = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Stable identity for persisted health state within this peer or
+          uplink. List order is never identity. When null, nixnetd derives a
+          deterministic ID from the path-defining fields (provider,
+          interface, address and probe target/method). Set this explicitly
+          when two transports intentionally have the same mechanism shape.
+        '';
+      };
+
       address = mkOption {
         type = types.nullOr types.str;
         default = null;

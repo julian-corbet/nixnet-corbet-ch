@@ -17,17 +17,27 @@ use super::{EngineState, Group, GroupKind, TransportState};
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct PersistedTransport {
+    /// Stable transport identity. State files written before this field
+    /// intentionally cold-start rather than guessing by list position.
+    id: String,
     state: String,
     consecutive_success: i64,
     consecutive_failure: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
     address: String,
+    #[serde(with = "rfc3339_opt", skip_serializing_if = "Option::is_none")]
+    last_success_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct PersistedGroup {
-    winner: i64, // -1 == none
+    #[serde(skip_serializing_if = "String::is_empty")]
+    winner_id: String,
+    /// Accepted only so an old state file remains parseable. It is never
+    /// used for restore: list position is not identity.
+    #[serde(rename = "winner", skip_serializing)]
+    _legacy_winner: i64,
     #[serde(with = "rfc3339_opt", skip_serializing_if = "Option::is_none")]
     winner_since: Option<OffsetDateTime>,
     /// STALE-2: when a successful probe last confirmed
@@ -47,7 +57,8 @@ struct PersistedGroup {
 impl Default for PersistedGroup {
     fn default() -> Self {
         Self {
-            winner: -1,
+            winner_id: String::new(),
+            _legacy_winner: -1,
             winner_since: None,
             confirmed_at: None,
             degraded: false,
@@ -167,22 +178,27 @@ fn restore(groups: &mut HashMap<String, Group>, saved: &HashMap<String, Persiste
             Some(pg) => pg,
             None => continue,
         };
-        g.winner = if pg.winner >= 0 && (pg.winner as usize) < g.transports.len() {
-            Some(pg.winner as usize)
+        g.winner = if pg.winner_id.is_empty() {
+            None
         } else {
-            None // transports list shrank across a config change, or there was never a winner
+            g.transports.iter().position(|tr| tr.key == pg.winner_id)
         };
         g.winner_since = pg.winner_since;
         g.last_confirmed_at = pg.confirmed_at;
         g.degraded = pg.degraded;
         g.last_published_addr = pg.last_published_address.clone();
         expire_restored_last_known_good(name, g, now);
+        let saved_by_id: HashMap<&str, &PersistedTransport> = pg
+            .transports
+            .iter()
+            .filter(|tr| !tr.id.is_empty())
+            .map(|tr| (tr.id.as_str(), tr))
+            .collect();
         let mut winner_static_address_changed = false;
-        for (i, pt) in pg.transports.iter().enumerate() {
-            if i >= g.transports.len() {
-                break;
-            }
-            let tr = &mut g.transports[i];
+        for (i, tr) in g.transports.iter_mut().enumerate() {
+            let Some(pt) = saved_by_id.get(tr.key.as_str()).copied() else {
+                continue;
+            };
             tr.state = match pt.state.as_str() {
                 "up" => TransportState::Up,
                 "down" => TransportState::Down,
@@ -190,6 +206,7 @@ fn restore(groups: &mut HashMap<String, Group>, saved: &HashMap<String, Persiste
             };
             tr.consecutive_success = pt.consecutive_success;
             tr.consecutive_failure = pt.consecutive_failure;
+            tr.last_success_at = pt.last_success_at;
 
             // A configured address is the declaration, not a cache hint.
             // Restoring an old effective address over it made an edited
@@ -213,6 +230,19 @@ fn restore(groups: &mut HashMap<String, Group>, saved: &HashMap<String, Persiste
                     winner_static_address_changed |= g.winner == Some(i);
                 }
             }
+        }
+
+        // The old format named its winner and transports by list position.
+        // Reusing that evidence after a reorder is worse than a cold start:
+        // it can immediately publish the wrong address or promote the wrong
+        // uplink. A missing current winner therefore invalidates the group
+        // publication, while individually matched transports may still keep
+        // their own counters.
+        if g.winner.is_none() && !g.last_published_addr.is_empty() {
+            g.winner_since = None;
+            g.last_published_addr.clear();
+            g.last_confirmed_at = None;
+            g.degraded = true;
         }
 
         if winner_static_address_changed {
@@ -269,7 +299,11 @@ fn dump(groups: &HashMap<String, Group>) -> HashMap<String, PersistedGroup> {
     let mut out = HashMap::new();
     for (name, g) in groups {
         let mut pg = PersistedGroup {
-            winner: g.winner.map(|w| w as i64).unwrap_or(-1),
+            winner_id: g
+                .winner
+                .map(|w| g.transports[w].key.clone())
+                .unwrap_or_default(),
+            _legacy_winner: -1,
             winner_since: g.winner_since,
             confirmed_at: g.last_confirmed_at,
             degraded: g.degraded,
@@ -278,10 +312,12 @@ fn dump(groups: &HashMap<String, Group>) -> HashMap<String, PersistedGroup> {
         };
         for tr in &g.transports {
             pg.transports.push(PersistedTransport {
+                id: tr.key.clone(),
                 state: tr.state.as_str().to_string(),
                 consecutive_success: tr.consecutive_success,
                 consecutive_failure: tr.consecutive_failure,
                 address: tr.current_address.clone(),
+                last_success_at: tr.last_success_at,
             });
         }
         out.insert(name.clone(), pg);
@@ -324,16 +360,20 @@ mod tests {
             Some(ts) => format!(",\n        \"confirmedAt\": \"{ts}\""),
             None => String::new(),
         };
+        let transport_confirmed = match confirmed_at {
+            Some(ts) => format!(", \"lastSuccessAt\": \"{ts}\""),
+            None => String::new(),
+        };
         std::fs::write(
             path,
             format!(
                 r#"{{
   "peers": {{
     "host-b": {{
-      "winner": 0,
+      "winnerId": "{addr}",
       "degraded": {degraded},
       "lastPublishedAddress": "{addr}"{confirmed},
-      "transports": [ {{ "state": "down", "consecutiveSuccess": 0, "consecutiveFailure": 48000 }} ]
+      "transports": [ {{ "id": "{addr}", "state": "down", "consecutiveSuccess": 0, "consecutiveFailure": 48000{transport_confirmed} }} ]
     }}
   }},
   "uplinks": {{}}
@@ -537,6 +577,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restore_matches_transports_and_winner_by_stable_identity() {
+        let (eng, dir) = new_test_engine();
+        let mut original = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let lan = add_transport(&mut original, 10, "192.0.2.10");
+        let overlay = add_transport(&mut original, 20, "100.64.0.10");
+        original.transports[lan].state = super::TransportState::Down;
+        original.transports[lan].consecutive_failure = 7;
+        original.transports[overlay].state = super::TransportState::Up;
+        original.transports[overlay].consecutive_success = 11;
+        original.winner = Some(overlay);
+        original.last_published_addr = "100.64.0.10".into();
+        original.last_confirmed_at = Some(ago(5));
+        eng.state
+            .lock()
+            .unwrap()
+            .peers
+            .insert("host-b".into(), original);
+        {
+            let state = eng.state.lock().unwrap();
+            eng.save_state_locked(&state);
+        }
+
+        let mut reordered = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let overlay_now_first = add_transport(&mut reordered, 20, "100.64.0.10");
+        let lan_now_second = add_transport(&mut reordered, 10, "192.0.2.10");
+        let mut fresh = EngineState {
+            peers: HashMap::from([("host-b".into(), reordered)]),
+            uplinks: HashMap::new(),
+            ..Default::default()
+        };
+        Engine::load_state(&dir.path().join("state.json"), &mut fresh);
+
+        let restored = &fresh.peers["host-b"];
+        assert_eq!(restored.winner, Some(overlay_now_first));
+        assert_eq!(
+            restored.transports[overlay_now_first].state,
+            super::TransportState::Up
+        );
+        assert_eq!(
+            restored.transports[overlay_now_first].consecutive_success,
+            11
+        );
+        assert_eq!(
+            restored.transports[lan_now_second].state,
+            super::TransportState::Down
+        );
+        assert_eq!(restored.transports[lan_now_second].consecutive_failure, 7);
+    }
+
+    #[test]
+    fn legacy_position_only_state_cold_starts_instead_of_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"peers":{"host-b":{"winner":0,"degraded":false,
+              "lastPublishedAddress":"192.0.2.10",
+              "transports":[{"state":"up","address":"192.0.2.10"}]}},"uplinks":{}}"#,
+        )
+        .unwrap();
+        let mut group = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        add_transport(&mut group, 10, "192.0.2.10");
+        let mut state = EngineState {
+            peers: HashMap::from([("host-b".into(), group)]),
+            uplinks: HashMap::new(),
+            ..Default::default()
+        };
+
+        Engine::load_state(&path, &mut state);
+        let restored = &state.peers["host-b"];
+        assert_eq!(restored.winner, None);
+        assert_eq!(restored.last_published_addr, "");
+        assert_eq!(restored.transports[0].state, super::TransportState::Unknown);
+    }
+
     /// A corrupt state file is a logged COLD START, never an error and
     /// never a crash loop: this is the layer that makes the host reachable
     /// at all, and under `Restart=always` a refusal to start is a machine
@@ -573,10 +689,10 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::write(
             &path,
-            r#"{"peers":{},"uplinks":{"internet":{"winner":0,"degraded":true,
+            r#"{"peers":{},"uplinks":{"internet":{"winnerId":"192.0.2.10","degraded":true,
                "lastPublishedAddress":"192.0.2.10",
                "confirmedAt":"2000-01-01T00:00:00Z",
-               "transports":[{"state":"down"}]}}}"#,
+               "transports":[{"id":"192.0.2.10","state":"down"}]}}}"#,
         )
         .unwrap();
 
@@ -606,10 +722,10 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::write(
             &path,
-            r#"{"peers":{"host-b":{"winner":0,"winnerSince":"2026-08-05T08:00:00Z",
+            r#"{"peers":{"host-b":{"winnerId":"192.0.2.10","winnerSince":"2026-08-05T08:00:00Z",
                "confirmedAt":"2026-08-05T08:00:00Z","degraded":false,
                "lastPublishedAddress":"192.0.2.10",
-               "transports":[{"state":"up","consecutiveSuccess":7,"address":"192.0.2.10"}]}},"uplinks":{}}"#,
+               "transports":[{"id":"192.0.2.10","state":"up","consecutiveSuccess":7,"address":"192.0.2.10"}]}},"uplinks":{}}"#,
         )
         .unwrap();
 
@@ -643,9 +759,9 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::write(
             &path,
-            r#"{"peers":{"host-b":{"winner":0,"degraded":false,
+            r#"{"peers":{"host-b":{"winnerId":"test-dynamic","degraded":false,
                "lastPublishedAddress":"100.64.42.10",
-               "transports":[{"state":"up","consecutiveSuccess":7,"address":"100.64.42.10"}]}},"uplinks":{}}"#,
+               "transports":[{"id":"test-dynamic","state":"up","consecutiveSuccess":7,"address":"100.64.42.10"}]}},"uplinks":{}}"#,
         )
         .unwrap();
 
@@ -684,6 +800,7 @@ mod tests {
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
             state: std::sync::Mutex::new(EngineState::default()),
+            initialized: std::sync::atomic::AtomicBool::new(false),
         };
         let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
         g.last_published_addr = "192.0.2.10".into();

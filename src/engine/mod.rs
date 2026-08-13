@@ -20,8 +20,9 @@ mod state;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -69,12 +70,19 @@ struct TransportRuntime {
     spec: config::Transport,
     /// Human-readable id for logs/status, e.g. "peer/host-b#0(lan)".
     id: String,
+    /// Stable persisted identity. List position is presentation only.
+    key: String,
 
     state: TransportState,
     consecutive_success: i64,
     consecutive_failure: i64,
     current_address: String,
     detail: String,
+    /// Successful observation backing this transport's effective address.
+    last_success_at: Option<OffsetDateTime>,
+    /// Monotonic worker progress used by the systemd watchdog.
+    probe_started_at: Option<Instant>,
+    next_probe_due: Option<Instant>,
 }
 
 struct Group {
@@ -150,6 +158,7 @@ pub struct Engine {
     state_path: PathBuf,
 
     state: Mutex<EngineState>,
+    initialized: AtomicBool,
 }
 
 /// One currently-healthy candidate, ordered by priority within
@@ -245,6 +254,7 @@ impl Engine {
             for (i, t) in p.transports.into_iter().enumerate() {
                 let id = transport_id(GroupKind::Peer, &name, i, &t);
                 transports.push(TransportRuntime {
+                    key: t.id.clone(),
                     spec: t,
                     id,
                     state: TransportState::Unknown,
@@ -252,6 +262,9 @@ impl Engine {
                     consecutive_failure: 0,
                     current_address: String::new(),
                     detail: String::new(),
+                    last_success_at: None,
+                    probe_started_at: None,
+                    next_probe_due: None,
                 });
             }
             peers.insert(
@@ -282,6 +295,7 @@ impl Engine {
             for (i, t) in u.transports.into_iter().enumerate() {
                 let id = transport_id(GroupKind::Uplink, &name, i, &t);
                 transports.push(TransportRuntime {
+                    key: t.id.clone(),
                     spec: t,
                     id,
                     state: TransportState::Unknown,
@@ -289,6 +303,9 @@ impl Engine {
                     consecutive_failure: 0,
                     current_address: String::new(),
                     detail: String::new(),
+                    last_success_at: None,
+                    probe_started_at: None,
+                    next_probe_due: None,
                 });
             }
             uplinks.insert(
@@ -328,6 +345,7 @@ impl Engine {
             status_path,
             state_path,
             state: Mutex::new(state),
+            initialized: AtomicBool::new(false),
         }
     }
 
@@ -339,13 +357,26 @@ impl Engine {
         self.state.lock().unwrap().uplinks.len()
     }
 
-    /// Starts one thread per transport and blocks until every one of them
-    /// observes `shutdown`. Probe/publish errors are logged and reflected
-    /// in status.json, never fatal to the daemon itself -- a single bad
-    /// transport must never take the whole daemon down.
+    /// Starts one thread per transport and blocks until shutdown.
     pub fn run(self: Arc<Self>, shutdown: Shutdown) {
+        self.run_with_ready(shutdown, || {});
+    }
+
+    /// Calls `ready` only after workers exist and restored publications
+    /// have been attempted. This is the only honest `READY=1` boundary.
+    pub fn run_with_ready<F>(self: Arc<Self>, shutdown: Shutdown, ready: F)
+    where
+        F: FnOnce(),
+    {
         let keys = self.transport_keys();
         let mut handles = Vec::with_capacity(keys.len());
+        {
+            let mut state = self.state.lock().unwrap();
+            let now = Instant::now();
+            for (kind, name, idx) in &keys {
+                state.group_mut(*kind, name).transports[*idx].next_probe_due = Some(now);
+            }
+        }
         for key in keys {
             let eng = Arc::clone(&self);
             let sd = shutdown.clone();
@@ -373,6 +404,8 @@ impl Engine {
         // it.
         self.publish_restored_peers();
         self.publish_restored_uplinks();
+        self.initialized.store(true, Ordering::Release);
+        ready();
 
         // A host with zero peer groups and zero uplink groups configured
         // (nixnet enabled ahead of any real config -- a legitimate,
@@ -389,12 +422,56 @@ impl Engine {
         // once that lands) or SIGTERM/SIGINT ends it the normal way.
         if handles.is_empty() {
             while !shutdown.wait(Duration::from_secs(3600)) {}
+            self.initialized.store(false, Ordering::Release);
             return;
         }
 
-        for h in handles {
-            let _ = h.join();
+        while !shutdown.is_set() {
+            if handles.iter().any(|h| h.is_finished()) {
+                logf!(
+                    "engine: a transport worker exited unexpectedly; terminating so systemd can restart the complete supervisor"
+                );
+                self.initialized.store(false, Ordering::Release);
+                shutdown.trigger();
+                break;
+            }
+            if shutdown.wait(Duration::from_millis(250)) {
+                break;
+            }
         }
+
+        for h in handles {
+            if h.join().is_err() {
+                logf!("engine: transport worker panicked");
+            }
+        }
+        self.initialized.store(false, Ordering::Release);
+    }
+
+    /// True only while the real engine is making bounded progress. A
+    /// wedged state lock, stuck probe/publisher, or retired worker stops
+    /// the heartbeat instead of being hidden by an independent timer.
+    pub fn watchdog_healthy(&self, stall_limit: Duration) -> bool {
+        if !self.initialized.load(Ordering::Acquire) {
+            return false;
+        }
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) | Err(TryLockError::Poisoned(_)) => return false,
+        };
+        let now = Instant::now();
+        state
+            .peers
+            .values()
+            .chain(state.uplinks.values())
+            .flat_map(|g| g.transports.iter())
+            .all(|tr| match tr.probe_started_at {
+                Some(started) => now.saturating_duration_since(started) <= stall_limit,
+                None => tr
+                    .next_probe_due
+                    .and_then(|due| due.checked_add(stall_limit))
+                    .is_some_and(|deadline| now <= deadline),
+            })
     }
 
     fn transport_keys(&self) -> Vec<(GroupKind, String, usize)> {
@@ -428,10 +505,32 @@ impl Engine {
             Duration::from_millis(interval_ms as u64)
         };
 
+        let mut next = Instant::now();
         loop {
-            self.probe_once(kind, &name, idx);
-            if shutdown.wait(interval) {
+            let now = Instant::now();
+            if now < next && shutdown.wait(next.duration_since(now)) {
                 return;
+            }
+            {
+                let mut state = self.state.lock().unwrap();
+                let tr = &mut state.group_mut(kind, &name).transports[idx];
+                tr.probe_started_at = Some(Instant::now());
+                tr.next_probe_due = None;
+            }
+            self.probe_once(kind, &name, idx);
+            next = next.checked_add(interval).unwrap_or_else(Instant::now);
+            let now = Instant::now();
+            if next < now {
+                // Keep a start-to-start cadence, coalescing missed ticks so
+                // a slow probe neither stretches every future threshold nor
+                // creates a catch-up storm.
+                next = now;
+            }
+            {
+                let mut state = self.state.lock().unwrap();
+                let tr = &mut state.group_mut(kind, &name).transports[idx];
+                tr.probe_started_at = None;
+                tr.next_probe_due = Some(next);
             }
         }
     }
@@ -455,6 +554,7 @@ impl Engine {
             }
         };
 
+        let observed_at = OffsetDateTime::now_utc();
         let mut state = self.state.lock().unwrap();
         let (old_state, new_state, transition_count, tr_detail);
         {
@@ -469,6 +569,7 @@ impl Engine {
                 {
                     tr.state = TransportState::Up;
                 }
+                tr.last_success_at = Some(observed_at);
             } else {
                 tr.consecutive_success = 0;
                 tr.consecutive_failure += 1;
@@ -478,7 +579,10 @@ impl Engine {
                     tr.state = TransportState::Down;
                 }
             }
-            if !res.address.is_empty() {
+            // Only a healthy provider result may commit a newly-discovered
+            // address. Otherwise down-threshold hysteresis can publish an
+            // address that has never passed a probe.
+            if res.healthy && !res.address.is_empty() {
                 tr.current_address = res.address.clone();
             } else if tr.current_address.is_empty() {
                 tr.current_address = tr.spec.address.clone();
@@ -659,14 +763,6 @@ impl Engine {
                     Action::PublishPeers { passive: true }
                 }
             } else {
-                // Everything published for this group from here on is
-                // backed by a transport that just probed successfully:
-                // whichever candidate wins below is Up by construction.
-                // This stamp is what STALE-1 publishes and what STALE-2
-                // measures the age against, so it is set on the tick the
-                // confirmation happened, not on the tick something changed.
-                g.last_confirmed_at = Some(now);
-
                 if g.degraded {
                     g.degraded = false;
                     logf!(
@@ -716,6 +812,11 @@ impl Engine {
                         address_drift = true;
                     }
                 }
+
+                // Freshness belongs to the selected transport's last
+                // successful observation. A failed winner tick, or another
+                // transport's successful tick, must not refresh it.
+                g.last_confirmed_at = g.transports[new_winner].last_success_at;
 
                 if !winner_changed && !address_drift {
                     // The settled case, and the one the old code treated as
@@ -1060,9 +1161,9 @@ fn threshold(v: i64, def: i64) -> i64 {
     }
 }
 
-/// Derives a stable, readable log/status identifier. Transport identity
-/// itself is the list position (index) -- reordering a transports list in
-/// Nix is equivalent to removing and re-adding entries.
+/// Derives a readable log/status label. Persisted identity is the separate
+/// `TransportRuntime::key`; the index here is only useful to locate the
+/// declaration a human is looking at.
 fn transport_id(kind: GroupKind, group_name: &str, idx: usize, t: &config::Transport) -> String {
     let label = if !t.provider_id.is_empty() {
         t.provider_id.as_str()
@@ -1098,6 +1199,7 @@ mod tests {
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
             state: Mutex::new(EngineState::default()),
+            initialized: AtomicBool::new(false),
         };
         (eng, dir)
     }
@@ -1116,6 +1218,7 @@ mod tests {
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
             state: Mutex::new(EngineState::default()),
+            initialized: AtomicBool::new(false),
         };
         (eng, dir)
     }
@@ -1186,16 +1289,21 @@ mod tests {
     pub(super) fn add_uplink_transport(g: &mut Group, priority: i64, interface: &str) -> usize {
         g.transports.push(TransportRuntime {
             spec: config::Transport {
+                id: interface.to_string(),
                 priority,
                 interface: interface.to_string(),
                 ..Default::default()
             },
             id: interface.to_string(),
+            key: interface.to_string(),
             state: TransportState::Unknown,
             consecutive_success: 0,
             consecutive_failure: 0,
             current_address: String::new(),
             detail: String::new(),
+            last_success_at: Some(OffsetDateTime::now_utc()),
+            probe_started_at: None,
+            next_probe_due: None,
         });
         g.transports.len() - 1
     }
@@ -1208,18 +1316,28 @@ mod tests {
     /// specifically exercise a *changing* dynamic address mutate
     /// `transports[idx].current_address` directly afterward.
     pub(super) fn add_transport(g: &mut Group, priority: i64, address: &str) -> usize {
+        let key = if address.is_empty() {
+            "test-dynamic".to_string()
+        } else {
+            address.to_string()
+        };
         g.transports.push(TransportRuntime {
             spec: config::Transport {
+                id: key.clone(),
                 priority,
                 address: address.to_string(),
                 ..Default::default()
             },
-            id: address.to_string(),
+            id: key.clone(),
+            key,
             state: TransportState::Unknown,
             consecutive_success: 0,
             consecutive_failure: 0,
             current_address: address.to_string(),
             detail: String::new(),
+            last_success_at: Some(OffsetDateTime::now_utc()),
+            probe_started_at: None,
+            next_probe_due: None,
         });
         g.transports.len() - 1
     }
@@ -1260,6 +1378,43 @@ mod tests {
 
         shutdown.trigger();
         handle.join().expect("run() thread panicked");
+    }
+
+    #[test]
+    fn readiness_means_the_supervisor_watchdog_is_live() {
+        let (eng, _dir) = new_test_engine();
+        let eng = Arc::new(eng);
+        let shutdown = Shutdown::new();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let runner = Arc::clone(&eng);
+        let runner_shutdown = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            runner.run_with_ready(runner_shutdown, || ready_tx.send(()).unwrap())
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(eng.watchdog_healthy(Duration::from_secs(10)));
+
+        shutdown.trigger();
+        handle.join().unwrap();
+        assert!(!eng.watchdog_healthy(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn a_stuck_transport_makes_the_watchdog_withhold_heartbeats() {
+        let (eng, _dir) = new_test_engine();
+        let mut group = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let transport = add_transport(&mut group, 10, "192.0.2.10");
+        group.transports[transport].probe_started_at =
+            Instant::now().checked_sub(Duration::from_secs(30));
+        eng.state
+            .lock()
+            .unwrap()
+            .peers
+            .insert("host-b".into(), group);
+        eng.initialized.store(true, Ordering::Release);
+
+        assert!(!eng.watchdog_healthy(Duration::from_secs(10)));
     }
 
     /// Regression test for the 2026-08-03 production incident: `run()`
@@ -1333,6 +1488,7 @@ mod tests {
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
             state: Mutex::new(EngineState::default()),
+            initialized: AtomicBool::new(false),
         };
         // A configured peer whose winner was never established, i.e. no
         // state.json existed to restore a `last_published_addr` from.
@@ -1951,6 +2107,7 @@ mod tests {
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
             state: Mutex::new(EngineState::default()),
+            initialized: AtomicBool::new(false),
         };
         let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
         add_transport(&mut g, 10, "192.0.2.10"); // still Unknown: nothing has probed yet
@@ -2053,6 +2210,39 @@ mod tests {
         assert_eq!(
             staleness(Some(60), Some(now + time::Duration::hours(2)), now),
             Staleness::Fresh
+        );
+    }
+
+    #[test]
+    fn another_transports_tick_does_not_refresh_the_winners_evidence() {
+        let (eng, _dir) = new_test_engine();
+        let mut group = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        let winner = add_transport(&mut group, 10, "192.0.2.10");
+        let other = add_transport(&mut group, 20, "192.0.2.20");
+        group.transports[winner].state = TransportState::Up;
+        group.transports[other].state = TransportState::Up;
+        group.transports[winner].last_success_at = Some(ago(3600));
+        group.transports[other].last_success_at = Some(OffsetDateTime::now_utc());
+        group.winner = Some(winner);
+        group.winner_since = Some(ago(3600));
+        group.last_published_addr = "192.0.2.10".into();
+        group.last_confirmed_at = Some(ago(3600));
+        eng.state
+            .lock()
+            .unwrap()
+            .peers
+            .insert("host-b".into(), group);
+
+        {
+            let mut state = eng.state.lock().unwrap();
+            eng.reconcile_locked(&mut state, GroupKind::Peer, "host-b");
+        }
+
+        let state = eng.state.lock().unwrap();
+        let confirmed = state.peers["host-b"].last_confirmed_at.unwrap();
+        assert!(
+            confirmed < ago(3500),
+            "a different transport laundered the stale winner into a fresh publication"
         );
     }
 
