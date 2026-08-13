@@ -62,7 +62,9 @@ let
         echo "nixnet-cloudflared-drift-check: metrics endpoint (${cfg.metricsAddr}) not responding -- tunnel daemon down or wedged"
         drift=1
       else
-        ready_connections=$(echo "$ready_json" | jq -r '.readyConnections // 0')
+        ready_connections=$(echo "$ready_json" | jq -r \
+          'if type == "object" and (.readyConnections | type) == "number" then (.readyConnections | floor) else 0 end' \
+          2>/dev/null || echo 0)
         if [ "$ready_connections" -lt 1 ]; then
           echo "nixnet-cloudflared-drift-check: readyConnections=$ready_connections -- no live edge connections (daemon running, tunnel not actually serving)"
           drift=1
@@ -83,7 +85,9 @@ let
       # driftFailureThreshold) before counting a failure at all, rather
       # than risk restarting a daemon that was already about to succeed.
       active_since_us=$(systemctl show ${lib.escapeShellArg cfg.tunnelUnit} -p ActiveEnterTimestampMonotonic --value 2>/dev/null || echo 0)
-      now_us=$(awk '{ printf "%d", $1 * 1000000 }' /proc/uptime)
+      case "$active_since_us" in *[!0-9]*) active_since_us=0 ;; esac
+      now_us=$(awk '{ printf "%.0f", $1 * 1000000 }' /proc/uptime)
+      if [ "$active_since_us" -gt "$now_us" ]; then active_since_us=0; fi
       age_sec=$(( (now_us - active_since_us) / 1000000 ))
       if [ "$age_sec" -lt ${toString (cfg.checkIntervalSec * cfg.driftFailureThreshold)} ]; then
         echo "nixnet-cloudflared-drift-check: drift-shaped reading but ${cfg.tunnelUnit} only active ''${age_sec}s -- within startup grace, not counting"
@@ -92,7 +96,10 @@ let
 
       count=0
       [ -r "$drift_count_file" ] && count=$(cat "$drift_count_file")
-      count=$((count + 1))
+      case "$count" in *[!0-9]*) count=0 ;; esac
+      if [ "$count" -lt ${toString cfg.driftFailureThreshold} ]; then
+        count=$((count + 1))
+      fi
       echo "$count" > "$drift_count_file"
 
       if [ "$count" -lt ${toString cfg.driftFailureThreshold} ]; then
@@ -103,15 +110,17 @@ let
       now=$(date +%s)
       last=0
       [ -r "$last_restart_file" ] && last=$(cat "$last_restart_file")
+      case "$last" in *[!0-9]*) last=0 ;; esac
+      if [ "$last" -gt "$now" ]; then last=0; fi
       elapsed=$((now - last))
       if [ "$elapsed" -lt ${toString cfg.minRestartIntervalSec} ]; then
         echo "nixnet-cloudflared-drift-check: threshold reached but rate-limited (last restart ''${elapsed}s ago, min ${toString cfg.minRestartIntervalSec}s) -- waiting"
         exit 0
       fi
 
-      echo "$now" > "$last_restart_file"
       echo "NIXNET_CLOUDFLARED_RESTART count=$count reason=drift-threshold-reached unit=${cfg.tunnelUnit}"
       systemctl restart ${lib.escapeShellArg cfg.tunnelUnit}
+      echo "$now" > "$last_restart_file"
       rm -f "$drift_count_file"
     '';
   };
@@ -206,6 +215,7 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${driftCheckScript}/bin/nixnet-cloudflared-drift-check";
+        TimeoutStartSec = "2min";
         # Root: needs `systemctl restart` on cfg.tunnelUnit. Narrowly-scoped,
         # rate-limited oneshot, never a resident privileged process --
         # same privilege shape as netbird-provider's reprovision unit.

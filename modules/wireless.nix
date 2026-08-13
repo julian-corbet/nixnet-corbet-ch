@@ -63,6 +63,8 @@ let
   # about them" -- the same job `nixnet-firewall.service` does for its table.
   activeNetworks = lib.optionals cfg.enable
     (lib.filter (n: cfg.profiles ? ${n.name}) networkList);
+  activeSecretFiles = map (n: n.secretFile)
+    (lib.filter (n: n.secretFile != "") activeNetworks);
 
   declaredKinds = lib.unique (map (r: r.kind) radioList);
   hasWwanRadio = lib.elem "wwan" declaredKinds;
@@ -338,28 +340,33 @@ let
     name = "nixnet-radio-power";
     runtimeInputs = [ pkgs.coreutils pkgs.gnugrep pkgs.util-linux ];
     text = ''
-      # Serialised, and skipped rather than queued when another run holds the lock: every action
-      # this script takes generates the very events (a device down, a radio state change) that call
-      # it again. A queue would turn one cable change into a pile-up.
+      # Automatic events are skipped rather than queued when another run holds the lock: every
+      # action this script takes generates the same device/radio events that call it again. An
+      # explicit operator/test request blocks, however, because returning success without applying
+      # the requested policy is a lie.
       exec 9>/run/nixnet-radio-power.lock
-      flock -n 9 || exit 0
-
       state="''${1:-}"
+      if [ -n "$state" ]; then
+        flock 9
+      else
+        flock -n 9 || exit 0
+      fi
       if [ -z "$state" ]; then
-        state=ac
+        state=battery
         mains=0
         for supply in /sys/class/power_supply/*; do
           [ -r "$supply/type" ] || continue
           IFS= read -r supply_type < "$supply/type" || continue
           [ "$supply_type" = "Mains" ] || continue
           mains=1
-          online=1
+          online=0
           [ ! -r "$supply/online" ] || IFS= read -r online < "$supply/online" || true
-          [ "$online" = "1" ] || state=battery
+          # Several supplies can be called Mains (for example AC plus a dock). The machine is on
+          # mains when ANY of them is online, not only when every one is.
+          [ "$online" = "1" ] && state=ac
         done
         # No mains supply at all is a desktop, a server or a VM: there is no battery to save, so
-        # the AC policy is the honest answer rather than a default that powers radios down on a
-        # machine that is plugged into a wall.
+        # the AC policy is the honest answer.
         [ "$mains" = 1 ] || state=ac
       fi
 
@@ -369,16 +376,17 @@ let
         *) echo "usage: nixnet-radio-power [ac|battery]" >&2; exit 2 ;;
       esac
 
+      # One daemon query per decision, not one per declared radio. Capturing before grep also
+      # avoids grep -q closing a pipe early under pipefail and turning a match into an error.
+      device_states=$(${cfg.nmcli} --terse --fields DEVICE,STATE device)
       is_connected() {
-        ${cfg.nmcli} --terse --fields DEVICE,STATE device | grep -qx "$1:connected"
+        grep -qx "$1:connected" <<<"$device_states"
       }
 
       set_radio() {
         ${cfg.nmcli} radio "$1" "$2"
       }
 
-      # The winner, by the one order this repo has: lowest priority among radios that are actually
-      # associated right now.
       winner_kind=""
       winner_priority=1000
       ${lib.concatMapStrings
@@ -390,9 +398,8 @@ let
         '')
         radioList}
 
-      # NOTHING is associated. Powering radios down here would not be saving power on an idle link,
-      # it would be removing the machine's last way back onto a network -- and a policy that can do
-      # that has stopped being a power policy. Everything on, regardless of state.
+      # NOTHING is associated. Powering radios down would remove the machine's last way back onto
+      # a network, so every radio remains available for recovery.
       if [ -z "$winner_kind" ]; then
         policy=all
       fi
@@ -799,11 +806,18 @@ in
         # case, not a fault -- and that is why the script asks whether NetworkManager is reachable
         # instead of reading a reload's exit status. See the assembly script for what was measured.
         before = [ "NetworkManager.service" ];
+        unitConfig = {
+          RequiresMountsFor = activeSecretFiles;
+          StartLimitIntervalSec = 0;
+        };
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
           UMask = "0077";
           ExecStart = "${assembleScript}/bin/nixnet-wireless-profiles";
+          Restart = "on-failure";
+          RestartSec = "30s";
+          TimeoutStartSec = "2min";
         };
       };
     }

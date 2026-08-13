@@ -874,11 +874,11 @@ the HTTP-vs-L4-direct split it renders.
 
 ## Non-NixOS hosts (via `system-manager`)
 
-`nixosModules.core`/`.netbird-provider` need a real NixOS host. For a
-non-NixOS Linux box applying config with
+`nixosModules.netbird-provider` needs the upstream NixOS NetBird service
+and is therefore not exported for system-manager. For a non-NixOS Linux
+box applying the core daemon config with
 [numtide/system-manager](https://github.com/numtide/system-manager)
-instead, import `systemManagerModules.core`/`.netbird-provider` instead —
-same file, same schema:
+instead, import `systemManagerModules.core`:
 
 ```nix
 {

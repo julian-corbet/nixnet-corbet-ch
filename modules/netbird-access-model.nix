@@ -42,7 +42,7 @@
 # exist" hazard this module exists to catch. See the README's operator
 # runbook for the exact ordered steps, and this module's `renamedFrom`
 # field for how the audit helps confirm a rename actually landed.
-{ config, lib, pkgs, ... }:
+{ config, lib, options, pkgs, ... }:
 
 let
   cfg = config.nixnet.netbirdAccessModel;
@@ -453,7 +453,7 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf cfg.enable ({
     assertions = [
       {
         assertion = lib.elem cfg.internalGroup groupNames;
@@ -489,14 +489,6 @@ in
       '';
     };
 
-    # Wiring, not duplication: when the membership reconciler is also
-    # enabled on this host, its "every peer's default group" defaults to
-    # THIS module's internalGroup. A host that genuinely wants the two to
-    # diverge can still override netbirdGroupReconcile.catchAllGroup
-    # directly -- this only supplies the common-case default so the name
-    # is written once.
-    nixnet.netbirdGroupReconcile.catchAllGroup = lib.mkIf groupReconcileCfg.enable (lib.mkDefault cfg.internalGroup);
-
     systemd.services.nixnet-netbird-access-model-audit = lib.mkIf cfg.audit.enable {
       description = "Audit the live NetBird account's groups/policies/routes against the declared nixnet.netbirdAccessModel (read-only)";
       after = [ "network-online.target" ];
@@ -519,5 +511,13 @@ in
         Persistent = true;
       };
     };
-  };
+  } // lib.optionalAttrs
+    ((lib.hasAttrByPath [ "nixnet" "netbirdGroupReconcile" "catchAllGroup" ] options)
+      && groupReconcileCfg.enable) {
+    # Wiring, not duplication: when the membership reconciler is also
+    # imported and enabled on this host, its "every peer's default group"
+    # defaults to THIS module's internalGroup. Guarding on the sibling
+    # option keeps this module usable on its own.
+    nixnet.netbirdGroupReconcile.catchAllGroup = lib.mkDefault cfg.internalGroup;
+  });
 }

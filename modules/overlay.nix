@@ -21,6 +21,11 @@
 let
   cfg = config.nixnet.overlay;
   tl = import ../lib/tooling.nix { inherit lib; };
+  q = lib.escapeShellArg;
+
+  stripPort = url:
+    let match = builtins.match "(.*):[0-9]+" url;
+    in if match == null then url else builtins.head match;
 
   # This module writes an nftables table of its own (below), so it owes the host the same thing
   # modules/firewall.nix does: the means to READ that table. The failure is not hypothetical — a
@@ -478,53 +483,87 @@ in
     # on advertiseRoutes so only a routing peer carries it; idempotent -C
     # guard.
     # ── Headless enrollment ──────────────────────────────────────────────
-    # One-shot: bring the client up with the setup key if not already
-    # joined. Idempotent — skips when Management is already Connected.
+    # One-shot: reconnect an existing identity first, and use the setup key
+    # only when that cannot recover. Skips when management is already connected
+    # to the declared endpoint.
     # Ordered after the netbird daemon + network so `netbird up` can reach
     # the management server. Note: `nixnet.netbird`'s own reprovisioning
     # (netbird-provider.nix) is a stricter, LOUDLY-failing alternative to
-    # this same job for a host that also wants active drift detection —
-    # this oneshot only runs at unit start and silently no-ops (`exit 0`)
-    # when no setup key is present, so a host relying on it ALONE for
-    # recovery gets no signal when enrollment never happened.
+    # this same job for a host that also wants active drift detection. This
+    # oneshot only runs at unit start; failures are loud and retry every 30s.
     systemd.services.nixnet-overlay-enroll = {
       description = "Enroll ${cfg.hostname} into NetBird (${cfg.managementUrl})";
       after = [ "netbird.service" "network-online.target" ];
       wants = [ "netbird.service" "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
-      path = [ pkgs.netbird pkgs.coreutils ];
+      path = [ pkgs.netbird pkgs.coreutils pkgs.jq ];
+      unitConfig.StartLimitIntervalSec = 0;
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
         Restart = lib.mkDefault "on-failure";
-        RestartSec = lib.mkDefault "10s";
+        RestartSec = lib.mkDefault "30s";
+        TimeoutStartSec = "3min";
       };
       script = ''
         set -euo pipefail
+
+        connected_to_expected_management() {
+          local status_json mgmt_url normalized
+          status_json=$(netbird status --json 2>/dev/null || true)
+          mgmt_url=$(jq -r '.management.url // empty' <<<"$status_json" 2>/dev/null || true)
+          normalized="$mgmt_url"
+          case "''${mgmt_url##*:}" in
+            ""|*[!0-9]*) : ;;
+            *) normalized="''${mgmt_url%:*}" ;;
+          esac
+          [ "$(jq -r '.management.connected // false' <<<"$status_json" 2>/dev/null || echo false)" = true ] \
+            && { [ -z "$mgmt_url" ] || [ "$normalized" = ${q (stripPort cfg.managementUrl)} ]; }
+        }
+
+        wait_connected() {
+          for i in {1..30}; do
+            connected_to_expected_management && return 0
+            sleep 1
+          done
+          return 1
+        }
+
         # Wait for the daemon socket.
         for i in {1..30}; do
           if netbird status >/dev/null 2>&1; then break; fi
           sleep 1
         done
-        if netbird status 2>/dev/null | grep -q "Management: Connected"; then
+        if connected_to_expected_management; then
           echo "already enrolled and connected"
           exit 0
         fi
-        if [ ! -r "${cfg.setupKeyFile}" ]; then
-          echo "no setup key at ${cfg.setupKeyFile}; daemon is up — enroll once with:"
-          echo "  netbird up --management-url ${cfg.managementUrl} --setup-key <key> --hostname ${cfg.hostname}"
+
+        # Preserve an existing peer identity whenever possible. Re-keying a
+        # merely disconnected daemon can create a duplicate peer and orphan
+        # routes attached to the original server-side identity.
+        if timeout 30 netbird up --management-url ${q cfg.managementUrl} \
+            && wait_connected; then
+          echo "reconnected existing NetBird identity"
           exit 0
         fi
+
+        if [ ! -r ${q cfg.setupKeyFile} ]; then
+          echo "no readable setup key at ${cfg.setupKeyFile}; enrollment cannot proceed" >&2
+          exit 1
+        fi
+        netbird down || true
         # `--setup-key-file`, never `--setup-key "$(cat ...)"`: the latter
         # hands a long-lived, reusable setup key to netbird as an argv
         # element, and /proc/<pid>/cmdline is world-readable on a default
         # Linux host (no hidepid=, no ProtectProc=) -- any local uid could
         # read it and enroll an arbitrary peer into the account. The flag
         # reads the same root-readable file checked just above.
-        netbird up \
-          --management-url "${cfg.managementUrl}" \
-          --setup-key-file "${cfg.setupKeyFile}" \
-          --hostname "${cfg.hostname}"
+        timeout 30 netbird up \
+          --management-url ${q cfg.managementUrl} \
+          --setup-key-file ${q cfg.setupKeyFile} \
+          --hostname ${q cfg.hostname}
+        wait_connected
       '';
     };
     })

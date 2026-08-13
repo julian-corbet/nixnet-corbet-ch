@@ -981,7 +981,10 @@ in
         User = "nixnetd";
         Group = "nixnetd";
         RuntimeDirectory = cfg.daemon.runtimeDir;
-        StateDirectory = baseNameOf (toString cfg.daemon.stateDir);
+        # StateDirectory= is relative to /var/lib. Preserve the complete
+        # relative path: baseNameOf silently redirected a configured
+        # /var/lib/nixnet/state to /var/lib/state.
+        StateDirectory = removePrefix "/var/lib/" (toString cfg.daemon.stateDir);
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ReadWritePaths = [ "/run/${cfg.daemon.runtimeDir}" cfg.daemon.stateDir (dirOf cfg.daemon.hostsFile) ];

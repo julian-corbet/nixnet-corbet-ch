@@ -87,6 +87,11 @@ in
     testScript = ''
       machine.wait_for_unit("nixnet-wireless-profiles.service")
 
+      mounts = machine.succeed(
+          "systemctl show -p RequiresMountsFor --value nixnet-wireless-profiles.service"
+      )
+      assert "/run/test-secrets/wlan" in mounts, f"secret mount dependency missing: {mounts}"
+
       live = "/run/NetworkManager/system-connections/nixnet-home.nmconnection"
       template = "/etc/nixnet/wireless/nixnet-home.nmconnection"
       key = "${passphrase}"

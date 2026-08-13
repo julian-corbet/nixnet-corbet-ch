@@ -73,7 +73,6 @@
       # ---------------------------------------------------------------
       systemManagerModules.core = ./modules/core.nix;
       systemManagerModules.default = self.systemManagerModules.core;
-      systemManagerModules.netbird-provider = ./modules/netbird-provider.nix;
       systemManagerModules.cloudflared-provider = ./modules/cloudflared-provider.nix;
       systemManagerModules.backend = ./modules/backend.nix;
       systemManagerModules.wireguard = ./modules/wireguard.nix;

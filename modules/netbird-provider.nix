@@ -31,8 +31,9 @@
 # real value: a peer forked from its stable identity to a freshly-minted
 # duplicate, silently orphaning the LAN route the original peer advertised.
 #
-# Like modules/core.nix, this file is shared verbatim between
-# nixosModules.netbird-provider and systemManagerModules.netbird-provider.
+# This is a NixOS module: it extends upstream `services.netbird` and the
+# NixOS user/group database. It is deliberately not exported as a
+# system-manager module, whose option surface has neither.
 
 { lib, config, pkgs, ... }:
 
@@ -99,7 +100,10 @@ let
           # avoid false positives during normal daemon startup.
           count=0
           [ -r "$drift_count_file" ] && count=$(cat "$drift_count_file")
-          count=$((count + 1))
+          case "$count" in *[!0-9]*) count=0 ;; esac
+          if [ "$count" -lt ${toString cfg.reprovision.driftFailureThreshold} ]; then
+            count=$((count + 1))
+          fi
           echo "$count" > "$drift_count_file"
           if [ "$count" -ge ${toString cfg.reprovision.driftFailureThreshold} ]; then
             touch "$trigger_file"
@@ -149,8 +153,17 @@ let
         # through to ordinary priority failover with no identity action.
         ok_reachable
 
-        peer_entry=$(echo "$status_json" | ${pkgs.jq}/bin/jq -c --arg name "${peerName}" \
-          '(.peers.details // [])[] | select(.fqdn == $name or .hostName == $name or (.fqdn | tostring | startswith($name)))' 2>/dev/null | head -n1 || true)
+        peer_matches=$(echo "$status_json" | ${pkgs.jq}/bin/jq -c --arg name "${peerName}" \
+          '[ (.peers.details // [])[] | select(.fqdn == $name or .hostName == $name or (.fqdn | tostring | startswith($name + "."))) ]' 2>/dev/null || echo '[]')
+        peer_count=$(echo "$peer_matches" | ${pkgs.jq}/bin/jq -r 'length' 2>/dev/null || echo 0)
+        if [ "$peer_count" -gt 1 ]; then
+          echo '{"healthy":false,"detail":"netbird peer name is ambiguous; more than one exact/FQDN match"}'
+          exit 1
+        fi
+        peer_entry=""
+        if [ "$peer_count" -eq 1 ]; then
+          peer_entry=$(echo "$peer_matches" | ${pkgs.jq}/bin/jq -c '.[0]')
+        fi
 
         connected="false"
         discovered_addr=""
@@ -230,6 +243,7 @@ let
     text = ''
       set -euo pipefail
       trigger_dir="/run/nixnet/reprovision"
+      drift_count_file="$trigger_dir/.netbird-periodic-drift-count"
       mkdir -p "$trigger_dir"
 
       drift=0
@@ -264,14 +278,21 @@ let
       fi
 
       if [ "$drift" -eq 1 ]; then
-        # Periodic safety net: a single bad reading is enough to trigger
-        # here (it already only runs every checkIntervalSec, unlike the
-        # reactive exec-probe path which needs driftFailureThreshold
-        # consecutive failures because it runs on the much faster probe
-        # cadence).
-        touch "$trigger_dir/netbird"
-        echo "nixnet-netbird-drift-check: drift detected, touched $trigger_dir/netbird"
+        count=0
+        [ -r "$drift_count_file" ] && count=$(cat "$drift_count_file")
+        case "$count" in *[!0-9]*) count=0 ;; esac
+        if [ "$count" -lt ${toString cfg.reprovision.driftFailureThreshold} ]; then
+          count=$((count + 1))
+        fi
+        echo "$count" > "$drift_count_file"
+        if [ "$count" -ge ${toString cfg.reprovision.driftFailureThreshold} ]; then
+          touch "$trigger_dir/netbird"
+          echo "nixnet-netbird-drift-check: drift detected $count consecutive times, touched $trigger_dir/netbird"
+        else
+          echo "nixnet-netbird-drift-check: drift reading $count/${toString cfg.reprovision.driftFailureThreshold}; waiting for confirmation"
+        fi
       else
+        rm -f "$drift_count_file"
         echo "nixnet-netbird-drift-check: no drift detected"
       fi
     '';
@@ -338,6 +359,7 @@ let
         fi
       fi
       if [ "$drift_still_present" -eq 0 ]; then
+        rm -f /run/nixnet/reprovision/.netbird-periodic-drift-count
         echo "NIXNET_NETBIRD_REPROVISION_SKIPPED reason=drift-already-resolved"
         exit 0
       fi
@@ -353,8 +375,9 @@ let
         local deadline_epoch="$1" connected="false"
         while [ "$(date +%s)" -lt "$deadline_epoch" ]; do
           st=$(netbird status --json 2>/dev/null || echo '{}')
-          mgmt_connected=$(echo "$st" | jq -r '.management.connected // false')
-          if [ "$mgmt_connected" = "true" ] && { ip link show netbird0 >/dev/null 2>&1 || ip link show wt0 >/dev/null 2>&1; }; then
+          status_json="$st"
+          ${identityHealthCheckBash "jq" cfg.managementUrl}
+          if [ "$mgmt_healthy" = "yes" ] && { ip link show netbird0 >/dev/null 2>&1 || ip link show wt0 >/dev/null 2>&1; }; then
             connected="true"
             break
           fi
@@ -362,8 +385,6 @@ let
         done
         echo "$connected"
       }
-
-      netbird down || true
 
       # Try a PLAIN reconnect first -- no setup key. If this daemon already
       # has a valid local peer identity (config.json/state.json intact) but
@@ -392,6 +413,7 @@ let
       fi
 
       if [ "$plain_reconnect_ok" = "true" ]; then
+        rm -f /run/nixnet/reprovision/.netbird-periodic-drift-count
         echo "NIXNET_NETBIRD_REPROVISION_SUCCEEDED method=plain-reconnect"
         printf '{"result":"succeeded","method":"plain-reconnect","at":"%s"}\n' "$(date -Iseconds)" > "$status_file"
         exit 0
@@ -427,6 +449,7 @@ let
       connected=$(connect_wait "$setup_deadline")
 
       if [ "$connected" = "true" ]; then
+        rm -f /run/nixnet/reprovision/.netbird-periodic-drift-count
         echo "NIXNET_NETBIRD_REPROVISION_SUCCEEDED method=setup-key"
         printf '{"result":"succeeded","method":"setup-key","at":"%s"}\n' "$(date -Iseconds)" > "$status_file"
         exit 0
@@ -506,6 +529,14 @@ in
 
   config = mkIf cfg.enable {
     assertions = [
+      {
+        assertion = config.nixnet.enable;
+        message = ''
+          nixnet.netbird.enable requires nixnet.enable: this provider's
+          probes are children of nixnetd, so enabling it without the core
+          daemon leaves recovery machinery running with no consumer.
+        '';
+      }
       {
         assertion = all (name: hasAttr name config.nixnet.peers) (attrNames cfg.peers);
         message = ''
@@ -593,8 +624,9 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${driftCheckScript}/bin/nixnet-netbird-drift-check";
-        # Root: needs to read /var/lib/netbird/config.json (root-only) and
-        # run `netbird status` at full privilege.
+        TimeoutStartSec = "30s";
+        # Root: may create the trigger consumed by the privileged recovery
+        # unit and queries `netbird status` at full privilege.
       };
     };
 
@@ -620,6 +652,9 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${reprovisionScript}/bin/nixnet-netbird-reprovision";
+        # Two bounded `netbird up` calls and two independently bounded
+        # confirmation polls can all run on the fallback path.
+        TimeoutStartSec = "${toString (4 * cfg.reprovision.connectTimeoutSec + 30)}s";
         # Root: required to drive `netbird up`/`down` and read the
         # root-readable setupKeyFile secret -- narrowly-scoped, rate-limited
         # oneshot, never a resident privileged process.
@@ -645,7 +680,11 @@ in
     };
 
     systemd.tmpfiles.rules = [
-      "d /run/nixnet/reprovision 0750 root root -"
+      # The address probes run as nixnetd and must be able to create both
+      # their counters and the root-consumed edge trigger. Keeping this
+      # directory private to that fixed identity avoids a local-user DoS
+      # against the privileged reprovision service.
+      "d /run/nixnet/reprovision 0750 nixnetd nixnetd -"
     ];
   };
 }

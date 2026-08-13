@@ -66,6 +66,9 @@ let
 
   cfg = evalFor { };
   nixnetdService = cfg.systemd.services.nixnetd.serviceConfig;
+  nestedStateCfg = evalFor {
+    nixnet.daemon.stateDir = "/var/lib/nixnet/nested-state";
+  };
 
   results = [
     # THE regression this file exists for. Pre-fix, `DynamicUser = true`
@@ -97,6 +100,11 @@ let
     (check "nixnetd-fixed-user/group-declared"
       (cfg.users.groups ? nixnetd)
       "users.groups keys: ${builtins.toJSON (builtins.attrNames cfg.users.groups)}")
+
+    (check "nixnetd/state-directory-preserves-nested-path"
+      ((nestedStateCfg.systemd.services.nixnetd.serviceConfig.StateDirectory or null)
+        == "nixnet/nested-state")
+      "serviceConfig.StateDirectory: ${builtins.toJSON (nestedStateCfg.systemd.services.nixnetd.serviceConfig.StateDirectory or null)}")
 
   ];
 
@@ -336,6 +344,87 @@ let
       "rendered ruleset:\n${overlayV4OnlyCfg.nixnet.overlay.ruleset}")
   ];
 
+  # The access-model is exported as a standalone NixOS module. Its optional
+  # integration with group reconciliation must not make that export depend on
+  # importing the sibling module, while still supplying the shared default
+  # when both are present.
+  accessModelBase = {
+    nixnet.netbirdAccessModel = {
+      enable = true;
+      internalGroup = "internal";
+      groups.internal.description = "All internally managed peers.";
+      audit.apiUrl = "https://mesh.example.com/api";
+    };
+  };
+
+  accessModelStandaloneCfg = evalModules [
+    (moduleDir + "/netbird-access-model.nix")
+    accessModelBase
+  ];
+
+  accessModelCombinedCfg = evalModules [
+    (moduleDir + "/netbird-access-model.nix")
+    (moduleDir + "/netbird-group-reconcile.nix")
+    accessModelBase
+    {
+      nixnet.netbirdGroupReconcile = {
+        enable = true;
+        apiUrl = "https://mesh.example.com/api";
+      };
+    }
+  ];
+
+  accessModelResults = [
+    (check "netbird-access-model/imports-standalone"
+      (!(accessModelStandaloneCfg.nixnet ? netbirdGroupReconcile)
+        && accessModelStandaloneCfg.nixnet.netbirdAccessModel.internalGroup == "internal")
+      "standalone module unexpectedly requires or defines nixnet.netbirdGroupReconcile")
+
+    (check "netbird-access-model/defaults-reconciler-catch-all"
+      (accessModelCombinedCfg.nixnet.netbirdGroupReconcile.catchAllGroup == "internal")
+      "catchAllGroup: ${builtins.toJSON accessModelCombinedCfg.nixnet.netbirdGroupReconcile.catchAllGroup}")
+  ];
+
+  ingressTunnelId = "00000000-0000-0000-0000-000000000001";
+  ingressCfg = evalModules [
+    (moduleDir + "/ingress.nix")
+    {
+      nixnet.ingress = {
+        enable = true;
+        tunnelId = ingressTunnelId;
+        credentialsFile = "/run/secrets/cloudflared-credentials.json";
+        edgeIpVersion = "6";
+        transportProtocol = "http2";
+        ingress = [{
+          hostname = "app.example.com";
+          path = "^/hook$";
+          service = "http://127.0.0.1:8080";
+        }];
+        dnsReconcile = {
+          enable = true;
+          apiTokenFile = "/run/secrets/cloudflare-api-token";
+          zone = "example.com";
+        };
+      };
+    }
+  ];
+
+  ingressTunnel = ingressCfg.services.cloudflared.tunnels.${ingressTunnelId};
+  ingressResults = [
+    (check "ingress/uses-native-edge-ip-option"
+      (ingressTunnel.edgeIPVersion == "6")
+      "edgeIPVersion: ${builtins.toJSON ingressTunnel.edgeIPVersion}")
+
+    (check "ingress/uses-native-transport-option"
+      (ingressTunnel.protocol == "http2")
+      "protocol: ${builtins.toJSON ingressTunnel.protocol}")
+
+    (check "ingress/dns-reconciler-waits-for-token-mount"
+      (lib.elem "/run/secrets/cloudflare-api-token"
+        (lib.toList (ingressCfg.systemd.services.nixnet-ingress-dns-reconcile.unitConfig.RequiresMountsFor or [ ])))
+      "RequiresMountsFor: ${builtins.toJSON (ingressCfg.systemd.services.nixnet-ingress-dns-reconcile.unitConfig.RequiresMountsFor or null)}")
+  ];
+
   # Source-text checks for the two assertions, rather than reading the
   # evaluated `config.assertions` list: that list is the FULL system's,
   # every module's, not just nixnet's -- forcing every entry's `.message`
@@ -402,7 +491,7 @@ let
     (builtins.filter (n: n != "ok") (builtins.attrNames renderCheck));
 
   allResults = results ++ meshGatewayResults ++ overlayResults ++ overlayV4OnlyResults
-    ++ sourceResults ++ firewallResults;
+    ++ accessModelResults ++ ingressResults ++ sourceResults ++ firewallResults;
 
   failed = builtins.filter (r: !r.ok) allResults;
 

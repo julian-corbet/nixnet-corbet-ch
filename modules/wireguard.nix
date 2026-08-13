@@ -14,6 +14,8 @@ let
   serviceName = "nixnet-wireguard-${cfg.interface}";
   runtimeDir = "/run/nixnet-wireguard";
   configPath = "${runtimeDir}/${cfg.interface}.conf";
+  secretFiles = [ cfg.privateKeyFile ]
+    ++ lib.filter (path: path != null) (map (peer: peer.presharedKeyFile) (lib.attrValues cfg.peers));
 
   peerText = peer: ''
     [Peer]
@@ -29,10 +31,21 @@ let
       set -euo pipefail
       umask 077
 
-      test -r ${q cfg.privateKeyFile}
+      test -s ${q cfg.privateKeyFile}
+      ${lib.concatMapStringsSep "\n" (path: "test -s ${q path}")
+        (lib.filter (path: path != cfg.privateKeyFile) secretFiles)}
       install -d -m 0700 ${q runtimeDir}
       config=${q configPath}
-      trap 'rm -f "$config"' ERR
+
+      cleanup_partial() {
+        if ip link show dev ${q cfg.interface} >/dev/null 2>&1; then
+          wg-quick down "$config" >/dev/null 2>&1 \
+            || ip link delete dev ${q cfg.interface} >/dev/null 2>&1 \
+            || true
+        fi
+        rm -f "$config"
+      }
+      trap cleanup_partial ERR
 
       cat > "$config" <<EOF
       [Interface]
@@ -42,7 +55,11 @@ let
       ${lib.concatMapStringsSep "\n" peerText (lib.attrValues cfg.peers)}
       EOF
 
+      # Parse the complete generated file before making the first netlink change. `up` can still
+      # fail on live-state conflicts, so the ERR trap above removes any partial interface too.
+      wg-quick strip "$config" >/dev/null
       wg-quick up "$config"
+      trap - ERR
     '';
   };
 
@@ -183,9 +200,16 @@ in
       systemd.services.${serviceName} = {
         description = "nixnet: WireGuard private transit ${cfg.interface}";
         wantedBy = [ "multi-user.target" ];
-        wants = [ "network-online.target" ];
+        # A failed secret producer must not cancel this start permanently.
+        # The setup script validates every secret itself and retries, so a
+        # late producer recovers without an operator re-starting the unit.
+        wants = [ "network-online.target" ] ++ cfg.secretUnits;
         after = [ "network-online.target" ] ++ cfg.secretUnits;
-        requires = cfg.secretUnits;
+        unitConfig = {
+          RequiresMountsFor = secretFiles;
+          StartLimitIntervalSec = 300;
+          StartLimitBurst = 5;
+        };
         path = [ pkgs.coreutils pkgs.iproute2 pkgs.wireguard-tools ];
         serviceConfig = {
           Type = "oneshot";
@@ -197,6 +221,9 @@ in
           AmbientCapabilities = [ "CAP_NET_ADMIN" "CAP_NET_RAW" ];
           ExecStart = "${setup}/bin/${serviceName}";
           ExecStop = "${teardown}/bin/${serviceName}-teardown";
+          Restart = "on-failure";
+          RestartSec = "30s";
+          TimeoutStartSec = "2min";
         };
       };
     }
