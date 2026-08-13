@@ -403,7 +403,8 @@ mod tests {
 
         let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
         g.max_age_sec = max_age_sec;
-        add_transport(&mut g, 10, "192.0.2.10");
+        let winner = add_transport(&mut g, 10, "192.0.2.10");
+        g.winner = Some(winner);
         let mut state = EngineState {
             peers: HashMap::from([("host-b".to_string(), g)]),
             uplinks: HashMap::new(),
@@ -544,7 +545,8 @@ mod tests {
         let mut g = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
         g.last_published_addr = "192.0.2.10".into();
         g.last_confirmed_at = Some(confirmed);
-        add_transport(&mut g, 10, "192.0.2.10");
+        let winner = add_transport(&mut g, 10, "192.0.2.10");
+        g.winner = Some(winner);
         eng.state.lock().unwrap().peers.insert("host-b".into(), g);
 
         {
@@ -558,11 +560,10 @@ mod tests {
              modules/core.nix reads this exact field name:\n{on_disk}"
         );
 
+        let mut fresh_group = new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD);
+        add_transport(&mut fresh_group, 10, "192.0.2.10");
         let mut fresh = EngineState {
-            peers: HashMap::from([(
-                "host-b".to_string(),
-                new_peer_group("host-b", 0, config::ON_ALL_DOWN_LAST_KNOWN_GOOD),
-            )]),
+            peers: HashMap::from([("host-b".to_string(), fresh_group)]),
             uplinks: HashMap::new(),
             ..Default::default()
         };
