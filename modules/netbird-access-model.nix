@@ -512,12 +512,12 @@ in
       };
     };
   } // lib.optionalAttrs
-    ((lib.hasAttrByPath [ "nixnet" "netbirdGroupReconcile" "catchAllGroup" ] options)
-      && groupReconcileCfg.enable) {
+    (lib.hasAttrByPath [ "nixnet" "netbirdGroupReconcile" "catchAllGroup" ] options) {
     # Wiring, not duplication: when the membership reconciler is also
     # imported and enabled on this host, its "every peer's default group"
     # defaults to THIS module's internalGroup. Guarding on the sibling
     # option keeps this module usable on its own.
-    nixnet.netbirdGroupReconcile.catchAllGroup = lib.mkDefault cfg.internalGroup;
+    nixnet.netbirdGroupReconcile.catchAllGroup =
+      lib.mkIf groupReconcileCfg.enable (lib.mkDefault cfg.internalGroup);
   });
 }
