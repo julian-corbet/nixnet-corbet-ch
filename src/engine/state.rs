@@ -147,6 +147,7 @@ impl super::Engine {
     }
 
     /// Writes the full state atomically. Callers must hold the lock.
+    #[cfg(test)]
     pub(super) fn save_state_locked(&self, state: &EngineState) {
         if let Some(data) = serialized_state(state) {
             let _ = self.write_state_data(&data);
@@ -708,7 +709,7 @@ mod tests {
             .peers
             .get_mut("host-b")
             .unwrap()
-            .last_confirmed_at = Some(OffsetDateTime::now_utc());
+            .last_confirmed_at = Some(time::OffsetDateTime::now_utc());
         eng.save_state(false);
         assert_eq!(std::fs::read(&path).unwrap(), first);
 

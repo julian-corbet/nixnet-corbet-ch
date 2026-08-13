@@ -876,6 +876,7 @@ impl Engine {
         action
     }
 
+    #[cfg(test)]
     fn apply_action_locked(
         &self,
         state: &mut EngineState,
@@ -1009,6 +1010,7 @@ impl Engine {
 
     /// Test/startup compatibility wrapper. Runtime probe ticks use
     /// [`Engine::reconcile`], which releases the state lock before I/O.
+    #[cfg(test)]
     fn reconcile_locked(&self, state: &mut EngineState, kind: GroupKind, name: &str) {
         let action = self.decide_action_locked(state, kind, name);
         self.apply_action_locked(state, kind, name, action);
