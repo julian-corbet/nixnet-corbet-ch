@@ -65,6 +65,7 @@
           }
         ];
       };
+
     };
 
     testScript = ''
@@ -78,6 +79,7 @@
       # There was no table before this one, so the only thing a revert could do is delete it.
       machine.fail("systemctl is-active nixnet-firewall-revert.timer")
       machine.fail(f"test -e {state}/pending.nft")
+      machine.fail(f"test -e {state}/pending-hash")
 
       journal = machine.succeed("journalctl -u nixnet-firewall.service --no-pager")
       assert "no previous ruleset to restore" in journal, (
@@ -97,6 +99,12 @@
       out = machine.succeed("nft list table inet nixnet")
       assert "9090" in out, f"the changed ruleset did not load:\n{out}"
       machine.succeed(f"test -s {state}/pending.nft")
+      machine.succeed(f"test -s {state}/pending-hash")
+      machine.succeed("systemctl is-active nixnet-firewall-revert.timer")
+
+      # Restarting the apply unit is not confirmation and must not discard the rollback snapshot.
+      machine.succeed("systemctl restart nixnet-firewall.service")
+      machine.succeed(f"test -s {state}/pending.nft")
       machine.succeed("systemctl is-active nixnet-firewall-revert.timer")
 
       # Nobody confirms — the unattended case.
@@ -107,12 +115,20 @@
       )
       # Reverted TO something, not into nothing: the previous ruleset is what came back.
       assert "hook input" in out, f"the revert left no input chain at all:\n{out}"
+      machine.succeed(f"test -s {state}/reverted-hash")
+      machine.fail(f"test -e {state}/applied-hash")
 
-      # ── 3. the handover to FW-4 ─────────────────────────────────────────
+      # ── 3. the handover to every automatic owner ────────────────────────
       # The reconcile loop must not undo the revert. It goes red instead.
       machine.fail("systemctl start nixnet-firewall-reconcile.service")
       out = machine.succeed("nft list table inet nixnet")
       assert "9090" not in out, f"reconcile reloaded the ruleset the dead-man switch undid:\n{out}"
+
+      # Nor may a service restart or reboot re-apply it. This was a separate path from reconcile:
+      # the old apply script unconditionally loaded first and cleared the revert marker afterwards.
+      machine.fail("systemctl restart nixnet-firewall.service")
+      out = machine.succeed("nft list table inet nixnet")
+      assert "9090" not in out, f"service restart re-applied the deliberately reverted ruleset:\n{out}"
     '';
   };
 }

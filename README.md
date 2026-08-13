@@ -429,7 +429,7 @@ fact in the ruleset itself:
 - **Management interfaces first**, before the host's own rules and not
   overridable by them.
 - **A failed apply is not a host with no firewall.** The apply unit runs
-  under `set -eu` with no `|| true` anywhere, so the loader's exit status
+  under `set -eu` and checks the loader explicitly, so its exit status
   *is* the signal; the load is one `nft -f` transaction, so a failure
   leaves the previous ruleset byte-identical; and a *finished* apply with
   nixnet's table absent exits non-zero rather than reporting success — the
@@ -443,6 +443,9 @@ fact in the ruleset itself:
   ruleset **change**, never on a boot — arming every boot meant the timer
   fired on every headless boot, nobody typed the confirmation, and the
   revert (with no prior table to restore) deleted the firewall outright.
+  All firewall state transitions share one lock; a rejected generation is
+  blocked across reconcile, service restart and reboot, and durable state
+  advances only after the kernel marker verifies the load.
 - **Silent drops** for traffic that is dropped anyway: on the host this
   generalises, 66% of kernel log lines were the firewall logging ordinary
   LAN broadcast housekeeping — the noise that hid a real WireGuard drop.

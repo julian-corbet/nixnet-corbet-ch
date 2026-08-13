@@ -268,7 +268,9 @@ let
 
   # ── Dead-man switch ─────────────────────────────────────────────────────────────────────────
   stateDir = "/var/lib/nixnet-firewall";
+  lockFile = "${stateDir}/lock";
   pendingFile = "${stateDir}/pending.nft";
+  pendingHashFile = "${stateDir}/pending-hash";
   appliedHashFile = "${stateDir}/applied-hash";
 
   # Which ruleset the dead-man switch REPLACED, if it ever fired. This is the one thing that must
@@ -279,15 +281,80 @@ let
   revertedHashFile = "${stateDir}/reverted-hash";
   repairCountFile = "${stateDir}/repairs";
 
+  # Every command that can inspect or change the table takes this same lock. systemd ordering is
+  # not mutual exclusion: a timer can start while an activation is applying, and confirm is a
+  # human command outside the unit graph entirely. State files are renamed into place so a crash
+  # cannot leave a partial hash that compares equal by accident.
+  stateFunc = ''
+    nixnet_lock() {
+      mkdir -p ${stateDir}
+      chmod 0700 ${stateDir}
+      exec 9>${lockFile}
+      ${pkgs.util-linux}/bin/flock 9
+    }
+
+    nixnet_state_write() {
+      local _target="$1"
+      local _value="$2"
+      if [ -f "$_target" ] && [ "$(cat "$_target")" = "$_value" ]; then
+        return
+      fi
+      local _tmp="$_target.$$.tmp"
+      printf %s "$_value" > "$_tmp"
+      chmod 0600 "$_tmp"
+      ${pkgs.coreutils}/bin/sync "$_tmp"
+      mv -f "$_tmp" "$_target"
+      ${pkgs.coreutils}/bin/sync ${stateDir}
+    }
+  '';
+
+  autoRevertFunc =
+    if !cfg.autoRevert.enable then ''
+      nixnet_cancel_revert() { :; }
+      nixnet_arm_revert() { :; }
+      nixnet_ensure_revert() { :; }
+      nixnet_clean_stale_revert() { :; }
+    '' else ''
+      nixnet_cancel_revert() {
+        ${pkgs.systemd}/bin/systemctl stop nixnet-firewall-revert.timer \
+          nixnet-firewall-revert.service 2>/dev/null || true
+      }
+
+      nixnet_arm_revert() {
+        ${pkgs.systemd}/bin/systemctl --no-block restart nixnet-firewall-revert.timer
+      }
+
+      nixnet_ensure_revert() {
+        if [ -f ${pendingFile} ] && [ -f ${pendingHashFile} ] \
+          && [ "$(cat ${pendingHashFile})" = "${rulesetHash}" ] \
+          && ! ${pkgs.systemd}/bin/systemctl is-active --quiet nixnet-firewall-revert.timer \
+          && ! ${pkgs.systemd}/bin/systemctl is-active --quiet nixnet-firewall-revert.service; then
+          ${pkgs.systemd}/bin/systemctl --no-block start nixnet-firewall-revert.timer
+        fi
+      }
+
+      nixnet_clean_stale_revert() {
+        if { [ -e ${pendingFile} ] || [ -e ${pendingHashFile} ]; } \
+          && { [ ! -f ${pendingFile} ] || [ ! -f ${pendingHashFile} ] \
+            || [ "$(cat ${pendingHashFile})" != "${rulesetHash}" ]; }; then
+          nixnet_cancel_revert
+          rm -f ${pendingFile} ${pendingHashFile}
+        fi
+      }
+    '';
+
   confirm = pkgs.writeShellApplication {
     name = "nixnet-firewall-confirm";
-    runtimeInputs = [ pkgs.systemd ];
+    runtimeInputs = [ pkgs.systemd pkgs.util-linux ];
     text = ''
+      ${stateFunc}
+      nixnet_lock
+
       # Disarm the revert timer. Run this once you have confirmed you still have a working
       # connection THROUGH the new ruleset — ideally from a SECOND session, not the one you already
       # had open, since an established connection survives rules that would refuse a new one.
-      systemctl stop nixnet-firewall-revert.timer 2>/dev/null || true
-      rm -f ${pendingFile}
+      systemctl stop nixnet-firewall-revert.timer nixnet-firewall-revert.service 2>/dev/null || true
+      rm -f ${pendingFile} ${pendingHashFile}
       # Also clears a revert that already fired. Confirming AFTER the window closed is a real
       # operator action meaning "put it back and stop reverting" — the ruleset is fine, the human
       # was just slow. It re-enables the reconcile loop, which restores the ruleset on its next run.
@@ -297,93 +364,39 @@ let
   };
 
   revertScript = pkgs.writeShellScript "nixnet-firewall-revert" ''
-    if [ -f ${pendingFile} ]; then
-      echo "nixnet: confirmation window expired — restoring the previous ruleset."
-      # The exit status decides what happens next, so it is checked rather than assumed. A failed
-      # restore that deleted the snapshot and told the reconcile loop to stand down would leave the
-      # host running the suspect ruleset with BOTH safety nets retired and nothing left that could
-      # put anything back.
-      if ${pkgs.nftables}/bin/nft -f ${pendingFile}; then
-        rm -f ${pendingFile}
-        # Tell the reconcile loop to stand down for THIS ruleset. Without this it would find the
-        # generation marker missing one interval later, conclude the firewall had been flushed by a
-        # foreigner, and reload the very ruleset this revert just undid.
-        printf %s "${rulesetHash}" > ${revertedHashFile}
-      else
-        echo "nixnet: restoring the previous ruleset FAILED — keeping the snapshot." >&2
-        echo "nixnet: the host is running the unconfirmed ruleset; reconcile stays enabled." >&2
-        exit 1
-      fi
-    fi
-  '';
+    set -eu
+    ${stateFunc}
+    ${metricsFunc}
+    ${inForceFunc}
+    nixnet_lock
 
-  # Snapshot OUR TABLE ONLY, never `nft list ruleset`. A full dump would restore every table on the
-  # host — so a revert firing after docker, k3s or the overlay module legitimately changed their
-  # own tables during the confirmation window would stomp those changes too. Same own-table
-  # discipline the apply path enforces.
-  #
-  # One script for both planes, and it ARMS THE TIMER ITSELF rather than leaving that to whatever
-  # wants the timer unit: arming is the thing that must happen only on a real change, so it belongs
-  # next to the comparison that decides that.
-  snapshotScript = pkgs.writeShellScript "nixnet-firewall-snapshot" ''
-    mkdir -p ${stateDir}
-    chmod 0700 ${stateDir}
-
-    # ── ARM ONLY ON A REAL CHANGE ──────────────────────────────────────────────────────────────
-    # The dead-man switch exists to protect the moment an operator applies a NEW ruleset and might
-    # lock themselves out. A plain reboot is not that moment, and arming there is actively harmful:
-    # the confirmation has to be typed by a human, nobody types it on a headless box, so the timer
-    # fired on EVERY boot and the "revert" deleted the firewall outright (with no prior table, the
-    # restore file is just `add table; delete table`). A CI-deployed host therefore spent every
-    # boot running with no firewall at all, from ~`seconds` in until the next reboot. Found in
-    # production; every unattended host on the default was exposed.
-    #
-    # Remote-lockout protection for an unattended deploy is the deploy layer's rollback, not this
-    # timer's. This switch covers exactly what it can: a ruleset that differs from the last one
-    # applied on this box.
-    if [ -f ${appliedHashFile} ] && [ "$(cat ${appliedHashFile})" = "${rulesetHash}" ]; then
-      rm -f ${pendingFile}
-      echo "nixnet: ruleset unchanged since last apply — not arming auto-revert."
+    if [ ! -f ${pendingFile} ] || [ ! -f ${pendingHashFile} ]; then
       exit 0
     fi
-
-    # ── NEVER ARM WITH NOTHING TO RESTORE ──────────────────────────────────────────────────────
-    # There is no prior table, so the only thing a revert could do is DELETE this one and leave the
-    # host with no packet filter. That is not a recovery from a bad ruleset, it is a worse outcome
-    # than the ruleset — and it is the failure that put corbet-eu-vultr, a public host and the
-    # overlay control plane, on the open internet unfiltered on 2026-08-04.
-    #
-    # Read the sequence, because "arm only on a change" was already implemented and did not prevent
-    # it: the first deploy of a nixnet ruleset to a host is BY DEFINITION a change, so the switch
-    # armed. The snapshot it took was of an empty kernel, so the restore file said `add table;
-    # delete table`. Nobody typed `nixnet-firewall-confirm`, because it was an unattended CI deploy
-    # and there is no human in that loop. `seconds` later the timer fired and did exactly what it
-    # was told. Green unit, no firewall, and every subsequent theory (the switch self-killing,
-    # deploy-rs rolling back, a podman health check) was looking at a different part of the elephant.
-    #
-    # A first apply therefore gets NO dead-man switch. The protection an unattended first deploy
-    # actually has is the deploy layer's own rollback, which reverts the whole generation rather
-    # than one table — and if that fails too, a firewall that is merely WRONG still leaves a host in
-    # a better state than a firewall that is ABSENT.
-    if ! ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
-      rm -f ${pendingFile}
-      printf %s "${rulesetHash}" > ${appliedHashFile}
-      echo "nixnet: no previous ruleset to restore — not arming auto-revert." >&2
-      echo "nixnet: a revert here could only DELETE this host's firewall, which is not a recovery." >&2
-      exit 0
+    if [ "$(cat ${pendingHashFile})" != "${rulesetHash}" ]; then
+      echo "nixnet: refusing to restore a snapshot belonging to a different ruleset generation." >&2
+      exit 1
     fi
 
-    { echo "table inet ${cfg.table}"; echo "delete table inet ${cfg.table}"; \
-      ${pkgs.nftables}/bin/nft list table inet ${cfg.table}; } > ${pendingFile}
+    echo "nixnet: confirmation window expired — restoring the previous ruleset."
+    # Record the stand-down intent first. A power loss immediately after nft commits the restore
+    # must not let boot re-apply the ruleset this timer rejected. Remove it again on an ordinary
+    # failed transaction, where the suspect ruleset is still live and a retry remains possible.
+    nixnet_state_write ${revertedHashFile} "${rulesetHash}"
+    if ! ${pkgs.nftables}/bin/nft -f ${pendingFile}; then
+      rm -f ${revertedHashFile}
+      echo "nixnet: restoring the previous ruleset FAILED — keeping the snapshot." >&2
+      echo "nixnet: the host is running the unconfirmed ruleset; reconcile stays enabled." >&2
+      exit 1
+    fi
+    if nixnet_in_force; then
+      rm -f ${revertedHashFile}
+      echo "nixnet: restore returned success but the rejected generation is still in force." >&2
+      exit 1
+    fi
 
-    # Recorded BEFORE the countdown, not on confirmation. If the revert does fire, the next boot
-    # must load this ruleset and LEAVE it alone rather than re-arming and re-reverting forever —
-    # one unconfirmed window per change, not one per boot.
-    printf %s "${rulesetHash}" > ${appliedHashFile}
-
-    # --no-block: on the NixOS plane this runs from a unit ordered before nftables.service, and a
-    # blocking start would have systemd waiting on a job we are ourselves in the middle of.
-    ${pkgs.systemd}/bin/systemctl --no-block start nixnet-firewall-revert.timer
+    rm -f ${pendingFile} ${pendingHashFile} ${appliedHashFile}
+    nixnet_write_metrics 0
   '';
 
   # ── The apply path ──────────────────────────────────────────────────────────────────────────
@@ -450,13 +463,27 @@ let
   # its snapshot would be of the broken state.
   reconcileScript = pkgs.writeShellScript "nixnet-firewall-reconcile" ''
     set -eu
+    ${stateFunc}
+    ${autoRevertFunc}
     ${metricsFunc}
     ${inForceFunc}
+    nixnet_lock
+    ${lib.optionalString (!cfg.autoRevert.enable) "rm -f ${pendingFile} ${pendingHashFile} ${revertedHashFile}"}
+    nixnet_clean_stale_revert
 
-    mkdir -p ${stateDir}
-    chmod 0700 ${stateDir}
+    # A deliberate revert is stronger than the presence of the marker: somebody may have loaded
+    # the rejected file by hand, but only confirm is authorization to resume owning it.
+    if [ -f ${revertedHashFile} ] && [ "$(cat ${revertedHashFile})" = "${rulesetHash}" ]; then
+      echo "nixnet: ruleset ${rulesetHash} was deliberately reverted — NOT repairing." >&2
+      echo "nixnet: fix and redeploy it, or run nixnet-firewall-confirm to authorize it again." >&2
+      nixnet_write_metrics 0
+      exit 1
+    fi
 
     if nixnet_in_force; then
+      nixnet_state_write ${appliedHashFile} "${rulesetHash}"
+      rm -f ${revertedHashFile}
+      nixnet_ensure_revert
       nixnet_write_metrics 1
       exit 0
     fi
@@ -469,19 +496,12 @@ let
       reason="table inet ${cfg.table} is absent"
     fi
 
-    # The one case where the right move is to leave it broken and say so. The dead-man switch fired,
-    # which means an operator applied a ruleset and never confirmed they could still get in.
-    # Repairing would reload exactly that ruleset, once per interval, forever.
-    if [ -f ${revertedHashFile} ] && [ "$(cat ${revertedHashFile})" = "${rulesetHash}" ]; then
-      echo "nixnet: $reason — NOT repairing." >&2
-      echo "nixnet: auto-revert replaced this ruleset deliberately; the host is running rules nixnet did not choose." >&2
-      echo "nixnet: fix the ruleset and redeploy, or run nixnet-firewall-confirm to put it back." >&2
+    echo "nixnet: $reason — repairing." >&2
+    if ! ${pkgs.nftables}/bin/nft -f ${rulesetFile}; then
+      echo "nixnet: firewall repair transaction failed; the loaded table was not accepted as repaired." >&2
       nixnet_write_metrics 0
       exit 1
     fi
-
-    echo "nixnet: $reason — repairing." >&2
-    ${pkgs.nftables}/bin/nft -f ${rulesetFile}
 
     # Same discipline as the apply path: the loader's exit status is not proof. Check the kernel.
     if ! nixnet_in_force; then
@@ -490,23 +510,80 @@ let
       exit 1
     fi
 
+    nixnet_state_write ${appliedHashFile} "${rulesetHash}"
+    rm -f ${revertedHashFile}
+    nixnet_ensure_revert
     _count=0
     if [ -f ${repairCountFile} ]; then _count="$(cat ${repairCountFile})"; fi
     _count=$((_count + 1))
-    printf %s "$_count" > ${repairCountFile}
+    nixnet_state_write ${repairCountFile} "$_count"
     nixnet_write_metrics 1
     echo "nixnet: firewall repaired (repair #$_count). Not routine — something on this host removes it." >&2
   '';
 
-  # `set -eu`, and no `|| true` anywhere: FW-3. The loader's exit status IS the signal, and a
-  # swallowed one is how a production host came to be running with no packet filter at all,
-  # discovered from a serial console rather than from anything the host said.
+  # `set -eu`, with the loader checked explicitly: FW-3. Its exit status IS the signal, and a
+  # swallowed one is how a host can run with no packet filter while the unit claims success.
+  # Best-effort cancellation of an inactive timer is the narrow exception; nft never is.
   applyScript = pkgs.writeShellScript "nixnet-firewall-apply" ''
     set -eu
+    ${stateFunc}
+    ${autoRevertFunc}
     ${metricsFunc}
     ${inForceFunc}
-    ${lib.optionalString cfg.autoRevert.enable "${snapshotScript}"}
-    ${pkgs.nftables}/bin/nft -f ${rulesetFile}
+    nixnet_lock
+    ${lib.optionalString (!cfg.autoRevert.enable) "rm -f ${pendingFile} ${pendingHashFile} ${revertedHashFile}"}
+    nixnet_clean_stale_revert
+
+    # A ruleset that the dead-man switch rejected stays rejected across service restarts and
+    # reboots. Only a changed generation or the explicit confirm command may clear this guard.
+    if [ -f ${revertedHashFile} ] && [ "$(cat ${revertedHashFile})" = "${rulesetHash}" ]; then
+      echo "nixnet: refusing to re-apply ruleset ${rulesetHash}; its confirmation window expired." >&2
+      echo "nixnet: fix and redeploy it, or run nixnet-firewall-confirm to authorize it again." >&2
+      nixnet_write_metrics 0
+      exit 1
+    fi
+
+    # A restart of an already-loaded generation is not a change. Preserve an outstanding
+    # confirmation transaction and make sure its timer still exists; never turn restart into
+    # implicit confirmation by deleting the snapshot.
+    if nixnet_in_force; then
+      nixnet_state_write ${appliedHashFile} "${rulesetHash}"
+      rm -f ${revertedHashFile}
+      nixnet_ensure_revert
+      nixnet_write_metrics 1
+      echo "nixnet: ruleset already in force — no reload and no new confirmation window."
+      exit 0
+    fi
+
+    # A new apply supersedes any older confirmation countdown. Stop both timer and running revert
+    # service while holding the shared lock, then snapshot ONLY the table this module owns. Commit
+    # the snapshot before loading: if power fails after nft commits, the next boot can still arm a
+    # revert for the now-live generation.
+    nixnet_cancel_revert
+    ${lib.optionalString cfg.autoRevert.enable ''
+      if ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
+        snapshot_tmp="${pendingFile}.$$.tmp"
+        trap 'rm -f "$snapshot_tmp"' EXIT
+        { echo "table inet ${cfg.table}"; echo "delete table inet ${cfg.table}"; \
+          ${pkgs.nftables}/bin/nft list table inet ${cfg.table}; } > "$snapshot_tmp"
+        chmod 0600 "$snapshot_tmp"
+        ${pkgs.coreutils}/bin/sync "$snapshot_tmp"
+        mv -f "$snapshot_tmp" ${pendingFile}
+        ${pkgs.coreutils}/bin/sync ${stateDir}
+        trap - EXIT
+        nixnet_state_write ${pendingHashFile} "${rulesetHash}"
+      else
+        rm -f ${pendingFile} ${pendingHashFile}
+        echo "nixnet: no previous ruleset to restore — not arming auto-revert." >&2
+        echo "nixnet: a revert here could only delete this host's firewall, which is not a recovery." >&2
+      fi
+    ''}
+
+    if ! ${pkgs.nftables}/bin/nft -f ${rulesetFile}; then
+      echo "nixnet: firewall load failed; applied-hash was not advanced." >&2
+      nixnet_write_metrics 0
+      exit 1
+    fi
 
     # The other half a loader cannot report: a unit that FINISHED while nixnet's table is not
     # present. Presence is checkable, so check it — a green apply unit over an absent firewall is
@@ -518,10 +595,15 @@ let
       exit 1
     fi
 
-    # An apply supersedes a revert: this is the operator putting a ruleset on the host, which is
-    # the authority the reconcile loop stood down for. Leaving the file would have reconcile refuse
-    # to repair a future flush of a ruleset that is currently loaded and fine.
+    # State advances only after both the nft transaction and the kernel marker check succeed.
+    # Writing this before load was a retry bug: one failed attempt made every later start call the
+    # generation "unchanged" and silently disarm its safety snapshot.
+    nixnet_state_write ${appliedHashFile} "${rulesetHash}"
     rm -f ${revertedHashFile}
+    if [ -f ${pendingFile} ] && [ -f ${pendingHashFile} ] \
+      && [ "$(cat ${pendingHashFile})" = "${rulesetHash}" ]; then
+      nixnet_arm_revert
+    fi
     nixnet_write_metrics 1
   '';
 
@@ -534,6 +616,10 @@ let
   # every host that has never had one.
   teardownScript = pkgs.writeShellScript "nixnet-firewall-teardown" ''
     set -eu
+    ${stateFunc}
+    ${autoRevertFunc}
+    nixnet_lock
+    nixnet_cancel_revert
     ${pkgs.nftables}/bin/nft "add table inet ${cfg.table}; delete table inet ${cfg.table}"
     if ${pkgs.nftables}/bin/nft list table inet ${cfg.table} >/dev/null 2>&1; then
       echo "nixnet: table inet ${cfg.table} is still present after teardown." >&2
@@ -545,7 +631,7 @@ let
     # firewall with the SAME ruleset is read as "unchanged, do not arm" — the dead-man switch
     # silently disarmed for a ruleset the host has not run since. The revert marker goes with it:
     # it refers to a table that no longer exists either.
-    rm -f ${appliedHashFile} ${pendingFile} ${revertedHashFile}
+    rm -f ${appliedHashFile} ${pendingFile} ${pendingHashFile} ${revertedHashFile}
   '';
 
   # ONE unit name on both planes, and NO ExecStop. Both are load-bearing:
@@ -577,6 +663,7 @@ let
         Type = "oneshot";
         RemainAfterExit = true;
         ExecStart = "${if cfg.enable then applyScript else teardownScript}";
+        TimeoutStartSec = "2min";
       };
     }
     // lib.optionalAttrs (!isSystemManager) {
@@ -1270,7 +1357,11 @@ in
 
         systemd.services.nixnet-firewall-revert = lib.mkIf cfg.autoRevert.enable {
           description = "nixnet: restore the previous ruleset (confirmation window expired)";
-          serviceConfig = { Type = "oneshot"; ExecStart = "${revertScript}"; };
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = "${revertScript}";
+            TimeoutStartSec = "2min";
+          };
         };
 
         # Deliberately NOT `wantedBy = [ "timers.target" ]`. That is what armed the countdown on
@@ -1294,6 +1385,7 @@ in
           serviceConfig = {
             Type = "oneshot";
             ExecStart = "${reconcileScript}";
+            TimeoutStartSec = "2min";
           };
         };
 

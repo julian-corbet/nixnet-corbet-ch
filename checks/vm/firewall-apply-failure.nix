@@ -133,6 +133,7 @@ in
 
       # The healthy baseline this test measures the failure against.
       good = machine.succeed("nft list table inet nixnet")
+      applied_before = machine.succeed("cat /var/lib/nixnet-firewall/applied-hash").strip()
       assert "policy drop" in good, "the healthy generation is not default-deny; nothing below means anything"
       peer.wait_for_unit("multi-user.target")
       peer.succeed(f"ping -c 2 -W 5 {machine.name}")
@@ -151,6 +152,10 @@ in
       assert after == good, (
           "a failed apply changed the live ruleset -- the load is not one transaction:\n"
           f"--- before ---\n{good}\n--- after ---\n{after}"
+      )
+      applied_after = machine.succeed("cat /var/lib/nixnet-firewall/applied-hash").strip()
+      assert applied_after == applied_before, (
+          "a failed load advanced applied-hash, so a retry would mistake the broken generation for an unchanged one"
       )
 
       # FW-3's "Not": no panic default-drop. The host stays reachable.

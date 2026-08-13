@@ -158,6 +158,8 @@ operator out, once per interval, forever. `nixnet-firewall-confirm` is the way b
 **GIVEN** an apply with no previous ruleset to restore — a host's first, or its first after a reimage —
 **THEN** the auto-revert timer does not arm, and the host is still firewalled after the confirmation window
 would have expired. **GIVEN** a reboot with a ruleset byte-identical to the last one applied, likewise.
+**GIVEN** a changed ruleset whose window does expire, **THEN** neither reconcile, service restart nor reboot
+loads that rejected generation again until an explicit confirm or a changed deployment supersedes it.
 
 Why: both halves are the same production failure, found twice because the first fix was too narrow. Arming
 every boot meant the timer fired on every headless boot, nobody typed the confirmation, and the revert — with
@@ -174,6 +176,10 @@ deployed with no human in the loop should turn this off and rely on that.
 Also: a revert that FAILS keeps its snapshot and leaves the reconcile loop enabled. Discarding the only copy
 of the previous ruleset and standing the repair loop down, on the strength of a command whose exit status
 nobody read, retires both safety nets at once.
+
+Also: apply, reconcile, revert, confirm and teardown share one lock, and `applied-hash` advances only after the
+nft transaction and generation-marker read-back both succeed. A failed load therefore remains retryable; it
+cannot masquerade as an unchanged generation and disarm its own rollback snapshot.
 
 ### FW-6 — a host that enforces a ruleset can read it
 **GIVEN** a host where `nixnet.firewall` or `nixnet.overlay` is enabled, on a backend that has nftables, **THEN**
