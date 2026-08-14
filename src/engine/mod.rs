@@ -1349,9 +1349,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hosts = HostsPublisher::new(dir.path().join("hosts")).unwrap();
         // Never actually mutate routing in a test.
-        let routes = RoutePublisher {
-            ip_path: "/bin/true".to_string(),
-        };
+        let routes = RoutePublisher::new("/bin/true");
         let eng = Engine {
             hosts,
             routes,
@@ -1375,9 +1373,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let eng = Engine {
             hosts: HostsPublisher::new(dir.path().join("hosts")).unwrap(),
-            routes: RoutePublisher {
-                ip_path: route_fakes::fake_ip(dir.path()),
-            },
+            routes: RoutePublisher::new(route_fakes::fake_ip(dir.path())),
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
             status_ttl: Duration::from_secs(30),
@@ -1649,9 +1645,7 @@ mod tests {
 
         let eng = Engine {
             hosts: HostsPublisher::new(&hosts_path).unwrap(),
-            routes: RoutePublisher {
-                ip_path: "/bin/true".to_string(),
-            },
+            routes: RoutePublisher::new("/bin/true"),
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
             status_ttl: Duration::from_secs(30),
@@ -2272,9 +2266,7 @@ mod tests {
         std::fs::write(&hosts_path, seed).unwrap();
         let eng = Engine {
             hosts: HostsPublisher::new(&hosts_path).unwrap(),
-            routes: RoutePublisher {
-                ip_path: "/bin/true".to_string(),
-            },
+            routes: RoutePublisher::new("/bin/true"),
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
             status_ttl: Duration::from_secs(30),

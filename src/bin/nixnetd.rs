@@ -75,9 +75,7 @@ fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     let hosts = publish::HostsPublisher::new(&cfg.daemon.hosts_file)
         .map_err(|e| format!("initializing hosts publisher: {}", e))?;
-    let routes = publish::RoutePublisher {
-        ip_path: cfg.daemon.ip_path.clone(),
-    };
+    let routes = publish::RoutePublisher::new(cfg.daemon.ip_path.clone());
 
     // status.json lives in the runtime dir proper, independent of
     // wherever hostsFile is configured to point.

@@ -146,7 +146,10 @@ every ordinary NSS files-then-dns lookup
 Nix-rendered config, a hand-written one, or a `system-manager` render.
 `status.json` reports the last hosts-file publication error globally and the
 last route-metric publication error for each uplink, so a healthy probe does
-not mask a publisher that failed to apply its decision.
+not mask a publisher that failed to apply its decision. Every external `ip`
+read or mutation has a five-second wall-clock deadline, bounded output, and
+process-group cleanup; a stuck netlink helper becomes a reported publication
+error instead of stopping the daemon's supervised progress indefinitely.
 
 ## Beyond peer/uplink: resident-daemon watchdogs
 

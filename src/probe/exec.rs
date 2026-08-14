@@ -9,19 +9,14 @@
 //! and exec'd directly, never through a shell, so a provider script never
 //! gains an implicit dependency on `/bin/sh` existing on `PATH`.
 
-use std::io::Read;
-use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::config::Transport;
+use crate::subprocess;
 
 use super::{first_non_empty_line, tokenize, ProbeError, ProbeResult};
-
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 struct ExecEnvelope {
@@ -41,26 +36,9 @@ pub fn run(t: &Transport, timeout: Duration) -> Result<ProbeResult, ProbeError> 
         return Err(ProbeError::new("exec probe: probe.exec is empty"));
     }
 
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    // Give the probe its own process group. Killing only the direct child
-    // leaves descendants alive with inherited stdout/stderr pipe handles;
-    // joining the reader then blocks forever even though the timeout fired.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+    let arg_refs: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    let output = match subprocess::run(&argv[0], &arg_refs, timeout) {
+        Ok(output) => output,
         Err(e) => {
             // Couldn't even start the process (bad binary, etc.) --
             // unhealthy, not a hard daemon error, so one bad provider
@@ -72,71 +50,13 @@ pub fn run(t: &Transport, timeout: Duration) -> Result<ProbeResult, ProbeError> 
             });
         }
     };
-
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let process_group = child.id() as i32;
-    if stdout
-        .as_ref()
-        .is_some_and(|pipe| set_nonblocking(pipe).is_err())
-        || stderr
-            .as_ref()
-            .is_some_and(|pipe| set_nonblocking(pipe).is_err())
-    {
-        kill_process_group(process_group);
-        let _ = child.wait();
-        return Ok(ProbeResult {
-            healthy: false,
-            detail: "exec probe: could not make output pipes non-blocking".to_string(),
-            ..Default::default()
-        });
-    }
-
-    let mut stdout_buf = BoundedOutput::default();
-    let mut stderr_buf = BoundedOutput::default();
-    let start = Instant::now();
-    let status = loop {
-        drain(&mut stdout, &mut stdout_buf);
-        drain(&mut stderr, &mut stderr_buf);
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    // A hung script gets killed on timeout -- this is
-                    // then just a plain (signal-)non-zero exit below, not
-                    // a hard error, matching `exec.CommandContext`'s
-                    // context-cancellation behavior in the Go original.
-                    // Negative pid means the whole process group. The
-                    // direct child is included, as are provider helpers
-                    // that inherited the output pipes.
-                    kill_process_group(process_group);
-                    let _ = child.wait();
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(10).min(timeout));
-            }
-            Err(_) => {
-                kill_process_group(process_group);
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-
-    // Even a successfully-reaped direct child may have daemonized a
-    // descendant which still owns our output pipes. A probe command and
-    // everything it starts have the same lifetime; reap the group before
-    // the final non-blocking drain so success cannot hang either.
-    kill_process_group(process_group);
-    drain(&mut stdout, &mut stdout_buf);
-    drain(&mut stderr, &mut stderr_buf);
-    let healthy = matches!(status, Some(s) if s.success());
+    let healthy = !output.timed_out && output.status.success();
 
     let mut res = ProbeResult {
         healthy,
         ..Default::default()
     };
-    let line = first_non_empty_line(&stdout_buf.bytes);
+    let line = first_non_empty_line(&output.stdout);
     if !line.is_empty() {
         match serde_json::from_str::<ExecEnvelope>(&line) {
             Ok(envelope) => {
@@ -158,85 +78,23 @@ pub fn run(t: &Transport, timeout: Duration) -> Result<ProbeResult, ProbeError> 
             "exec exit non-zero".to_string()
         };
     }
-    let stderr = String::from_utf8_lossy(&stderr_buf.bytes);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
     if !stderr.is_empty() {
         res.detail.push_str(": stderr: ");
         res.detail.push_str(stderr);
     }
-    if stdout_buf.truncated || stderr_buf.truncated {
+    if output.truncated {
         res.detail.push_str(" (probe output truncated at 64 KiB)");
     }
     Ok(res)
-}
-
-#[derive(Default)]
-struct BoundedOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-fn set_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
-    let fd = pipe.as_raw_fd();
-    // SAFETY: fcntl only observes/updates flags on this valid owned fd.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: the fd remains valid for the duration of the call.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn drain<R: Read>(pipe: &mut Option<R>, output: &mut BoundedOutput) {
-    let Some(reader) = pipe.as_mut() else {
-        return;
-    };
-    let mut chunk = [0_u8; 8192];
-    let mut close = false;
-    // Bound work per pass so a command that writes forever cannot prevent
-    // the outer loop from checking its deadline.
-    for _ in 0..32 {
-        let count = match reader.read(&mut chunk) {
-            Ok(0) => {
-                close = true;
-                break;
-            }
-            Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                close = true;
-                break;
-            }
-        };
-        let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.bytes.len());
-        if remaining > 0 {
-            output
-                .bytes
-                .extend_from_slice(&chunk[..count.min(remaining)]);
-        }
-        output.truncated |= count > remaining;
-    }
-    if close {
-        *pipe = None;
-    }
-}
-
-fn kill_process_group(process_group: i32) {
-    // SAFETY: the child created this process group with setsid(); a
-    // negative pid targets that group and can never target this daemon.
-    unsafe {
-        libc::kill(-process_group, libc::SIGKILL);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Probe, Transport};
+    use std::time::Instant;
 
     fn exec_transport(command: &str) -> Transport {
         Transport {

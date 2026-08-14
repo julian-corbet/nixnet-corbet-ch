@@ -13,3 +13,4 @@ pub mod publish;
 pub mod sdnotify;
 pub mod shutdown;
 pub mod status;
+mod subprocess;

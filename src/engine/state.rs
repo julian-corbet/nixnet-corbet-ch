@@ -858,9 +858,7 @@ mod tests {
         let hosts_path = dir.path().join("hosts");
         let eng = Engine {
             hosts: HostsPublisher::new(&hosts_path).unwrap(),
-            routes: RoutePublisher {
-                ip_path: "/bin/true".to_string(),
-            },
+            routes: RoutePublisher::new("/bin/true"),
             status_path: dir.path().join("status.json"),
             state_path: dir.path().join("state.json"),
             status_ttl: std::time::Duration::from_secs(30),

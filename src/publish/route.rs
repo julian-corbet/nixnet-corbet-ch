@@ -31,9 +31,13 @@
 //! one.
 
 use std::fmt;
-use std::process::Command;
+use std::time::Duration;
 
 use serde::Deserialize;
+
+use crate::subprocess;
+
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One transport of a subject, in published rank order: index 0 is the
 /// winner, and each later entry is one `metric_step` less preferred.
@@ -98,7 +102,8 @@ pub struct RoutePublisher {
     /// PATH dependency" -- resolved once at Nix build time, not looked up
     /// on PATH at run time (falls back to `"ip"` only for the non-Nix,
     /// hand-written-config path).
-    pub ip_path: String,
+    ip_path: String,
+    command_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -133,6 +138,21 @@ impl IpRoute {
 }
 
 impl RoutePublisher {
+    pub fn new(ip_path: impl Into<String>) -> Self {
+        Self {
+            ip_path: ip_path.into(),
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeout(ip_path: impl Into<String>, command_timeout: Duration) -> Self {
+        Self {
+            ip_path: ip_path.into(),
+            command_timeout,
+        }
+    }
+
     /// Reprioritizes each ranked transport's existing default route, winner
     /// first at `metric_base`, each subsequent one `metric_step` higher --
     /// including the ones that are currently Down, which is TF-3: the
@@ -269,10 +289,7 @@ impl RoutePublisher {
     /// `linkdown`, ...) appear and vanish per route.
     fn show_default(&self, iface: &str) -> Result<Vec<IpRoute>, String> {
         let args = ["-j", "route", "show", "default", "dev", iface];
-        let out = Command::new(self.ip())
-            .args(args)
-            .output()
-            .map_err(|e| format!("ip {}: {}", args.join(" "), e))?;
+        let out = self.command(&args)?;
         if !out.status.success() {
             return Err(format!(
                 "ip {}: exit {} ({}{})",
@@ -302,7 +319,7 @@ impl RoutePublisher {
     /// Runs one mutating `ip` command, turning a non-zero exit into the
     /// error string `apply` collects.
     fn run(&self, args: &[&str]) -> Result<(), String> {
-        match Command::new(self.ip()).args(args).output() {
+        match self.command(args) {
             Ok(out) if out.status.success() => Ok(()),
             Ok(out) => Err(format!(
                 "ip {}: exit {} ({}{})",
@@ -311,8 +328,21 @@ impl RoutePublisher {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             )),
-            Err(e) => Err(format!("ip {}: {}", args.join(" "), e)),
+            Err(e) => Err(e),
         }
+    }
+
+    fn command(&self, args: &[&str]) -> Result<subprocess::BoundedOutput, String> {
+        let out = subprocess::run(self.ip(), args, self.command_timeout)
+            .map_err(|e| format!("ip {}: {}", args.join(" "), e))?;
+        if out.timed_out {
+            return Err(format!(
+                "ip {}: timed out after {}ms",
+                args.join(" "),
+                self.command_timeout.as_millis()
+            ));
+        }
+        Ok(out)
     }
 }
 
@@ -333,9 +363,10 @@ pub(crate) mod tests {
     /// terminating each invocation, which is unambiguous because no argument
     /// nixnet passes is ever itself `--` or contains a newline -- and answers a
     /// `route show` with the canned contents of `dir/show-<iface>.json`, or
-    /// `[]` when that file is absent. If `dir/fail-replace` exists, every
-    /// `route replace` exits non-zero, which is how the "don't delete what we
-    /// failed to supersede" invariant gets exercised without a routing table.
+    /// `[]` when that file is absent. `hang-show` and `hang-replace` make the
+    /// corresponding command sleep, while `fail-replace` makes every replace
+    /// exit non-zero. Together those exercise failure handling without a real
+    /// routing table.
     pub(crate) fn fake_ip(dir: &Path) -> String {
         let path = dir.join("ip");
         let d = dir.display();
@@ -343,6 +374,8 @@ pub(crate) mod tests {
             "#!/bin/sh\n\
              for a in \"$@\"; do printf '%s\\n' \"$a\"; done >> '{d}/argv.log'\n\
              printf -- '--\\n' >> '{d}/argv.log'\n\
+             if [ \"$1\" = -j ] && [ -f '{d}/hang-show' ]; then sleep 30; fi\n\
+             if [ \"$2\" = replace ] && [ -f '{d}/hang-replace' ]; then sleep 30; fi\n\
              if [ \"$2\" = replace ] && [ -f '{d}/fail-replace' ]; then\n\
              \techo 'RTNETLINK answers: Network is unreachable' >&2\n\
              \texit 2\n\
@@ -459,9 +492,7 @@ pub(crate) mod tests {
     #[test]
     fn gateway_is_carried_over_and_the_old_metric_is_deleted() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = RoutePublisher {
-            ip_path: fake_ip(dir.path()),
-        };
+        let rp = RoutePublisher::new(fake_ip(dir.path()));
         canned_route(
             dir.path(),
             "eth0",
@@ -493,9 +524,7 @@ pub(crate) mod tests {
     #[test]
     fn a_gatewayless_route_stays_on_link() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = RoutePublisher {
-            ip_path: fake_ip(dir.path()),
-        };
+        let rp = RoutePublisher::new(fake_ip(dir.path()));
         // No `gateway` key and no `metric` key: a point-to-point default
         // at the kernel's implicit priority 0.
         canned_route(
@@ -520,9 +549,7 @@ pub(crate) mod tests {
     #[test]
     fn an_interface_with_no_default_route_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = RoutePublisher {
-            ip_path: fake_ip(dir.path()),
-        };
+        let rp = RoutePublisher::new(fake_ip(dir.path()));
         // No canned file at all -- the fake `ip` answers `[]`.
 
         let out = rp.apply(&ranked(&["eth9"]), 100, 50);
@@ -551,9 +578,7 @@ pub(crate) mod tests {
     #[test]
     fn a_down_interface_with_no_default_route_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = RoutePublisher {
-            ip_path: fake_ip(dir.path()),
-        };
+        let rp = RoutePublisher::new(fake_ip(dir.path()));
         canned_route(
             dir.path(),
             "eth0",
@@ -583,9 +608,7 @@ pub(crate) mod tests {
     #[test]
     fn a_route_already_at_the_target_metric_is_not_rewritten() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = RoutePublisher {
-            ip_path: fake_ip(dir.path()),
-        };
+        let rp = RoutePublisher::new(fake_ip(dir.path()));
         canned_route(
             dir.path(),
             "eth0",
@@ -616,9 +639,7 @@ pub(crate) mod tests {
     #[test]
     fn a_duplicate_default_at_the_target_metric_is_still_repaired() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = RoutePublisher {
-            ip_path: fake_ip(dir.path()),
-        };
+        let rp = RoutePublisher::new(fake_ip(dir.path()));
         canned_route(
             dir.path(),
             "eth0",
@@ -643,9 +664,7 @@ pub(crate) mod tests {
     #[test]
     fn each_interface_keeps_its_own_gateway_and_gets_the_next_metric() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = RoutePublisher {
-            ip_path: fake_ip(dir.path()),
-        };
+        let rp = RoutePublisher::new(fake_ip(dir.path()));
         canned_route(
             dir.path(),
             "eth0",
@@ -683,9 +702,7 @@ pub(crate) mod tests {
     #[test]
     fn the_loser_is_demoted_in_the_same_apply_that_promotes_the_winner() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = RoutePublisher {
-            ip_path: fake_ip(dir.path()),
-        };
+        let rp = RoutePublisher::new(fake_ip(dir.path()));
         // The state a previous publication left behind: eth0 won at 100,
         // wlan0 sat one step behind at 150. eth0 has since gone down.
         canned_route(
@@ -743,9 +760,7 @@ pub(crate) mod tests {
     #[test]
     fn a_failed_replace_never_deletes_the_surviving_route() {
         let dir = tempfile::tempdir().unwrap();
-        let rp = RoutePublisher {
-            ip_path: fake_ip(dir.path()),
-        };
+        let rp = RoutePublisher::new(fake_ip(dir.path()));
         std::fs::write(dir.path().join("fail-replace"), "").unwrap();
         canned_route(
             dir.path(),
@@ -771,6 +786,55 @@ pub(crate) mod tests {
             2,
             "show + the failed replace, and no del: {:?}",
             invocations(dir.path())
+        );
+    }
+
+    #[test]
+    fn a_hung_route_read_is_killed_reaped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let rp = RoutePublisher::with_timeout(fake_ip(dir.path()), Duration::from_millis(50));
+        std::fs::write(dir.path().join("hang-show"), "").unwrap();
+        let started = std::time::Instant::now();
+
+        let out = rp.apply(&ranked(&["eth0"]), 100, 50);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "route read remained blocked after its deadline"
+        );
+        assert!(out.changes.is_empty());
+        let error = out.error.expect("a timed-out route read must be reported");
+        assert!(
+            error.to_string().contains("timed out after 50ms"),
+            "unexpected timeout diagnostic: {error}"
+        );
+    }
+
+    #[test]
+    fn a_hung_route_write_is_killed_without_deleting_the_old_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let rp = RoutePublisher::with_timeout(fake_ip(dir.path()), Duration::from_millis(50));
+        std::fs::write(dir.path().join("hang-replace"), "").unwrap();
+        canned_route(
+            dir.path(),
+            "eth0",
+            r#"[{"dst":"default","gateway":"192.168.1.1","dev":"eth0","metric":600,"flags":[]}]"#,
+        );
+        let started = std::time::Instant::now();
+
+        let out = rp.apply(&ranked(&["eth0"]), 100, 50);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "route write remained blocked after its deadline"
+        );
+        assert!(out.changes.is_empty());
+        let error = out.error.expect("a timed-out route write must be reported");
+        assert!(error.to_string().contains("timed out after 50ms"));
+        assert_eq!(
+            invocations(dir.path()).len(),
+            2,
+            "show + timed-out replace, and no unsafe delete"
         );
     }
 }
