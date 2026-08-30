@@ -244,11 +244,11 @@ fn build_echo_request(id: u16, seq: u16, data: &[u8]) -> Vec<u8> {
 /// RFC 1071 Internet checksum.
 fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for c in chunks {
         sum += u16::from_be_bytes([c[0], c[1]]) as u32;
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += (*last as u32) << 8;
     }
     while (sum >> 16) != 0 {
