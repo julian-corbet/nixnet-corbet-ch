@@ -19,8 +19,10 @@
 #   backend   = "host:port" this service's HTTP traffic is proxied to.
 #   public    = true if it's also reachable from outside the cluster (has a
 #               tunnel ingress rule elsewhere) — affects nothing here beyond
-#               being OR'd with `nb` for the HTTP/L4 split below.
+#               being OR'd with `nb` and `internal` for the HTTP/L4 split below.
 #   nb        = true if it's also reachable as an overlay peer.
+#   internal  = true if it has only the split-horizon in-cluster HTTP route:
+#               nginx + CoreDNS, with no implication for tunnel or overlay.
 #   l4        = true if this is a non-HTTP (binary protocol) service.
 #   httpUi    = true if an `l4` service ALSO exposes an HTTP UI on the same
 #               port (so it still gets an nginx block).
@@ -35,10 +37,12 @@
 , upstreamForward ? [ "1.1.1.1" "1.0.0.1" ] # DNS forwarded here for anything NOT in the registry
 }:
 let
-  # An HTTP service gets a proxy block + a DNS answer to the proxy: exposed
-  # (public OR nb) AND speaking HTTP — i.e. NOT an L4 service, UNLESS it's
-  # an L4 service whose port is actually an HTTP UI.
-  isHttp = s: ((s.public or false) || (s.nb or false)) && (!(s.l4 or false) || (s.httpUi or false));
+  # An HTTP service gets a proxy block + a DNS answer to the proxy when it is
+  # present on at least one named HTTP plane (internal OR public OR nb) and is
+  # not an L4 service, unless that L4 port is explicitly an HTTP UI.
+  isHttp = s:
+    ((s.internal or false) || (s.public or false) || (s.nb or false))
+    && (!(s.l4 or false) || (s.httpUi or false));
   httpSvcs = lib.filterAttrs (_: isHttp) services;
 
   # An L4 service that is NOT an HTTP UI resolves DIRECT to its own

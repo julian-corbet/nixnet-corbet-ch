@@ -279,6 +279,8 @@ of these contribute a peer/uplink transport and none require
   pure function: turns a service registry into a split-horizon in-cluster
   nginx config + CoreDNS zone, so an in-cluster caller of `<svc>.<zone>`
   gets the same HTTPS experience as an overlay or public-tunnel caller.
+  `services.<name>.internal = true` creates only that in-cluster HTTP route;
+  it does not imply a public tunnel or overlay peer.
   Called from a consumer's own flake `outputs` or host config, same as
   `nixpkgs.lib` itself.
 
@@ -873,7 +875,9 @@ peer's list.
 module option tree; called as
 `inputs.nixnet.lib.svcProxyConfig { inherit lib services machines zone proxyClusterIP l4ClusterIpPrefix; }`.
 See the file's own header for the full `services.<name>` input shape and
-the HTTP-vs-L4-direct split it renders.
+the HTTP-vs-L4-direct split it renders. HTTP membership is explicit on any
+of three independent axes: `internal`, `public`, or `nb`; an entry with all
+three false produces no named HTTP route.
 
 ## Non-NixOS hosts (via `system-manager`)
 

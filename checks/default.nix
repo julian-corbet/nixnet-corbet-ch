@@ -71,7 +71,57 @@ let
   };
   nixnetdService = cfg.systemd.services.nixnetd.serviceConfig;
 
+  # The split-horizon route is an independent plane. An internal-only HTTP
+  # service must get nginx + CoreDNS without pretending to be public or an
+  # overlay peer; an unexposed registry entry must still render nothing.
+  svcProxyFixture = (import ../lib/svc-proxy-config.nix) {
+    inherit lib;
+    zone = "example.test";
+    proxyClusterIP = "10.42.64.95";
+    l4ClusterIpPrefix = "10.42.64";
+    services = {
+      hidden = {
+        backend = "10.42.64.200:8080";
+        public = false;
+        nb = false;
+      };
+      internal-only = {
+        backend = "10.42.64.81:8080";
+        internal = true;
+        public = false;
+        nb = false;
+      };
+      nb-only = {
+        backend = "10.42.64.201:8080";
+        nb = true;
+      };
+      public-only = {
+        backend = "10.42.64.202:8080";
+        public = true;
+      };
+    };
+  };
+
   results = [
+    (check "svc-proxy/internal-only-is-a-named-http-route"
+      (svcProxyFixture.httpNames == [ "internal-only" "nb-only" "public-only" ])
+      "httpNames: ${builtins.toJSON svcProxyFixture.httpNames}")
+
+    (check "svc-proxy/internal-only-nginx-preserves-host-and-backend"
+      (lib.hasInfix "server_name internal-only.example.test" svcProxyFixture.nginxConf
+        && lib.hasInfix "proxy_pass http://10.42.64.81:8080" svcProxyFixture.nginxConf
+        && lib.hasInfix "proxy_set_header Host $host" svcProxyFixture.nginxConf)
+      "internal-only nginx route is incomplete")
+
+    (check "svc-proxy/internal-only-coredns-points-at-proxy"
+      (lib.hasInfix "10.42.64.95 internal-only.example.test" svcProxyFixture.corednsConfig)
+      "internal-only CoreDNS answer does not point at the split-horizon proxy")
+
+    (check "svc-proxy/unexposed-http-stays-absent"
+      (!(lib.hasInfix "hidden.example.test" svcProxyFixture.nginxConf)
+        && !(lib.hasInfix "hidden.example.test" svcProxyFixture.corednsConfig))
+      "an entry with internal/public/nb all false leaked into a named route")
+
     # THE regression this file exists for. Pre-fix, `DynamicUser = true`
     # sat here and nixnetd's boot-time-seeded hostsFile could never be
     # renamed-over by its own per-boot-random UID -- unconditionally, not
