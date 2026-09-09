@@ -5,3 +5,5 @@ The default selection is `native,rust,package`. Native Linux success does not ce
 Additional coverage limits:
 
 - Retain rustfmt/clippy/test plus package build alongside Nix module/VM checks.
+
+Hosted Actions keeps the full portable workflow available for manual fallback.
