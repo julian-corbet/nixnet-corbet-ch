@@ -1,0 +1,28 @@
+# Shared ccid runner; coverage selectors are explicit.
+schema = 1
+project = "nixnet"
+
+[checks.native]
+kind = "nix"
+mode = "native"
+
+[checks.eval]
+kind = "nix"
+mode = "eval"
+
+[checks.list]
+kind = "nix"
+mode = "list"
+
+[checks.all-systems]
+kind = "nix"
+mode = "all-systems"
+
+[checks.package]
+kind = "commands"
+commands = [["nix", "build", "--no-link", "--no-update-lock-file", ".#nixnet"]]
+
+[checks.rust]
+kind = "cargo"
+actions = ["fmt", "test", "clippy"]
+all_targets = true
